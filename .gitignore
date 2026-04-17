@@ -1,0 +1,24 @@
+# Cargo build output (binaries, deps, incremental, criterion output, etc.)
+/debug/
+/target/
+
+# rustfmt
+**/*.rs.bk
+
+# MSVC (Windows) debug symbols
+*.pdb
+
+# LLVM coverage (cargo llvm-cov)
+*.profraw
+*.profdata
+lcov.info
+cobertura.xml
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# OS junk
+.DS_Store
+Thumbs.db
