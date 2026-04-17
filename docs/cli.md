@@ -2,7 +2,8 @@
 
 The `odx` binary is the command-line front end for `odx-rs`. It is library-driven: it detects the input format, normalizes it into an `OdxDataset`, and then writes the requested output through the existing ODX, DSI Studio, MRtrix, or interop APIs.
 
-For DSI Studio and MRtrix convention details, see [docs/dsistudio_mrtrix_conversion_workflows.md](/Users/mcieslak/projects/odx/odx-rs/docs/dsistudio_mrtrix_conversion_workflows.md).
+For DSI Studio and MRtrix convention details, see [docs/dsistudio_mrtrix_conversion_workflows.md](./dsistudio_mrtrix_conversion_workflows.md).
+For fixel coherence QC details, see [docs/fixel_qc.md](./fixel_qc.md).
 
 ## Quick Start
 
@@ -40,6 +41,12 @@ Validate a dataset:
 
 ```bash
 odx validate output.odx
+```
+
+Compute fixel coherence QC:
+
+```bash
+odx qc output.odx
 ```
 
 ## Commands
@@ -146,6 +153,49 @@ Useful options:
 - `--json`
 - `--strict`
 
+### `odx qc`
+
+```bash
+odx qc <input>
+```
+
+Computes sparse fixel coherence QC on the normalized `OdxDataset`.
+
+In brief:
+
+- choose a scalar primary metric: explicit `--primary-dpf`, otherwise `amplitude`,
+  `afd`, then `qa`
+- threshold fixels with `otsu`, `positive`, `all`, or a numeric override
+- classify each evaluated fixel as connected or disconnected by scanning the 13
+  undirected voxel-neighbor offsets, which is the efficient implementation of
+  full immediate 26-neighbor voxel connectivity, and requiring directional
+  agreement
+- report weighted coherence/incoherence plus connected/disconnected counts and
+  per-scalar-DPF summaries
+
+Useful options:
+
+- `--primary-dpf <name>`
+- `--threshold otsu|positive|all|value`
+- `--threshold-value <f32>`
+- `--angle-deg <f32>`
+- `--write-qc-class`
+- `--overwrite-qc-class`
+- `--json`
+
+When `--write-qc-class` is used on an ODX input, the CLI writes:
+
+- `dpf/qc_class.uint8`
+
+with the fixed encoding:
+
+- `0 = thresholded out`
+- `1 = disconnected`
+- `2 = connected`
+
+`--write-qc-class` is only valid for existing ODX directory or `.odx` archive
+inputs.
+
 ## Input Model
 
 Some formats are composite:
@@ -166,3 +216,4 @@ When `--json` is used:
 - `info` prints a dataset summary object
 - `validate` prints a validation report object
 - `convert` prints a short conversion summary object
+- `qc` prints the QC report object

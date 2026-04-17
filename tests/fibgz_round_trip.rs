@@ -1,19 +1,26 @@
 use std::path::Path;
 
-use odx_rs::{dsistudio, OdxDataset};
+use odx_rs::{dsistudio, read_reference_affine, OdxDataset};
 
 const FIB_PATH: &str =
     "../test_data/sub-NDARAE199TDD_ses-1_acq-64dirVARIANTVar1e_space-ACPC_model-ss3t_dwimap.fib.gz";
+const REF_AFFINE_PATH: &str =
+    "../test_data/sub-NDARAE199TDD_ses-1_acq-64dirVARIANTVar1e_space-ACPC_model-tensor_param-fa_dwimap.nii.gz";
+
+fn fixture_reference_affine() -> [[f64; 4]; 4] {
+    read_reference_affine(Path::new(REF_AFFINE_PATH)).unwrap()
+}
 
 #[test]
 fn load_fibgz_basic() {
     let path = Path::new(FIB_PATH);
-    if !path.exists() {
+    let reference = Path::new(REF_AFFINE_PATH);
+    if !path.exists() || !reference.exists() {
         eprintln!("skipping: test data not found at {FIB_PATH}");
         return;
     }
 
-    let odx = dsistudio::load_fibgz(path, None).unwrap();
+    let odx = dsistudio::load_fibgz(path, Some(fixture_reference_affine())).unwrap();
 
     // Dimensions should be 80x98x85
     let hdr = odx.header();
@@ -76,12 +83,13 @@ fn load_fibgz_basic() {
 #[test]
 fn fibgz_round_trip_via_odx() {
     let path = Path::new(FIB_PATH);
-    if !path.exists() {
+    let reference = Path::new(REF_AFFINE_PATH);
+    if !path.exists() || !reference.exists() {
         eprintln!("skipping: test data not found at {FIB_PATH}");
         return;
     }
 
-    let odx = dsistudio::load_fibgz(path, None).unwrap();
+    let odx = dsistudio::load_fibgz(path, Some(fixture_reference_affine())).unwrap();
 
     // Save to ODX directory
     let tmpdir = tempfile::TempDir::new().unwrap();
@@ -121,12 +129,13 @@ fn fibgz_round_trip_via_odx() {
 #[test]
 fn fibgz_round_trip_to_fib() {
     let path = Path::new(FIB_PATH);
-    if !path.exists() {
+    let reference = Path::new(REF_AFFINE_PATH);
+    if !path.exists() || !reference.exists() {
         eprintln!("skipping: test data not found at {FIB_PATH}");
         return;
     }
 
-    let odx = dsistudio::load_fibgz(path, None).unwrap();
+    let odx = dsistudio::load_fibgz(path, Some(fixture_reference_affine())).unwrap();
 
     // Write back to fib.gz
     let tmpdir = tempfile::TempDir::new().unwrap();
@@ -174,12 +183,13 @@ fn fibgz_round_trip_to_fib() {
 #[test]
 fn fz_round_trip_to_odx() {
     let path = Path::new(FIB_PATH);
-    if !path.exists() {
+    let reference = Path::new(REF_AFFINE_PATH);
+    if !path.exists() || !reference.exists() {
         eprintln!("skipping: test data not found at {FIB_PATH}");
         return;
     }
 
-    let odx = dsistudio::load_fibgz(path, None).unwrap();
+    let odx = dsistudio::load_fibgz(path, Some(fixture_reference_affine())).unwrap();
 
     let tmpdir = tempfile::TempDir::new().unwrap();
     let fz_out = tmpdir.path().join("round_trip.fz");
@@ -206,4 +216,20 @@ fn fz_round_trip_to_odx() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     assert!(max_diff < 0.02, "fz ODF max difference: {max_diff}");
+}
+
+#[test]
+fn fibgz_fixture_without_reference_affine_fails() {
+    let path = Path::new(FIB_PATH);
+    if !path.exists() {
+        eprintln!("skipping: test data not found at {FIB_PATH}");
+        return;
+    }
+
+    let err = dsistudio::load_fibgz(path, None).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("DSI Studio file has no spatial affine ('trans' field)"),
+        "unexpected error: {err}"
+    );
 }

@@ -6,7 +6,7 @@ use odx_rs::interop::{
     dsistudio_to_mrtrix, mrtrix_to_dsistudio, DenseOdfMode, DsistudioFormat,
     DsistudioToMrtrixOptions, MrtrixToDsistudioOptions, PeakSource,
 };
-use odx_rs::{dsistudio, mif, mrtrix, mrtrix_sh};
+use odx_rs::{dsistudio, mif, mrtrix, mrtrix_sh, read_reference_affine};
 
 const SH_MIF: &str =
     "../test_data/sub-NDARAE199TDD_ses-1_acq-64dirVARIANTVar1e_space-ACPC_model-ss3t_param-fod_label-WM_dwimap.mif.gz";
@@ -14,9 +14,15 @@ const FIXELS_NII: &str = "../test_data/fixels_nii";
 const FIXELS_MIF: &str = "../test_data/fixels_mif";
 const FIB_PATH: &str =
     "../test_data/sub-NDARAE199TDD_ses-1_acq-64dirVARIANTVar1e_space-ACPC_model-ss3t_dwimap.fib.gz";
+const REF_AFFINE_PATH: &str =
+    "../test_data/sub-NDARAE199TDD_ses-1_acq-64dirVARIANTVar1e_space-ACPC_model-tensor_param-fa_dwimap.nii.gz";
 
 fn fixture_path(rel: &str) -> PathBuf {
     Path::new(rel).to_path_buf()
+}
+
+fn fixture_reference_affine() -> [[f64; 4]; 4] {
+    read_reference_affine(Path::new(REF_AFFINE_PATH)).unwrap()
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
@@ -88,7 +94,8 @@ fn mrtrix_to_dsistudio_sh_and_fixels_writes_dense_odf_fz() {
 #[test]
 fn dsistudio_to_mrtrix_exports_fixels_and_sh_when_dense_odf_exists() {
     let fib = fixture_path(FIB_PATH);
-    if !fib.exists() {
+    let reference = fixture_path(REF_AFFINE_PATH);
+    if !fib.exists() || !reference.exists() {
         eprintln!("skipping missing fixture {}", fib.display());
         return;
     }
@@ -100,7 +107,10 @@ fn dsistudio_to_mrtrix_exports_fixels_and_sh_when_dense_odf_exists() {
         &fib,
         &out_fixels,
         Some(&out_sh),
-        &DsistudioToMrtrixOptions::default(),
+        &DsistudioToMrtrixOptions {
+            reference_affine: Some(fixture_reference_affine()),
+            ..Default::default()
+        },
     )
     .unwrap();
 

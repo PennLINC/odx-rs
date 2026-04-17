@@ -327,11 +327,7 @@ impl OdxDataset {
         self.compact_to_ijk()
             .iter()
             .map(|ijk| {
-                let v = [
-                    ijk[0] as f64,
-                    ijk[1] as f64,
-                    ijk[2] as f64,
-                ];
+                let v = [ijk[0] as f64, ijk[1] as f64, ijk[2] as f64];
                 [
                     (affine[0][0] * v[0] + affine[0][1] * v[1] + affine[0][2] * v[2] + affine[0][3])
                         as f32,

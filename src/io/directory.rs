@@ -308,6 +308,237 @@ pub fn save_directory(odx: &OdxDataset, dir: &Path, policy: OdxWritePolicy) -> R
     Ok(())
 }
 
+pub fn append_dpf_to_directory(
+    dir: &Path,
+    dpf: &HashMap<String, DataArray>,
+    overwrite: bool,
+) -> Result<()> {
+    let mut header = Header::from_file(&dir.join("header.json"))?;
+    validate_row_count("DPF", dpf, header.nb_peaks as usize)?;
+    let dpf_dir = dir.join("dpf");
+    fs::create_dir_all(&dpf_dir)?;
+    let mut header_dirty = false;
+    for (name, arr) in dpf {
+        if !overwrite {
+            if find_named_array_file(&dpf_dir, name)?.is_some() {
+                continue;
+            }
+        } else if let Some(existing) = find_named_array_file(&dpf_dir, name)? {
+            let target = dpf_dir.join(filename_for_array(name, arr));
+            if existing != target && existing.exists() {
+                fs::remove_file(existing)?;
+            }
+            header_dirty |= header
+                .array_quantization
+                .remove(&format!("dpf/{name}"))
+                .is_some();
+        }
+        fs::write(dpf_dir.join(filename_for_array(name, arr)), arr.as_bytes())?;
+    }
+    if header_dirty {
+        header.write_to(&dir.join("header.json"))?;
+    }
+    Ok(())
+}
+
+pub fn append_dpv_to_directory(
+    dir: &Path,
+    dpv: &HashMap<String, DataArray>,
+    overwrite: bool,
+) -> Result<()> {
+    let mut header = Header::from_file(&dir.join("header.json"))?;
+    validate_row_count("DPV", dpv, header.nb_voxels as usize)?;
+    let dpv_dir = dir.join("dpv");
+    fs::create_dir_all(&dpv_dir)?;
+    let mut header_dirty = false;
+    for (name, arr) in dpv {
+        if !overwrite {
+            if find_named_array_file(&dpv_dir, name)?.is_some() {
+                continue;
+            }
+        } else if let Some(existing) = find_named_array_file(&dpv_dir, name)? {
+            let target = dpv_dir.join(filename_for_array(name, arr));
+            if existing != target && existing.exists() {
+                fs::remove_file(existing)?;
+            }
+            header_dirty |= header
+                .array_quantization
+                .remove(&format!("dpv/{name}"))
+                .is_some();
+        }
+        fs::write(dpv_dir.join(filename_for_array(name, arr)), arr.as_bytes())?;
+    }
+    if header_dirty {
+        header.write_to(&dir.join("header.json"))?;
+    }
+    Ok(())
+}
+
+pub fn append_groups_to_directory(
+    dir: &Path,
+    groups: &HashMap<String, DataArray>,
+    overwrite: bool,
+) -> Result<()> {
+    let groups_dir = dir.join("groups");
+    fs::create_dir_all(&groups_dir)?;
+    for (name, arr) in groups {
+        let target = groups_dir.join(filename_for_array(name, arr));
+        if !overwrite {
+            if find_named_array_file(&groups_dir, name)?.is_some() {
+                continue;
+            }
+        } else if let Some(existing) = find_named_array_file(&groups_dir, name)? {
+            if existing != target && existing.exists() {
+                fs::remove_file(existing)?;
+            }
+        }
+        fs::write(target, arr.as_bytes())?;
+    }
+    Ok(())
+}
+
+pub fn append_dpg_to_directory(dir: &Path, dpg: &DataPerGroup, overwrite: bool) -> Result<()> {
+    let mut header = Header::from_file(&dir.join("header.json"))?;
+    let groups_dir = dir.join("groups");
+    let dpg_root = dir.join("dpg");
+    let mut header_dirty = false;
+    for (group, arrays) in dpg {
+        if find_named_array_file(&groups_dir, group)?.is_none() {
+            return Err(OdxError::Argument(format!(
+                "cannot add DPG entries for missing group '{group}'"
+            )));
+        }
+        let group_dir = dpg_root.join(group);
+        fs::create_dir_all(&group_dir)?;
+        for (name, arr) in arrays {
+            let target = group_dir.join(filename_for_array(name, arr));
+            if !overwrite {
+                if find_named_array_file(&group_dir, name)?.is_some() {
+                    continue;
+                }
+            } else if let Some(existing) = find_named_array_file(&group_dir, name)? {
+                if existing != target && existing.exists() {
+                    fs::remove_file(existing)?;
+                }
+                header_dirty |= header
+                    .array_quantization
+                    .remove(&format!("dpg/{group}/{name}"))
+                    .is_some();
+            }
+            fs::write(target, arr.as_bytes())?;
+        }
+    }
+    if header_dirty {
+        header.write_to(&dir.join("header.json"))?;
+    }
+    Ok(())
+}
+
+pub fn delete_dpf_from_directory(dir: &Path, names: &[&str]) -> Result<()> {
+    let mut header = Header::from_file(&dir.join("header.json"))?;
+    let dpf_dir = dir.join("dpf");
+    let mut header_dirty = false;
+    for name in names {
+        if let Some(path) = find_named_array_file(&dpf_dir, name)? {
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+            header_dirty |= header
+                .array_quantization
+                .remove(&format!("dpf/{name}"))
+                .is_some();
+        }
+    }
+    if header_dirty {
+        header.write_to(&dir.join("header.json"))?;
+    }
+    Ok(())
+}
+
+pub fn delete_dpv_from_directory(dir: &Path, names: &[&str]) -> Result<()> {
+    let mut header = Header::from_file(&dir.join("header.json"))?;
+    let dpv_dir = dir.join("dpv");
+    let mut header_dirty = false;
+    for name in names {
+        if let Some(path) = find_named_array_file(&dpv_dir, name)? {
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+            header_dirty |= header
+                .array_quantization
+                .remove(&format!("dpv/{name}"))
+                .is_some();
+        }
+    }
+    if header_dirty {
+        header.write_to(&dir.join("header.json"))?;
+    }
+    Ok(())
+}
+
+pub fn delete_groups_from_directory(dir: &Path, names: &[&str]) -> Result<()> {
+    let mut header = Header::from_file(&dir.join("header.json"))?;
+    let groups_dir = dir.join("groups");
+    let mut header_dirty = false;
+    for name in names {
+        if let Some(path) = find_named_array_file(&groups_dir, name)? {
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+        }
+        let dpg_dir = dir.join("dpg").join(name);
+        if dpg_dir.exists() {
+            fs::remove_dir_all(dpg_dir)?;
+        }
+        let prefix = format!("dpg/{name}/");
+        let before = header.array_quantization.len();
+        header
+            .array_quantization
+            .retain(|key, _| !key.starts_with(&prefix));
+        header_dirty |= header.array_quantization.len() != before;
+    }
+    if header_dirty {
+        header.write_to(&dir.join("header.json"))?;
+    }
+    Ok(())
+}
+
+pub fn delete_dpg_from_directory(dir: &Path, group: &str, names: Option<&[&str]>) -> Result<()> {
+    let mut header = Header::from_file(&dir.join("header.json"))?;
+    let group_dir = dir.join("dpg").join(group);
+    let mut header_dirty = false;
+    match names {
+        None | Some([]) => {
+            if group_dir.exists() {
+                fs::remove_dir_all(group_dir)?;
+            }
+            let prefix = format!("dpg/{group}/");
+            let before = header.array_quantization.len();
+            header
+                .array_quantization
+                .retain(|key, _| !key.starts_with(&prefix));
+            header_dirty |= header.array_quantization.len() != before;
+        }
+        Some(names) => {
+            for name in names {
+                if let Some(path) = find_named_array_file(&group_dir, name)? {
+                    if path.exists() {
+                        fs::remove_file(path)?;
+                    }
+                    header_dirty |= header
+                        .array_quantization
+                        .remove(&format!("dpg/{group}/{name}"))
+                        .is_some();
+                }
+            }
+        }
+    }
+    if header_dirty {
+        header.write_to(&dir.join("header.json"))?;
+    }
+    Ok(())
+}
+
 fn save_data_dir(
     arrays: &HashMap<String, DataArray>,
     dir: &Path,
@@ -326,15 +557,57 @@ fn save_data_dir(
         if let Some(spec) = quant {
             header.array_quantization.insert(key.clone(), spec);
         }
-        let filename = OdxFilename {
-            name: name.clone(),
-            ncols: stored.ncols(),
-            dtype: stored.dtype(),
-        }
-        .to_filename();
+        let filename = filename_for_array(name, &stored);
         fs::write(dir.join(filename), stored.as_bytes())?;
     }
     Ok(())
+}
+
+fn validate_row_count(
+    kind: &str,
+    arrays: &HashMap<String, DataArray>,
+    expected_rows: usize,
+) -> Result<()> {
+    for (name, arr) in arrays {
+        if arr.nrows() != expected_rows {
+            return Err(OdxError::Format(format!(
+                "{kind} '{name}' has {} rows, expected {expected_rows}",
+                arr.nrows()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn find_named_array_file(dir: &Path, name: &str) -> Result<Option<std::path::PathBuf>> {
+    if !dir.exists() {
+        return Ok(None);
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| OdxError::Format(format!("invalid filename: {}", path.display())))?;
+        let parsed = OdxFilename::parse(file_name)?;
+        if parsed.name == name {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn filename_for_array(name: &str, arr: &DataArray) -> String {
+    OdxFilename {
+        name: name.to_string(),
+        ncols: arr.ncols(),
+        dtype: arr.dtype(),
+    }
+    .to_filename()
 }
 
 fn save_dpg_dir(

@@ -1,4 +1,5 @@
 use assert_cmd::prelude::*;
+use odx_rs::{DType, Header, OdxBuilder, OdxDataset, QC_CLASS_DPF_NAME};
 use predicates::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,6 +10,8 @@ const SH_MIF: &str =
 const FIXELS_MIF: &str = "../test_data/fixels_mif";
 const FIB_PATH: &str =
     "../test_data/sub-NDARAE199TDD_ses-1_acq-64dirVARIANTVar1e_space-ACPC_model-ss3t_dwimap.fib.gz";
+const REF_AFFINE_PATH: &str =
+    "../test_data/sub-NDARAE199TDD_ses-1_acq-64dirVARIANTVar1e_space-ACPC_model-tensor_param-fa_dwimap.nii.gz";
 const PAM_PATH: &str = "../test_data/pam_fixture.pam5";
 
 fn fixture_path(rel: &str) -> PathBuf {
@@ -39,6 +42,47 @@ fn create_invalid_odx_dir(path: &Path) {
         bytemuck::cast_slice(&[[1.0f32, 0.0, 0.0]]),
     )
     .unwrap();
+}
+
+fn create_qc_fixture_odx_dir(path: &Path) {
+    let dims = [2u64, 1, 1];
+    let mask = vec![1u8, 1u8];
+    let mut builder = OdxBuilder::new(Header::identity_affine(), dims, mask);
+    builder.push_voxel_peaks(&[[1.0, 0.0, 0.0]]);
+    builder.push_voxel_peaks(&[[1.0, 0.0, 0.0]]);
+    builder.set_dpf_data(
+        "amplitude",
+        bytemuck::cast_slice(&[1.0f32, 1.0f32]).to_vec(),
+        1,
+        DType::Float32,
+    );
+    builder.set_dpf_data(
+        "disp",
+        bytemuck::cast_slice(&[0.25f32, 0.75f32]).to_vec(),
+        1,
+        DType::Float32,
+    );
+    builder.set_dpf_data(
+        "vec2",
+        bytemuck::cast_slice(&[1.0f32, 2.0f32, 3.0f32, 4.0f32]).to_vec(),
+        2,
+        DType::Float32,
+    );
+    builder.finalize().unwrap().save_directory(path).unwrap();
+}
+
+fn create_no_primary_metric_odx_dir(path: &Path) {
+    let dims = [1u64, 1, 1];
+    let mask = vec![1u8];
+    let mut builder = OdxBuilder::new(Header::identity_affine(), dims, mask);
+    builder.push_voxel_peaks(&[[1.0, 0.0, 0.0]]);
+    builder.set_dpf_data(
+        "vec2",
+        bytemuck::cast_slice(&[1.0f32, 2.0f32]).to_vec(),
+        2,
+        DType::Float32,
+    );
+    builder.finalize().unwrap().save_directory(path).unwrap();
 }
 
 #[test]
@@ -87,16 +131,36 @@ fn validate_help_mentions_strict() {
 }
 
 #[test]
+fn qc_help_mentions_threshold_and_primary_dpf() {
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args(["qc", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--primary-dpf"))
+        .stdout(predicate::str::contains("--threshold"))
+        .stdout(predicate::str::contains("--angle-deg"))
+        .stdout(predicate::str::contains("--write-qc-class"))
+        .stdout(predicate::str::contains("--overwrite-qc-class"));
+}
+
+#[test]
 fn info_on_fib_fixture_reports_format_and_dimensions() {
     let fib = fixture_path(FIB_PATH);
-    if !fib.exists() {
+    let reference = fixture_path(REF_AFFINE_PATH);
+    if !fib.exists() || !reference.exists() {
         eprintln!("skipping missing fixture {}", fib.display());
         return;
     }
 
     Command::cargo_bin("odx")
         .unwrap()
-        .args(["info", fib.to_str().unwrap()])
+        .args([
+            "info",
+            fib.to_str().unwrap(),
+            "--reference-affine",
+            reference.to_str().unwrap(),
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("format: dsistudio_fibgz"))
@@ -148,6 +212,28 @@ fn info_on_combined_mrtrix_input_reports_sh_and_dpf() {
 #[test]
 fn validate_succeeds_on_real_fixture() {
     let fib = fixture_path(FIB_PATH);
+    let reference = fixture_path(REF_AFFINE_PATH);
+    if !fib.exists() || !reference.exists() {
+        eprintln!("skipping missing fixture {}", fib.display());
+        return;
+    }
+
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "validate",
+            fib.to_str().unwrap(),
+            "--reference-affine",
+            reference.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("validation: ok"));
+}
+
+#[test]
+fn info_on_fib_fixture_requires_reference_affine_when_trans_is_missing() {
+    let fib = fixture_path(FIB_PATH);
     if !fib.exists() {
         eprintln!("skipping missing fixture {}", fib.display());
         return;
@@ -155,10 +241,12 @@ fn validate_succeeds_on_real_fixture() {
 
     Command::cargo_bin("odx")
         .unwrap()
-        .args(["validate", fib.to_str().unwrap()])
+        .args(["info", fib.to_str().unwrap()])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("validation: ok"));
+        .failure()
+        .stderr(predicate::str::contains(
+            "DSI Studio file has no spatial affine ('trans' field)",
+        ));
 }
 
 #[test]
@@ -177,9 +265,202 @@ fn validate_fails_on_malformed_odx_directory() {
 }
 
 #[test]
+fn qc_text_output_reports_headline_metrics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let odx_dir = tmp.path().join("qc_fixture.odx");
+    create_qc_fixture_odx_dir(&odx_dir);
+
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "qc",
+            odx_dir.to_str().unwrap(),
+            "--threshold",
+            "all",
+            "--primary-dpf",
+            "amplitude",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("primary_metric: amplitude"))
+        .stdout(predicate::str::contains("connected_fixels: 2"))
+        .stdout(predicate::str::contains("coherence_index: 1.000000"))
+        .stdout(predicate::str::contains("skipped_dpf: vec2"));
+}
+
+#[test]
+fn qc_json_output_serializes_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let odx_dir = tmp.path().join("qc_fixture.odx");
+    create_qc_fixture_odx_dir(&odx_dir);
+
+    let output = Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "qc",
+            odx_dir.to_str().unwrap(),
+            "--threshold",
+            "all",
+            "--primary-dpf",
+            "amplitude",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["primary_metric"], "amplitude");
+    assert_eq!(json["connected_fixels"], 2);
+    assert_eq!(json["per_dpf"]["disp"]["connected"]["count"], 2);
+    assert_eq!(json["skipped_dpf"][0], "vec2");
+}
+
+#[test]
+fn qc_reports_missing_primary_metric_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let odx_dir = tmp.path().join("no_primary.odx");
+    create_no_primary_metric_odx_dir(&odx_dir);
+
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args(["qc", odx_dir.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no usable primary DPF metric found",
+        ));
+}
+
+#[test]
+fn qc_rejects_non_scalar_requested_primary_metric() {
+    let tmp = tempfile::tempdir().unwrap();
+    let odx_dir = tmp.path().join("qc_fixture.odx");
+    create_qc_fixture_odx_dir(&odx_dir);
+
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "qc",
+            odx_dir.to_str().unwrap(),
+            "--primary-dpf",
+            "vec2",
+            "--threshold",
+            "all",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("expected a scalar field"));
+}
+
+#[test]
+fn qc_can_write_qc_class_dpf_to_odx_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let odx_dir = tmp.path().join("qc_fixture.odx");
+    create_qc_fixture_odx_dir(&odx_dir);
+
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "qc",
+            odx_dir.to_str().unwrap(),
+            "--threshold",
+            "all",
+            "--primary-dpf",
+            "amplitude",
+            "--write-qc-class",
+        ])
+        .assert()
+        .success();
+
+    assert!(odx_dir.join("dpf").join("qc_class.uint8").exists());
+    let reopened = OdxDataset::open(&odx_dir).unwrap();
+    assert_eq!(
+        reopened.scalar_dpf_f32(QC_CLASS_DPF_NAME).unwrap(),
+        vec![2.0, 2.0]
+    );
+}
+
+#[test]
+fn qc_write_qc_class_respects_overwrite_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let odx_dir = tmp.path().join("qc_fixture.odx");
+    create_qc_fixture_odx_dir(&odx_dir);
+    fs::write(odx_dir.join("dpf").join("qc_class.uint8"), [1u8, 1u8]).unwrap();
+
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "qc",
+            odx_dir.to_str().unwrap(),
+            "--threshold",
+            "all",
+            "--primary-dpf",
+            "amplitude",
+            "--write-qc-class",
+        ])
+        .assert()
+        .success();
+
+    let reopened = OdxDataset::open(&odx_dir).unwrap();
+    assert_eq!(
+        reopened.scalar_dpf_f32(QC_CLASS_DPF_NAME).unwrap(),
+        vec![1.0, 1.0]
+    );
+
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "qc",
+            odx_dir.to_str().unwrap(),
+            "--threshold",
+            "all",
+            "--primary-dpf",
+            "amplitude",
+            "--write-qc-class",
+            "--overwrite-qc-class",
+        ])
+        .assert()
+        .success();
+
+    let reopened = OdxDataset::open(&odx_dir).unwrap();
+    assert_eq!(
+        reopened.scalar_dpf_f32(QC_CLASS_DPF_NAME).unwrap(),
+        vec![2.0, 2.0]
+    );
+}
+
+#[test]
+fn qc_write_qc_class_rejects_non_odx_input() {
+    let fixels = fixture_path(FIXELS_MIF);
+    if !fixels.exists() {
+        eprintln!("skipping missing fixture {}", fixels.display());
+        return;
+    }
+
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "qc",
+            fixels.to_str().unwrap(),
+            "--write-qc-class",
+            "--threshold",
+            "all",
+            "--primary-dpf",
+            "afd",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--write-qc-class requires an ODX directory or .odx archive input",
+        ));
+}
+
+#[test]
 fn convert_fib_to_odx_directory() {
     let fib = fixture_path(FIB_PATH);
-    if !fib.exists() {
+    let reference = fixture_path(REF_AFFINE_PATH);
+    if !fib.exists() || !reference.exists() {
         eprintln!("skipping missing fixture {}", fib.display());
         return;
     }
@@ -194,6 +475,8 @@ fn convert_fib_to_odx_directory() {
             out.to_str().unwrap(),
             "--odx-layout",
             "directory",
+            "--reference-affine",
+            reference.to_str().unwrap(),
         ])
         .assert()
         .success();
@@ -230,7 +513,8 @@ fn convert_mrtrix_fixels_and_sh_to_fz() {
 #[test]
 fn convert_odx_directory_to_mrtrix_fixels_and_sh() {
     let fib = fixture_path(FIB_PATH);
-    if !fib.exists() {
+    let reference = fixture_path(REF_AFFINE_PATH);
+    if !fib.exists() || !reference.exists() {
         eprintln!("skipping missing fixture {}", fib.display());
         return;
     }
@@ -248,6 +532,8 @@ fn convert_odx_directory_to_mrtrix_fixels_and_sh() {
             odx_dir.to_str().unwrap(),
             "--odx-layout",
             "directory",
+            "--reference-affine",
+            reference.to_str().unwrap(),
         ])
         .assert()
         .success();

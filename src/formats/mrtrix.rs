@@ -217,7 +217,7 @@ pub fn save_mrtrix_sh(odx: &OdxDataset, path: &Path, options: &MrtrixShWriteOpti
             } else {
                 ensure_ext(path, "nii")
             };
-            write_nifti1_f32(&out, &dims, &odx.header().voxel_to_rasmm, &full)
+            write_mrtrix_nifti1_f32(&out, &dims, &odx.header().voxel_to_rasmm, &full)
         }
         MrtrixShContainer::Nifti2 => {
             let out = if path.extension() == Some(OsStr::new("gz")) || options.gzip {
@@ -225,7 +225,7 @@ pub fn save_mrtrix_sh(odx: &OdxDataset, path: &Path, options: &MrtrixShWriteOpti
             } else {
                 ensure_ext(path, "nii")
             };
-            write_nifti2_f32(&out, &dims, &odx.header().voxel_to_rasmm, &full)
+            write_mrtrix_nifti2_f32(&out, &dims, &odx.header().voxel_to_rasmm, &full)
         }
     }
 }
@@ -276,13 +276,13 @@ pub fn save_mrtrix_fixels(
             )?;
         }
         MrtrixFixelContainer::Nifti => {
-            write_nifti2_u32(
+            write_mrtrix_nifti2_u32(
                 &dir.join("index.nii"),
                 &[dims3[0], dims3[1], dims3[2], 2],
                 &odx.header().voxel_to_rasmm,
                 &index,
             )?;
-            write_nifti2_f32(
+            write_mrtrix_nifti2_f32(
                 &dir.join("directions.nii"),
                 &[odx.nb_peaks(), 3, 1],
                 &odx.header().voxel_to_rasmm,
@@ -309,7 +309,7 @@ pub fn save_mrtrix_fixels(
                     )?;
                 }
                 MrtrixFixelContainer::Nifti => {
-                    write_nifti2_f32(
+                    write_mrtrix_nifti2_f32(
                         &dir.join(format!("{name}.nii")),
                         &dims,
                         &odx.header().voxel_to_rasmm,
@@ -353,7 +353,7 @@ pub fn save_mrtrix_fixels(
                     )?;
                 }
                 MrtrixFixelContainer::Nifti => {
-                    write_nifti2_f32(
+                    write_mrtrix_nifti2_f32(
                         &dir.join(format!("{name}.nii")),
                         &dims,
                         &odx.header().voxel_to_rasmm,
@@ -1294,22 +1294,15 @@ fn write_mif_bytes(
     Ok(())
 }
 
-fn write_nifti1_f32(
+fn write_nifti1_f32_raw(
     path: &Path,
     dims: &[usize],
     affine: &[[f64; 4]; 4],
     data: &[f32],
 ) -> Result<()> {
-    let mut storage = data.to_vec();
-    let flips = mrtrix_nifti_axis_flips(dims);
-    let mut storage_affine = *affine;
-    if flips.iter().any(|&flip| flip) {
-        flip_spatial_axes_in_place(&mut storage, dims, flips);
-        storage_affine = flip_spatial_axes_in_affine(storage_affine, dims, flips);
-    }
-    let array = Array::from_shape_vec(IxDyn(dims), storage)
+    let array = Array::from_shape_vec(IxDyn(dims), data.to_vec())
         .map_err(|err| OdxError::Format(format!("failed to shape NIfTI-1 data: {err}")))?;
-    let header = nifti1_header(&storage_affine);
+    let header = nifti1_header(affine);
     nifti::writer::WriterOptions::new(path)
         .reference_header(&header)
         .write_nifti(&array)
@@ -1321,7 +1314,7 @@ fn write_nifti1_f32(
         })
 }
 
-fn write_nifti2_f32(
+fn write_mrtrix_nifti1_f32(
     path: &Path,
     dims: &[usize],
     affine: &[[f64; 4]; 4],
@@ -1334,16 +1327,56 @@ fn write_nifti2_f32(
         flip_spatial_axes_in_place(&mut storage, dims, flips);
         storage_affine = flip_spatial_axes_in_affine(storage_affine, dims, flips);
     }
+    write_nifti1_f32_raw(path, dims, &storage_affine, &storage)
+}
+
+fn write_nifti2_f32_raw(
+    path: &Path,
+    dims: &[usize],
+    affine: &[[f64; 4]; 4],
+    data: &[f32],
+) -> Result<()> {
     write_nifti2_bytes(
         path,
         dims,
-        &storage_affine,
+        affine,
         NiftiType::Float32,
-        &f32_to_fortran_bytes(&storage, dims),
+        &f32_to_fortran_bytes(data, dims),
     )
 }
 
-fn write_nifti2_u32(
+fn write_mrtrix_nifti2_f32(
+    path: &Path,
+    dims: &[usize],
+    affine: &[[f64; 4]; 4],
+    data: &[f32],
+) -> Result<()> {
+    let mut storage = data.to_vec();
+    let flips = mrtrix_nifti_axis_flips(dims);
+    let mut storage_affine = *affine;
+    if flips.iter().any(|&flip| flip) {
+        flip_spatial_axes_in_place(&mut storage, dims, flips);
+        storage_affine = flip_spatial_axes_in_affine(storage_affine, dims, flips);
+    }
+    write_nifti2_f32_raw(path, dims, &storage_affine, &storage)
+}
+
+fn write_nifti2_u32_raw(
+    path: &Path,
+    dims: &[usize],
+    affine: &[[f64; 4]; 4],
+    data: &[u32],
+) -> Result<()> {
+    write_nifti2_bytes(
+        path,
+        dims,
+        affine,
+        NiftiType::Uint32,
+        &u32_to_fortran_bytes(data, dims),
+    )
+}
+
+fn write_mrtrix_nifti2_u32(
     path: &Path,
     dims: &[usize],
     affine: &[[f64; 4]; 4],
@@ -1356,13 +1389,7 @@ fn write_nifti2_u32(
         flip_spatial_axes_in_place(&mut storage, dims, flips);
         storage_affine = flip_spatial_axes_in_affine(storage_affine, dims, flips);
     }
-    write_nifti2_bytes(
-        path,
-        dims,
-        &storage_affine,
-        NiftiType::Uint32,
-        &u32_to_fortran_bytes(&storage, dims),
-    )
+    write_nifti2_u32_raw(path, dims, &storage_affine, &storage)
 }
 
 fn write_nifti2_bytes(
@@ -1595,18 +1622,18 @@ mod tests {
     }
 
     #[test]
-    fn nifti2_u32_file_round_trip() {
+    fn raw_nifti2_u32_file_round_trip() {
         let dims = [4usize, 3, 2, 2];
         let total: usize = dims.iter().product();
         let data: Vec<u32> = (0..total as u32).map(|v| v * 7 + 3).collect();
         let affine = [
-            [-2.0, 0.0, 0.0, 10.0],
-            [0.0, -2.0, 0.0, 20.0],
+            [2.0, 0.0, 0.0, 10.0],
+            [0.0, 2.0, 0.0, 20.0],
             [0.0, 0.0, 2.0, 30.0],
             [0.0, 0.0, 0.0, 1.0],
         ];
         let path = std::env::temp_dir().join("odx_mrtrix_nifti2_u32_test.nii");
-        write_nifti2_u32(&path, &dims, &affine, &data).unwrap();
+        write_nifti2_u32_raw(&path, &dims, &affine, &data).unwrap();
         let parsed = load_u32_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(parsed.dims, dims);
@@ -1639,7 +1666,7 @@ mod tests {
         }
 
         let path = std::env::temp_dir().join("odx_mrtrix_real_index_test.nii");
-        write_nifti2_u32(
+        write_mrtrix_nifti2_u32(
             &path,
             &[dims3[0], dims3[1], dims3[2], 2],
             &odx.header().voxel_to_rasmm,

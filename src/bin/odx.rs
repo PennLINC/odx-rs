@@ -16,7 +16,10 @@ use odx_rs::mrtrix::{
     self, MrtrixFixelContainer, MrtrixFixelWriteOptions, MrtrixShContainer, MrtrixShWriteOptions,
 };
 use odx_rs::pam::{self, PamWriteOptions};
-use odx_rs::{OdxDataset, OdxError, OdxWritePolicy};
+use odx_rs::{
+    compute_fixel_qc, write_qc_class_dpf, FixelQcOptions, FixelQcReport, OdxDataset, OdxError,
+    OdxWritePolicy, ThresholdMode,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "odx")]
@@ -34,6 +37,8 @@ enum Command {
     Convert(ConvertArgs),
     /// Validate internal consistency after normalizing into an ODX dataset.
     Validate(ValidateArgs),
+    /// Compute fixel coherence QC metrics and connected/disconnected summaries.
+    Qc(QcArgs),
     /// Generate shell completions.
     Completions {
         #[arg(value_enum)]
@@ -123,6 +128,33 @@ struct ValidateArgs {
     strict: bool,
 }
 
+#[derive(Args, Debug)]
+struct QcArgs {
+    input: PathBuf,
+    #[arg(long)]
+    sh: Option<PathBuf>,
+    #[arg(long = "fixel-dir")]
+    fixel_dir: Option<PathBuf>,
+    #[arg(long = "reference-affine")]
+    reference_affine: Option<PathBuf>,
+    #[arg(long = "input-format", value_enum)]
+    input_format: Option<FormatOverride>,
+    #[arg(long = "primary-dpf")]
+    primary_dpf: Option<String>,
+    #[arg(long = "threshold", value_enum, default_value = "otsu")]
+    threshold: QcThresholdArg,
+    #[arg(long = "threshold-value")]
+    threshold_value: Option<f32>,
+    #[arg(long = "angle-deg", default_value_t = 15.0)]
+    angle_deg: f32,
+    #[arg(long = "write-qc-class")]
+    write_qc_class: bool,
+    #[arg(long = "overwrite-qc-class")]
+    overwrite_qc_class: bool,
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum FormatOverride {
     OdxDirectory,
@@ -176,6 +208,14 @@ enum Z0PolicyArg {
     Auto,
     Never,
     Always,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum QcThresholdArg {
+    Otsu,
+    Positive,
+    All,
+    Value,
 }
 
 impl From<FormatOverride> for DetectedFormat {
@@ -261,6 +301,7 @@ fn run(cli: Cli) -> odx_rs::Result<()> {
         Command::Info(args) => run_info(args),
         Command::Convert(args) => run_convert(args),
         Command::Validate(args) => run_validate(args),
+        Command::Qc(args) => run_qc(args),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "odx", &mut io::stdout());
@@ -322,15 +363,80 @@ fn run_validate(args: ValidateArgs) -> odx_rs::Result<()> {
     Ok(())
 }
 
-fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
-    let (odx, input_format) = load_from_args(
+fn run_qc(args: QcArgs) -> odx_rs::Result<()> {
+    let (odx, detected) = load_from_args(
         &args.input,
         args.sh.as_deref(),
         args.fixel_dir.as_deref(),
         args.reference_affine.as_deref(),
         args.input_format,
     )?;
+    if args.overwrite_qc_class && !args.write_qc_class {
+        return Err(OdxError::Argument(
+            "--overwrite-qc-class requires --write-qc-class".into(),
+        ));
+    }
+    let threshold = match args.threshold {
+        QcThresholdArg::Otsu => {
+            if args.threshold_value.is_some() {
+                return Err(OdxError::Argument(
+                    "--threshold-value is only valid with --threshold value".into(),
+                ));
+            }
+            ThresholdMode::Otsu
+        }
+        QcThresholdArg::Positive => {
+            if args.threshold_value.is_some() {
+                return Err(OdxError::Argument(
+                    "--threshold-value is only valid with --threshold value".into(),
+                ));
+            }
+            ThresholdMode::Positive
+        }
+        QcThresholdArg::All => {
+            if args.threshold_value.is_some() {
+                return Err(OdxError::Argument(
+                    "--threshold-value is only valid with --threshold value".into(),
+                ));
+            }
+            ThresholdMode::All
+        }
+        QcThresholdArg::Value => ThresholdMode::Value(args.threshold_value.ok_or_else(|| {
+            OdxError::Argument("--threshold value requires --threshold-value <f32>".into())
+        })?),
+    };
 
+    let computation = compute_fixel_qc(
+        &odx,
+        &FixelQcOptions {
+            primary_metric: args.primary_dpf,
+            threshold,
+            angle_degrees: args.angle_deg,
+        },
+    )?;
+    if args.write_qc_class {
+        match detected {
+            DetectedFormat::OdxDirectory | DetectedFormat::OdxArchive => {
+                write_qc_class_dpf(&args.input, &computation.classes, args.overwrite_qc_class)?
+            }
+            _ => {
+                return Err(OdxError::Format(
+                    "--write-qc-class requires an ODX directory or .odx archive input".into(),
+                ))
+            }
+        }
+    }
+    let report = &computation.report;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        print!("{}", render_fixel_qc(report));
+    }
+    Ok(())
+}
+
+fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
     let output_format = resolve_output_format(
         &args.output,
         args.output_format,
@@ -348,6 +454,14 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
     if let Some(out_sh) = args.out_sh.as_deref() {
         ensure_output_path(out_sh, args.overwrite)?;
     }
+
+    let (odx, input_format) = load_from_args(
+        &args.input,
+        args.sh.as_deref(),
+        args.fixel_dir.as_deref(),
+        args.reference_affine.as_deref(),
+        args.input_format,
+    )?;
 
     let quant_policy = OdxWritePolicy {
         quantize_dense: args.quantize_dense,
@@ -516,4 +630,77 @@ fn resolve_output_format(
         });
     }
     detect_target_format(output)
+}
+
+fn render_fixel_qc(report: &FixelQcReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("primary_metric: {}\n", report.primary_metric));
+    out.push_str(&format!(
+        "threshold_value: {}\n",
+        report
+            .threshold_value
+            .map(|v| format!("{v:.6}"))
+            .unwrap_or_else(|| "none".into())
+    ));
+    out.push_str(&format!("total_fixels: {}\n", report.total_fixels));
+    out.push_str(&format!("evaluated_fixels: {}\n", report.evaluated_fixels));
+    out.push_str(&format!("excluded_fixels: {}\n", report.excluded_fixels));
+    out.push_str(&format!("connected_fixels: {}\n", report.connected_fixels));
+    out.push_str(&format!(
+        "disconnected_fixels: {}\n",
+        report.disconnected_fixels
+    ));
+    out.push_str(&format!(
+        "connected_to_disconnected_ratio: {}\n",
+        report
+            .connected_to_disconnected_ratio
+            .map(|v| format!("{v:.6}"))
+            .unwrap_or_else(|| "none".into())
+    ));
+    out.push_str(&format!(
+        "coherence_index: {}\n",
+        report
+            .coherence_index
+            .map(|v| format!("{v:.6}"))
+            .unwrap_or_else(|| "none".into())
+    ));
+    out.push_str(&format!(
+        "incoherence_index: {}\n",
+        report
+            .incoherence_index
+            .map(|v| format!("{v:.6}"))
+            .unwrap_or_else(|| "none".into())
+    ));
+    if report.skipped_dpf.is_empty() {
+        out.push_str("skipped_dpf: none\n");
+    } else {
+        out.push_str(&format!("skipped_dpf: {}\n", report.skipped_dpf.join(", ")));
+    }
+    if !report.per_dpf.is_empty() {
+        out.push_str("per_dpf:\n");
+        for (name, stats) in &report.per_dpf {
+            out.push_str(&format!(
+                "  {name}: connected(count={}, mean={}, median={}), disconnected(count={}, mean={}, median={})\n",
+                stats.connected.count,
+                render_optional_f64(stats.connected.mean),
+                render_optional_f32(stats.connected.median),
+                stats.disconnected.count,
+                render_optional_f64(stats.disconnected.mean),
+                render_optional_f32(stats.disconnected.median),
+            ));
+        }
+    }
+    out
+}
+
+fn render_optional_f64(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{v:.6}"))
+        .unwrap_or_else(|| "none".into())
+}
+
+fn render_optional_f32(value: Option<f32>) -> String {
+    value
+        .map(|v| format!("{v:.6}"))
+        .unwrap_or_else(|| "none".into())
 }

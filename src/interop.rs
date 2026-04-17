@@ -41,6 +41,7 @@ pub enum Z0Policy {
 
 #[derive(Debug, Clone)]
 pub struct DsistudioToMrtrixOptions {
+    pub reference_affine: Option<[[f64; 4]; 4]>,
     pub write_sh: bool,
     pub sh_lmax: Option<u32>,
     pub fixel_container: mrtrix::MrtrixFixelContainer,
@@ -50,6 +51,7 @@ pub struct DsistudioToMrtrixOptions {
 impl Default for DsistudioToMrtrixOptions {
     fn default() -> Self {
         Self {
+            reference_affine: None,
             write_sh: true,
             sh_lmax: None,
             fixel_container: mrtrix::MrtrixFixelContainer::Nifti,
@@ -87,7 +89,7 @@ pub fn dsistudio_to_mrtrix(
 ) -> Result<()> {
     // These wrappers are intentionally thin: all semantic loading/writing still
     // goes through OdxDataset so we don't create a second pairwise converter core.
-    let odx = load_dsistudio_dataset(input_ds_path)?;
+    let odx = load_dsistudio_dataset(input_ds_path, options.reference_affine)?;
     let fixel_dataset = if options.fixel_amplitude_name == "amplitude" {
         odx.clone_owned_parts()
     } else {
@@ -154,15 +156,15 @@ pub fn mrtrix_to_dsistudio(
     save_dsistudio_from_odx(&odx, out_ds_path, options)
 }
 
-fn load_dsistudio_dataset(path: &Path) -> Result<OdxDataset> {
+fn load_dsistudio_dataset(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxDataset> {
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
     if name.ends_with(".fz") {
-        dsistudio::load_fz(path, None)
+        dsistudio::load_fz(path, affine)
     } else {
-        dsistudio::load_fibgz(path, None)
+        dsistudio::load_fibgz(path, affine)
     }
 }
 

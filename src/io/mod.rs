@@ -1,7 +1,9 @@
+mod archive_edit;
 pub mod directory;
 pub mod filename;
 pub mod zip;
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::data_array::DataArray;
@@ -23,6 +25,27 @@ pub fn load(path: &Path) -> Result<OdxDataset> {
     } else {
         Err(crate::error::OdxError::Format(format!(
             "unrecognized ODX path: {}",
+            path.display()
+        )))
+    }
+}
+
+pub(crate) fn append_dpf(
+    path: &Path,
+    dpf: &HashMap<String, DataArray>,
+    overwrite: bool,
+) -> Result<()> {
+    if path.is_dir() {
+        directory::append_dpf_to_directory(path, dpf, overwrite)
+    } else if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e == "odx")
+    {
+        zip::append_dpf_to_zip(path, dpf, ::zip::CompressionMethod::Deflated, overwrite)
+    } else {
+        Err(crate::error::OdxError::Format(format!(
+            "qc_class writing requires an ODX directory or .odx archive: {}",
             path.display()
         )))
     }
