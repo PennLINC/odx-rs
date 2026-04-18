@@ -11,10 +11,9 @@ use nifti::{NiftiHeader, NiftiType};
 use crate::data_array::DataArray;
 use crate::dtype::DType;
 use crate::error::{OdxError, Result};
-use crate::formats::{dsistudio_odf8, mif};
+use crate::formats::mif;
 use crate::header::{CanonicalDenseRepresentation, Header};
 use crate::mmap_backing::{vec_into_bytes, MmapBacking};
-use crate::mrtrix_sh;
 use crate::odx_file::OdxParts;
 use crate::stream::OdxBuilder;
 use crate::OdxDataset;
@@ -371,6 +370,8 @@ pub fn save_mrtrix_fixels(
 }
 
 fn build_sh_only_dataset(sh: LoadedF32Image) -> Result<OdxDataset> {
+    const SH_MASK_EPSILON: f32 = 1e-6;
+
     let dims3 = image_dims3(&sh.dims)?;
     let voxel_count = dims3[0] as usize * dims3[1] as usize * dims3[2] as usize;
     let ncoeffs = *sh
@@ -378,18 +379,14 @@ fn build_sh_only_dataset(sh: LoadedF32Image) -> Result<OdxDataset> {
         .get(3)
         .ok_or_else(|| OdxError::Format("MRtrix SH image must be 4D".into()))?;
     let order = infer_sh_order(ncoeffs)?;
-    let sample_plan =
-        mrtrix_sh::RowSamplePlan::for_sh_rows_nonnegative(dsistudio_odf8::hemisphere_vertices_ras(), ncoeffs)?;
-    let mut sampled = vec![0.0f32; sample_plan.ndir()];
     let mut mask = vec![0u8; voxel_count];
     let mut masked = Vec::with_capacity(sh.data.len());
     for voxel in 0..voxel_count {
         let start = voxel * ncoeffs;
         let end = start + ncoeffs;
         let row = &sh.data[start..end];
-        sample_plan.apply_row_into(row, &mut sampled);
-        let amplitude_sum: f32 = sampled.iter().copied().sum();
-        if amplitude_sum > 1e-6 {
+        let coeff_sum_abs: f32 = row.iter().map(|value| value.abs()).sum();
+        if coeff_sum_abs > SH_MASK_EPSILON {
             mask[voxel] = 1;
             masked.extend_from_slice(row);
         }
