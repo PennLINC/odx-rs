@@ -15,6 +15,43 @@ fn fixture_path(rel: &str) -> PathBuf {
     Path::new(rel).to_path_buf()
 }
 
+fn write_test_mif(path: &Path, datatype: &str, dims: &[usize], payload: &[u8]) {
+    let dim = dims
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let vox = vec!["1".to_string(); dims.len()].join(",");
+    let layout = (0..dims.len())
+        .map(|axis| axis.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let mut offset = 0usize;
+    loop {
+        let header = format!(
+            "mrtrix image\n\
+             dim: {dim}\n\
+             vox: {vox}\n\
+             layout: {layout}\n\
+             datatype: {datatype}\n\
+             transform: 1, 0, 0, 0\n\
+             transform: 0, 1, 0, 0\n\
+             transform: 0, 0, 1, 0\n\
+             file: . {offset}\n\
+             END\n"
+        );
+        let new_offset = header.len();
+        if new_offset == offset {
+            let mut bytes = header.into_bytes();
+            bytes.extend_from_slice(payload);
+            std::fs::write(path, bytes).unwrap();
+            return;
+        }
+        offset = new_offset;
+    }
+}
+
 fn assert_close_slice(a: &[f32], b: &[f32], tol: f32) {
     assert_eq!(a.len(), b.len());
     let mut max_diff = 0.0f32;
@@ -213,4 +250,42 @@ fn round_trip_mrtrix_fixels_mif_and_nifti() {
         &odx.scalar_dpf_f32("disp").unwrap(),
         1e-6,
     );
+}
+
+#[test]
+fn load_float64_mif_sh_fixture() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("float64_sh.mif");
+    let coeffs = [1.0f64, 0.1, 0.2, 0.3, 0.4, 0.5];
+    let payload: Vec<u8> = coeffs
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    write_test_mif(&path, "Float64LE", &[1, 1, 1, coeffs.len()], &payload);
+
+    let odx = mrtrix::load_mrtrix_sh(&path).unwrap();
+    let sh = odx.sh::<f32>("coefficients").unwrap();
+    assert_eq!(sh.shape(), (1, coeffs.len()));
+    let expected: Vec<f32> = coeffs.iter().map(|value| *value as f32).collect();
+    assert_close_slice(sh.row(0), &expected, 1e-6);
+}
+
+#[test]
+fn integer_mif_sh_is_rejected() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("int16_sh.mif");
+    write_test_mif(&path, "Int16LE", &[1, 1, 1, 6], &[0u8; 12]);
+
+    let err = mrtrix::load_mrtrix_sh(&path).unwrap_err();
+    assert!(err.to_string().contains("Float32 or Float64"));
+}
+
+#[test]
+fn complex_mif_sh_is_rejected() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("complex_sh.mif");
+    write_test_mif(&path, "CFloat32LE", &[1, 1, 1, 6], &[0u8; 24]);
+
+    let err = mrtrix::load_mrtrix_sh(&path).unwrap_err();
+    assert!(err.to_string().contains("Float32 or Float64"));
 }

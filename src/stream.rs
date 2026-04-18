@@ -4,7 +4,7 @@ use crate::data_array::DataArray;
 use crate::dtype::DType;
 use crate::error::{OdxError, Result};
 use crate::header::{CanonicalDenseRepresentation, Header};
-use crate::mmap_backing::{vec_to_bytes, MmapBacking};
+use crate::mmap_backing::{vec_into_bytes, MmapBacking};
 use crate::odx_file::{OdxDataset, OdxParts};
 use serde_json::Value;
 
@@ -181,10 +181,10 @@ impl OdxBuilder {
 
         let sphere_verts_backing = self
             .sphere_vertices
-            .map(|v| MmapBacking::Owned(vec_to_bytes(v)));
+            .map(|v| MmapBacking::Owned(vec_into_bytes(v)));
         let sphere_faces_backing = self
             .sphere_faces
-            .map(|f| MmapBacking::Owned(vec_to_bytes(f)));
+            .map(|f| MmapBacking::Owned(vec_into_bytes(f)));
 
         fn build_data_map(
             entries: HashMap<String, (Vec<u8>, usize, DType)>,
@@ -200,8 +200,8 @@ impl OdxBuilder {
         Ok(OdxDataset::from_parts(OdxParts {
             header,
             mask_backing: MmapBacking::Owned(self.mask),
-            offsets_backing: MmapBacking::Owned(vec_to_bytes(self.offsets)),
-            directions_backing: MmapBacking::Owned(vec_to_bytes(self.directions)),
+            offsets_backing: MmapBacking::Owned(vec_into_bytes(self.offsets)),
+            directions_backing: MmapBacking::Owned(vec_into_bytes(self.directions)),
             sphere_vertices: sphere_verts_backing,
             sphere_faces: sphere_faces_backing,
             odf: build_data_map(self.odf),

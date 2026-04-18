@@ -253,6 +253,28 @@ Examples:
 | `dpf/afd.float32` | `(NB_PEAKS,)` | Apparent fiber density |
 | `dpf/dispersion.float32` | `(NB_PEAKS,)` | Orientation dispersion |
 | `dpf/icvf.float32` | `(NB_PEAKS,)` | Intra-cellular volume fraction per fixel |
+| `dpf/qc_class.uint8` | `(NB_PEAKS,)` | Optional QC class map: `0=thresholded out`, `1=disconnected`, `2=connected` |
+
+### QC Convention: `dpf/qc_class.uint8`
+
+`odx-rs` can store the output of sparse fixel coherence QC as a reserved scalar
+DPF:
+
+```text
+dpf/qc_class.uint8
+```
+
+The value semantics are fixed:
+
+- `0` — fixel was excluded by the QC threshold
+- `1` — fixel was evaluated and found disconnected
+- `2` — fixel was evaluated and found connected
+
+This field is optional. It is intended as a compact categorical annotation of
+existing fixels rather than a new source metric. QC implementations should not
+use `qc_class` itself as the primary weighting metric when recomputing QC.
+For `.odx` archives, `odx-rs` can append or replace this field efficiently
+without rebuilding the entire archive; see [ZIP Archive Support](#zip-archive-support).
 
 ## Groups and Per-Group Data (`groups/`, `dpg/`)
 
@@ -325,6 +347,52 @@ A `.odx` file is a ZIP archive containing the directory layout above. Entries
 may use deflate compression. For memory-mapped access, the ZIP is extracted to a
 temporary directory at load time (same pattern as trx-rs). For streaming or
 write-once use, entries can be read/written directly from/to the ZIP.
+
+`odx-rs` also supports archive mutation for a safe subset of payload entries.
+
+### Efficient archive edits
+
+For existing `.odx` archives, `odx-rs` can add, replace, and delete entries in:
+
+- `dpf/`
+- `dpv/`
+- `groups/`
+- `dpg/`
+
+The implementation uses two paths:
+
+- **append fast path** for pure additions of new entry names
+- **selective rewrite path** for replacements, deletions, prefix deletions, or
+  coordinated `header.json` updates
+
+Append-only edits use ZIP append mode directly. Rewrite edits copy unchanged ZIP
+members forward without decompressing and recompressing every file, skip deleted
+or replaced members, then write the new payloads and replace the original
+archive.
+
+This means archive mutation is usually much cheaper than extracting the full
+archive to a directory tree and rebuilding it from scratch.
+
+### Replacement and deletion semantics
+
+- Archive entries are treated as unique by logical path.
+- Replacing an entry means rewriting the archive with the old path removed and
+  the new path written once.
+- Deletion can target a single entry path or a whole prefix such as
+  `dpg/<group>/`.
+- Deleting a group also removes its `dpg/<group>/` subtree.
+- `odx-rs` does not rely on duplicate ZIP member names or shadowed entries.
+
+### Header and metadata updates
+
+Most payload additions and deletions do not require header changes beyond row
+count validation against the existing `NB_VOXELS` or `NB_PEAKS`.
+
+When an edited array has an `ARRAY_QUANTIZATION` entry, `odx-rs` updates
+`header.json` in the same transaction as the ZIP mutation so that stale
+quantization metadata is not left behind.
+
+Archive comments are preserved across selective rewrites.
 
 ## Structural Analogy to TRX
 

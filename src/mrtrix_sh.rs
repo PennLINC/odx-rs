@@ -172,6 +172,63 @@ fn condition_number(m: &DMatrix<f64>) -> f64 {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RowSamplePlan {
+    transform: Array2<f32>,
+    ncoeffs: usize,
+    ndir: usize,
+    clamp_nonnegative: bool,
+}
+
+impl RowSamplePlan {
+    pub fn for_sh_rows_nonnegative(dirs_ras: &[[f32; 3]], ncoeffs: usize) -> Result<Self> {
+        let lmax = lmax_for_ncoeffs(ncoeffs)?;
+        let transform = sh2amp_cart(dirs_ras, lmax);
+        let (ndir, cols) = transform.dim();
+        Ok(Self {
+            transform,
+            ncoeffs: cols,
+            ndir,
+            clamp_nonnegative: true,
+        })
+    }
+
+    pub fn ncoeffs(&self) -> usize {
+        self.ncoeffs
+    }
+
+    pub fn ndir(&self) -> usize {
+        self.ndir
+    }
+
+    pub fn apply_row_into(&self, src: &[f32], dst: &mut [f32]) {
+        assert_eq!(src.len(), self.ncoeffs);
+        assert_eq!(dst.len(), self.ndir);
+        apply_transform_row_into(&self.transform, src, dst);
+        if self.clamp_nonnegative {
+            for value in dst.iter_mut() {
+                *value = value.max(0.0);
+            }
+        }
+    }
+
+    pub fn apply_row(&self, src: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; self.ndir];
+        self.apply_row_into(src, &mut out);
+        out
+    }
+
+    pub fn transform_flat(&self) -> &[f32] {
+        self.transform
+            .as_slice()
+            .expect("MRtrix SH transform should be contiguous")
+    }
+
+    pub fn source_dir_count(&self) -> usize {
+        self.ndir
+    }
+}
+
 pub fn sh2amp_cart(dirs_ras: &[[f32; 3]], lmax: usize) -> Array2<f32> {
     let mut data = Vec::with_capacity(dirs_ras.len() * ncoeffs_for_lmax(lmax));
     for &dir in dirs_ras {
@@ -236,17 +293,13 @@ pub fn sample_rows_nonnegative(
     dirs_ras: &[[f32; 3]],
     ncoeffs: usize,
 ) -> Result<Vec<f32>> {
-    let lmax = lmax_for_ncoeffs(ncoeffs)?;
-    let transform = sh2amp_cart(dirs_ras, lmax);
-    let (ndir, _) = transform.dim();
+    let plan = RowSamplePlan::for_sh_rows_nonnegative(dirs_ras, ncoeffs)?;
+    let ndir = plan.ndir();
     let mut out = vec![0.0f32; nrows * ndir];
     for row in 0..nrows {
         let src = &coeffs[row * ncoeffs..(row + 1) * ncoeffs];
         let dst = &mut out[row * ndir..(row + 1) * ndir];
-        apply_transform_row_into(&transform, src, dst);
-        for value in dst.iter_mut() {
-            *value = value.max(0.0);
-        }
+        plan.apply_row_into(src, dst);
     }
     Ok(out)
 }
@@ -322,5 +375,41 @@ mod tests {
         let amp = sample_nonnegative(&coeffs, &dirs).unwrap();
         let fit = fit_from_amplitudes(&amp, &dirs, 2).unwrap();
         assert_eq!(fit.len(), coeffs.len());
+    }
+
+    #[test]
+    fn row_sample_plan_matches_batch_sampling() {
+        let dirs = vec![
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.57735026, 0.57735026, 0.57735026],
+        ];
+        let coeffs = vec![
+            1.0, 0.1, 0.2, 0.3, 0.4, 0.5, //
+            0.8, 0.2, 0.1, 0.0, -0.1, 0.3,
+        ];
+        let expected = sample_rows_nonnegative(&coeffs, 2, &dirs, 6).unwrap();
+        let plan = RowSamplePlan::for_sh_rows_nonnegative(&dirs, 6).unwrap();
+        let mut actual = vec![0.0f32; expected.len()];
+        for row in 0..2 {
+            plan.apply_row_into(
+                &coeffs[row * 6..(row + 1) * 6],
+                &mut actual[row * plan.ndir()..(row + 1) * plan.ndir()],
+            );
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn row_sample_plan_reuses_output_buffer() {
+        let dirs = vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let coeffs = vec![1.0, 0.1, 0.2, 0.3, 0.4, 0.5];
+        let plan = RowSamplePlan::for_sh_rows_nonnegative(&dirs, coeffs.len()).unwrap();
+        let mut out = vec![f32::NAN; plan.ndir()];
+        plan.apply_row_into(&coeffs, &mut out);
+        assert!(out.iter().all(|value| value.is_finite()));
+        let second = plan.apply_row(&coeffs);
+        assert_eq!(out, second);
     }
 }

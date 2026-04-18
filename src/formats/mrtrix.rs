@@ -8,11 +8,13 @@ use nalgebra::Matrix3;
 use ndarray::{Array, IxDyn};
 use nifti::{NiftiHeader, NiftiType};
 
+use crate::data_array::DataArray;
 use crate::dtype::DType;
 use crate::error::{OdxError, Result};
 use crate::formats::mif;
-use crate::header::CanonicalDenseRepresentation;
-use crate::mmap_backing::vec_to_bytes;
+use crate::header::{CanonicalDenseRepresentation, Header};
+use crate::mmap_backing::{vec_into_bytes, MmapBacking};
+use crate::odx_file::OdxParts;
 use crate::stream::OdxBuilder;
 use crate::OdxDataset;
 
@@ -370,23 +372,46 @@ pub fn save_mrtrix_fixels(
 fn build_sh_only_dataset(sh: LoadedF32Image) -> Result<OdxDataset> {
     let dims3 = image_dims3(&sh.dims)?;
     let voxel_count = dims3[0] as usize * dims3[1] as usize * dims3[2] as usize;
-    let mut builder = OdxBuilder::new(sh.affine, dims3, vec![1u8; voxel_count]);
-    for _ in 0..voxel_count {
-        builder.push_voxel_peaks(&[]);
-    }
     let ncoeffs = *sh
         .dims
         .get(3)
         .ok_or_else(|| OdxError::Format("MRtrix SH image must be 4D".into()))?;
     let order = infer_sh_order(ncoeffs)?;
-    builder.set_sh_info(order, "tournier07".into());
-    builder.set_sh_data(
-        "coefficients",
-        vec_to_bytes(sh.data),
-        ncoeffs,
-        DType::Float32,
+    let mut sh_arrays = HashMap::new();
+    sh_arrays.insert(
+        "coefficients".to_string(),
+        DataArray::owned_bytes(vec_into_bytes(sh.data), ncoeffs, DType::Float32),
     );
-    builder.finalize()
+
+    Ok(OdxDataset::from_parts(OdxParts {
+        header: Header {
+            voxel_to_rasmm: sh.affine,
+            dimensions: dims3,
+            nb_voxels: voxel_count as u64,
+            nb_peaks: 0,
+            nb_sphere_vertices: None,
+            nb_sphere_faces: None,
+            sh_order: Some(order),
+            sh_basis: Some("tournier07".into()),
+            canonical_dense_representation: Some(CanonicalDenseRepresentation::Sh),
+            sphere_id: None,
+            odf_sample_domain: None,
+            array_quantization: HashMap::new(),
+            extra: HashMap::new(),
+        },
+        mask_backing: MmapBacking::Owned(vec![1u8; voxel_count]),
+        offsets_backing: MmapBacking::Owned(vec_into_bytes(vec![0u32; voxel_count + 1])),
+        directions_backing: MmapBacking::Owned(vec_into_bytes(Vec::<[f32; 3]>::new())),
+        sphere_vertices: None,
+        sphere_faces: None,
+        odf: HashMap::new(),
+        sh: sh_arrays,
+        dpv: HashMap::new(),
+        dpf: HashMap::new(),
+        groups: HashMap::new(),
+        dpg: HashMap::new(),
+        tempdir: None,
+    }))
 }
 
 fn build_fixels_dataset(fixels: CanonicalFixels, sh: Option<LoadedF32Image>) -> Result<OdxDataset> {
@@ -409,10 +434,10 @@ fn build_fixels_dataset(fixels: CanonicalFixels, sh: Option<LoadedF32Image>) -> 
     }
 
     for (name, (values, ncols)) in dpf {
-        builder.set_dpf_data(&name, vec_to_bytes(values), ncols, DType::Float32);
+        builder.set_dpf_data(&name, vec_into_bytes(values), ncols, DType::Float32);
     }
     for (name, (values, ncols)) in dpv {
-        builder.set_dpv_data(&name, vec_to_bytes(values), ncols, DType::Float32);
+        builder.set_dpv_data(&name, vec_into_bytes(values), ncols, DType::Float32);
     }
 
     if let Some(sh_image) = sh {
@@ -421,19 +446,23 @@ fn build_fixels_dataset(fixels: CanonicalFixels, sh: Option<LoadedF32Image>) -> 
             .get(3)
             .ok_or_else(|| OdxError::Format("MRtrix SH image must be 4D".into()))?;
         let order = infer_sh_order(ncoeffs)?;
-        let mut masked = Vec::with_capacity(mask.iter().filter(|&&m| m != 0).count() * ncoeffs);
+        let masked_rows = mask.iter().filter(|&&m| m != 0).count();
+        let mut masked = vec![0.0f32; masked_rows * ncoeffs];
         let voxels = (dims[0] * dims[1] * dims[2]) as usize;
+        let mut masked_row = 0usize;
         for flat_idx in 0..voxels {
             if mask[flat_idx] == 0 {
                 continue;
             }
             let start = flat_idx * ncoeffs;
-            masked.extend_from_slice(&sh_image.data[start..start + ncoeffs]);
+            let dst = masked_row * ncoeffs;
+            masked[dst..dst + ncoeffs].copy_from_slice(&sh_image.data[start..start + ncoeffs]);
+            masked_row += 1;
         }
         builder.set_sh_info(order, "tournier07".into());
         builder.set_sh_data(
             "coefficients",
-            vec_to_bytes(masked),
+            vec_into_bytes(masked),
             ncoeffs,
             DType::Float32,
         );
@@ -549,12 +578,7 @@ fn load_canonical_fixels(dir: &Path) -> Result<CanonicalFixels> {
 
 fn load_f32_image(path: &Path) -> Result<LoadedF32Image> {
     if is_mif_path(path) {
-        let img = mif::read_mif(path)?;
-        let mut loaded = LoadedF32Image {
-            dims: img.header.dimensions.clone(),
-            affine: img.affine_4x4(),
-            data: img.logical_f32_vec()?,
-        };
+        let mut loaded = load_mif_f32_image(path)?;
         canonicalize_spatial_axes_to_ras_f32(&mut loaded);
         Ok(loaded)
     } else if is_nifti_path(path) {
@@ -569,12 +593,7 @@ fn load_f32_image(path: &Path) -> Result<LoadedF32Image> {
 
 fn load_u32_image(path: &Path) -> Result<LoadedU32Image> {
     if is_mif_path(path) {
-        let img = mif::read_mif(path)?;
-        let mut loaded = LoadedU32Image {
-            dims: img.header.dimensions.clone(),
-            affine: img.affine_4x4(),
-            data: img.logical_u32_vec()?,
-        };
+        let mut loaded = load_mif_u32_image(path)?;
         canonicalize_spatial_axes_to_ras_u32(&mut loaded);
         Ok(loaded)
     } else if is_nifti_path(path) {
@@ -585,6 +604,209 @@ fn load_u32_image(path: &Path) -> Result<LoadedU32Image> {
             path.display()
         )))
     }
+}
+
+fn load_mif_f32_image(path: &Path) -> Result<LoadedF32Image> {
+    let bytes = mif::read_mif_bytes(path)?;
+    let header = mif::parse_mif_header(&bytes)?;
+    let payload = bytes.get(header.data_offset..).ok_or_else(|| {
+        OdxError::Format(format!(
+            "MIF data offset {} exceeds file length in '{}'",
+            header.data_offset,
+            path.display()
+        ))
+    })?;
+    Ok(LoadedF32Image {
+        dims: header.dimensions.clone(),
+        affine: header.affine_4x4(),
+        data: decode_mif_real_to_logical_f32(payload, &header)?,
+    })
+}
+
+fn load_mif_u32_image(path: &Path) -> Result<LoadedU32Image> {
+    let bytes = mif::read_mif_bytes(path)?;
+    let header = mif::parse_mif_header(&bytes)?;
+    let payload = bytes.get(header.data_offset..).ok_or_else(|| {
+        OdxError::Format(format!(
+            "MIF data offset {} exceeds file length in '{}'",
+            header.data_offset,
+            path.display()
+        ))
+    })?;
+    Ok(LoadedU32Image {
+        dims: header.dimensions.clone(),
+        affine: header.affine_4x4(),
+        data: decode_mif_u32_to_logical(payload, &header)?,
+    })
+}
+
+fn decode_mif_real_to_logical_f32(payload: &[u8], header: &mif::MifHeader) -> Result<Vec<f32>> {
+    if !(header.datatype.starts_with("Float32") || header.datatype.starts_with("Float64")) {
+        return Err(OdxError::Format(format!(
+            "MRtrix float image requires Float32 or Float64 MIF data, found {}",
+            header.datatype
+        )));
+    }
+
+    let total: usize = header.dimensions.iter().product();
+    let elem_size = header.element_size();
+    let expected_bytes = total
+        .checked_mul(elem_size)
+        .ok_or_else(|| OdxError::Format("MIF payload byte size overflow".into()))?;
+    if payload.len() < expected_bytes {
+        return Err(OdxError::Format(format!(
+            "MIF payload shorter than expected: {} < {}",
+            payload.len(),
+            expected_bytes
+        )));
+    }
+
+    let strides = header.compute_strides();
+    if header.is_native_endian()
+        && header.datatype.starts_with("Float32")
+        && strides_match_c_order(&header.dimensions, &strides)
+    {
+        return Ok(payload[..expected_bytes]
+            .chunks_exact(4)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect());
+    }
+
+    decode_mif_logical_values(&header.dimensions, &strides, elem_size, |offset| {
+        read_mif_float_as_f32(payload, offset, &header.datatype)
+    })
+}
+
+fn decode_mif_u32_to_logical(payload: &[u8], header: &mif::MifHeader) -> Result<Vec<u32>> {
+    if !header.datatype.starts_with("UInt32") {
+        return Err(OdxError::Format(format!(
+            "MRtrix integer image requires UInt32 MIF data, found {}",
+            header.datatype
+        )));
+    }
+
+    let total: usize = header.dimensions.iter().product();
+    let elem_size = header.element_size();
+    let expected_bytes = total
+        .checked_mul(elem_size)
+        .ok_or_else(|| OdxError::Format("MIF payload byte size overflow".into()))?;
+    if payload.len() < expected_bytes {
+        return Err(OdxError::Format(format!(
+            "MIF payload shorter than expected: {} < {}",
+            payload.len(),
+            expected_bytes
+        )));
+    }
+
+    let strides = header.compute_strides();
+    if header.is_native_endian() && strides_match_c_order(&header.dimensions, &strides) {
+        return Ok(payload[..expected_bytes]
+            .chunks_exact(4)
+            .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect());
+    }
+
+    decode_mif_logical_values(&header.dimensions, &strides, elem_size, |offset| {
+        read_mif_u32(payload, offset, &header.datatype)
+    })
+}
+
+fn decode_mif_logical_values<T, F>(
+    dims: &[usize],
+    strides: &[isize],
+    elem_size: usize,
+    mut decode_at: F,
+) -> Result<Vec<T>>
+where
+    F: FnMut(usize) -> Result<T>,
+{
+    let total: usize = dims.iter().product();
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+
+    let base_offset: isize = dims
+        .iter()
+        .zip(strides.iter())
+        .map(|(&dim, &stride)| {
+            if stride < 0 {
+                (dim as isize - 1) * (-stride)
+            } else {
+                0
+            }
+        })
+        .sum();
+
+    let mut coords = vec![0usize; dims.len()];
+    let mut logical = Vec::with_capacity(total);
+    for _ in 0..total {
+        let mut raw_index = base_offset;
+        for (&coord, &stride) in coords.iter().zip(strides.iter()) {
+            raw_index += coord as isize * stride;
+        }
+        logical.push(decode_at(raw_index as usize * elem_size)?);
+        for axis in (0..dims.len()).rev() {
+            coords[axis] += 1;
+            if coords[axis] < dims[axis] {
+                break;
+            }
+            coords[axis] = 0;
+        }
+    }
+    Ok(logical)
+}
+
+fn strides_match_c_order(dims: &[usize], strides: &[isize]) -> bool {
+    if dims.len() != strides.len() {
+        return false;
+    }
+    let mut expected = vec![0isize; dims.len()];
+    let mut stride = 1isize;
+    for axis in (0..dims.len()).rev() {
+        expected[axis] = stride;
+        stride *= dims[axis] as isize;
+    }
+    expected == strides
+}
+
+fn read_mif_float_as_f32(payload: &[u8], offset: usize, datatype: &str) -> Result<f32> {
+    match datatype {
+        "Float32LE" | "Float32" => Ok(f32::from_le_bytes(read_4(payload, offset)?)),
+        "Float32BE" => Ok(f32::from_be_bytes(read_4(payload, offset)?)),
+        "Float64LE" | "Float64" => Ok(f64::from_le_bytes(read_8(payload, offset)?) as f32),
+        "Float64BE" => Ok(f64::from_be_bytes(read_8(payload, offset)?) as f32),
+        _ => Err(OdxError::Format(format!(
+            "unsupported MIF floating datatype {}",
+            datatype
+        ))),
+    }
+}
+
+fn read_mif_u32(payload: &[u8], offset: usize, datatype: &str) -> Result<u32> {
+    match datatype {
+        "UInt32LE" | "UInt32" => Ok(u32::from_le_bytes(read_4(payload, offset)?)),
+        "UInt32BE" => Ok(u32::from_be_bytes(read_4(payload, offset)?)),
+        _ => Err(OdxError::Format(format!(
+            "unsupported MIF u32 datatype {}",
+            datatype
+        ))),
+    }
+}
+
+fn read_4(payload: &[u8], offset: usize) -> Result<[u8; 4]> {
+    payload
+        .get(offset..offset + 4)
+        .ok_or_else(|| OdxError::Format("short MIF payload while reading 4-byte value".into()))?
+        .try_into()
+        .map_err(|_| OdxError::Format("short MIF payload while reading 4-byte value".into()))
+}
+
+fn read_8(payload: &[u8], offset: usize) -> Result<[u8; 8]> {
+    payload
+        .get(offset..offset + 8)
+        .ok_or_else(|| OdxError::Format("short MIF payload while reading 8-byte value".into()))?
+        .try_into()
+        .map_err(|_| OdxError::Format("short MIF payload while reading 8-byte value".into()))
 }
 
 fn load_nifti_f32(path: &Path) -> Result<LoadedF32Image> {

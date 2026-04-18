@@ -1,3 +1,5 @@
+use std::mem::ManuallyDrop;
+
 use bytemuck::{cast_slice, cast_slice_mut, Pod};
 use memmap2::{Mmap, MmapMut};
 
@@ -5,6 +7,14 @@ use crate::error::{OdxError, Result};
 
 pub fn vec_to_bytes<T: Pod>(v: Vec<T>) -> Vec<u8> {
     cast_slice::<T, u8>(&v).to_vec()
+}
+
+pub fn vec_into_bytes<T: Pod>(v: Vec<T>) -> Vec<u8> {
+    let mut v = ManuallyDrop::new(v);
+    let len = v.len() * std::mem::size_of::<T>();
+    let cap = v.capacity() * std::mem::size_of::<T>();
+    let ptr = v.as_mut_ptr() as *mut u8;
+    unsafe { Vec::from_raw_parts(ptr, len, cap) }
 }
 
 pub enum MmapBacking {
