@@ -11,9 +11,10 @@ use nifti::{NiftiHeader, NiftiType};
 use crate::data_array::DataArray;
 use crate::dtype::DType;
 use crate::error::{OdxError, Result};
-use crate::formats::mif;
+use crate::formats::{dsistudio_odf8, mif};
 use crate::header::{CanonicalDenseRepresentation, Header};
 use crate::mmap_backing::{vec_into_bytes, MmapBacking};
+use crate::mrtrix_sh;
 use crate::odx_file::OdxParts;
 use crate::stream::OdxBuilder;
 use crate::OdxDataset;
@@ -377,17 +378,34 @@ fn build_sh_only_dataset(sh: LoadedF32Image) -> Result<OdxDataset> {
         .get(3)
         .ok_or_else(|| OdxError::Format("MRtrix SH image must be 4D".into()))?;
     let order = infer_sh_order(ncoeffs)?;
+    let sample_plan =
+        mrtrix_sh::RowSamplePlan::for_sh_rows_nonnegative(dsistudio_odf8::hemisphere_vertices_ras(), ncoeffs)?;
+    let mut sampled = vec![0.0f32; sample_plan.ndir()];
+    let mut mask = vec![0u8; voxel_count];
+    let mut masked = Vec::with_capacity(sh.data.len());
+    for voxel in 0..voxel_count {
+        let start = voxel * ncoeffs;
+        let end = start + ncoeffs;
+        let row = &sh.data[start..end];
+        sample_plan.apply_row_into(row, &mut sampled);
+        let amplitude_sum: f32 = sampled.iter().copied().sum();
+        if amplitude_sum > 1e-6 {
+            mask[voxel] = 1;
+            masked.extend_from_slice(row);
+        }
+    }
+    let masked_voxel_count = mask.iter().filter(|&&m| m != 0).count();
     let mut sh_arrays = HashMap::new();
     sh_arrays.insert(
         "coefficients".to_string(),
-        DataArray::owned_bytes(vec_into_bytes(sh.data), ncoeffs, DType::Float32),
+        DataArray::owned_bytes(vec_into_bytes(masked), ncoeffs, DType::Float32),
     );
 
     Ok(OdxDataset::from_parts(OdxParts {
         header: Header {
             voxel_to_rasmm: sh.affine,
             dimensions: dims3,
-            nb_voxels: voxel_count as u64,
+            nb_voxels: masked_voxel_count as u64,
             nb_peaks: 0,
             nb_sphere_vertices: None,
             nb_sphere_faces: None,
@@ -399,8 +417,8 @@ fn build_sh_only_dataset(sh: LoadedF32Image) -> Result<OdxDataset> {
             array_quantization: HashMap::new(),
             extra: HashMap::new(),
         },
-        mask_backing: MmapBacking::Owned(vec![1u8; voxel_count]),
-        offsets_backing: MmapBacking::Owned(vec_into_bytes(vec![0u32; voxel_count + 1])),
+        mask_backing: MmapBacking::Owned(mask),
+        offsets_backing: MmapBacking::Owned(vec_into_bytes(vec![0u32; masked_voxel_count + 1])),
         directions_backing: MmapBacking::Owned(vec_into_bytes(Vec::<[f32; 3]>::new())),
         sphere_vertices: None,
         sphere_faces: None,
@@ -1811,6 +1829,34 @@ fn write_f64_row(buf: &mut [u8], offset: usize, row: &[f64; 4]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sh_only_dataset_derives_mask_from_sampled_amplitudes() {
+        let dims = vec![2usize, 1, 1, 6];
+        let affine = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let sh = LoadedF32Image {
+            dims,
+            affine,
+            data: vec![
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, // positive isotropic voxel
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // empty voxel
+            ],
+        };
+
+        let odx = build_sh_only_dataset(sh).unwrap();
+        assert_eq!(odx.header().dimensions, [2, 1, 1]);
+        assert_eq!(odx.nb_voxels(), 1);
+        assert_eq!(odx.mask(), &[1, 0]);
+
+        let coeffs = odx.sh::<f32>("coefficients").unwrap();
+        assert_eq!(coeffs.nrows(), 1);
+        assert_eq!(coeffs.row(0), &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
 
     #[test]
     fn fortran_reorder_round_trip_u32() {
