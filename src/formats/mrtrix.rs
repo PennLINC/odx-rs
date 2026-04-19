@@ -108,6 +108,8 @@ struct CanonicalFixels {
     dpv: HashMap<String, (Vec<f32>, usize)>,
 }
 
+const ANISOTROPIC_POWER_DPV_NAME: &str = "anisotropic_power";
+
 pub fn load_mrtrix(path_or_dir: &Path) -> Result<OdxDataset> {
     if path_or_dir.is_dir() {
         load_mrtrix_fixels(path_or_dir)
@@ -381,6 +383,7 @@ fn build_sh_only_dataset(sh: LoadedF32Image) -> Result<OdxDataset> {
     let order = infer_sh_order(ncoeffs)?;
     let mut mask = vec![0u8; voxel_count];
     let mut masked = Vec::with_capacity(sh.data.len());
+    let mut anisotropic_power: Vec<f32> = Vec::with_capacity(voxel_count);
     for voxel in 0..voxel_count {
         let start = voxel * ncoeffs;
         let end = start + ncoeffs;
@@ -389,6 +392,7 @@ fn build_sh_only_dataset(sh: LoadedF32Image) -> Result<OdxDataset> {
         if coeff_sum_abs > SH_MASK_EPSILON {
             mask[voxel] = 1;
             masked.extend_from_slice(row);
+            anisotropic_power.push(row.iter().map(|value| value * value).sum());
         }
     }
     let masked_voxel_count = mask.iter().filter(|&&m| m != 0).count();
@@ -421,7 +425,10 @@ fn build_sh_only_dataset(sh: LoadedF32Image) -> Result<OdxDataset> {
         sphere_faces: None,
         odf: HashMap::new(),
         sh: sh_arrays,
-        dpv: HashMap::new(),
+        dpv: HashMap::from([(
+            ANISOTROPIC_POWER_DPV_NAME.to_string(),
+            DataArray::owned_bytes(vec_into_bytes(anisotropic_power), 1, DType::Float32),
+        )]),
         dpf: HashMap::new(),
         groups: HashMap::new(),
         dpg: HashMap::new(),
@@ -463,6 +470,7 @@ fn build_fixels_dataset(fixels: CanonicalFixels, sh: Option<LoadedF32Image>) -> 
         let order = infer_sh_order(ncoeffs)?;
         let masked_rows = mask.iter().filter(|&&m| m != 0).count();
         let mut masked = vec![0.0f32; masked_rows * ncoeffs];
+        let mut anisotropic_power = vec![0.0f32; masked_rows];
         let voxels = (dims[0] * dims[1] * dims[2]) as usize;
         let mut masked_row = 0usize;
         for flat_idx in 0..voxels {
@@ -471,7 +479,9 @@ fn build_fixels_dataset(fixels: CanonicalFixels, sh: Option<LoadedF32Image>) -> 
             }
             let start = flat_idx * ncoeffs;
             let dst = masked_row * ncoeffs;
-            masked[dst..dst + ncoeffs].copy_from_slice(&sh_image.data[start..start + ncoeffs]);
+            let row = &sh_image.data[start..start + ncoeffs];
+            masked[dst..dst + ncoeffs].copy_from_slice(row);
+            anisotropic_power[masked_row] = row.iter().map(|value| value * value).sum();
             masked_row += 1;
         }
         builder.set_sh_info(order, "tournier07".into());
@@ -479,6 +489,12 @@ fn build_fixels_dataset(fixels: CanonicalFixels, sh: Option<LoadedF32Image>) -> 
             "coefficients",
             vec_into_bytes(masked),
             ncoeffs,
+            DType::Float32,
+        );
+        builder.set_dpv_data(
+            ANISOTROPIC_POWER_DPV_NAME,
+            vec_into_bytes(anisotropic_power),
+            1,
             DType::Float32,
         );
         builder.set_canonical_dense_representation(CanonicalDenseRepresentation::Sh);
@@ -1853,6 +1869,10 @@ mod tests {
         let coeffs = odx.sh::<f32>("coefficients").unwrap();
         assert_eq!(coeffs.nrows(), 1);
         assert_eq!(coeffs.row(0), &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+        let anisotropic_power = odx.dpv::<f32>(ANISOTROPIC_POWER_DPV_NAME).unwrap();
+        assert_eq!(anisotropic_power.nrows(), 1);
+        assert_eq!(anisotropic_power.row(0), &[1.0]);
     }
 
     #[test]
