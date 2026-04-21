@@ -3,8 +3,8 @@ use std::process::Command;
 
 use odx_rs::formats::dsistudio_odf8;
 use odx_rs::interop::{
-    dsistudio_to_mrtrix, mrtrix_to_dsistudio, DenseOdfMode, DsistudioFormat,
-    DsistudioToMrtrixOptions, MrtrixToDsistudioOptions, PeakSource,
+    dsistudio_to_mrtrix, mrtrix_to_dsistudio, save_dsistudio_from_odx, DenseOdfMode,
+    DsistudioFormat, DsistudioToMrtrixOptions, MrtrixToDsistudioOptions, PeakSource,
 };
 use odx_rs::{dsistudio, mif, mrtrix, mrtrix_sh, read_reference_affine};
 
@@ -118,6 +118,40 @@ fn dsistudio_to_mrtrix_exports_fixels_and_sh_when_dense_odf_exists() {
     let reloaded_sh = mrtrix::load_mrtrix_sh(&out_sh).unwrap();
     assert!(reloaded_fixels.nb_peaks() > 0);
     assert_eq!(reloaded_sh.header().sh_basis.as_deref(), Some("tournier07"));
+}
+
+#[test]
+fn dsistudio_fib_to_fz_preserves_existing_dense_odf() {
+    let fib = fixture_path(FIB_PATH);
+    let reference = fixture_path(REF_AFFINE_PATH);
+    if !fib.exists() || !reference.exists() {
+        eprintln!("skipping missing fixture {}", fib.display());
+        return;
+    }
+
+    let odx = dsistudio::load_fibgz(&fib, Some(fixture_reference_affine())).unwrap();
+    let orig_odf = odx.odf::<f32>("amplitudes").unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("preserved_dense_odf.fz");
+    save_dsistudio_from_odx(
+        &odx,
+        &out,
+        &MrtrixToDsistudioOptions {
+            output_format: DsistudioFormat::Fz,
+            dense_odf_mode: DenseOdfMode::Off,
+            peak_source: PeakSource::Fixels,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let reloaded = dsistudio::load_fz(&out, None).unwrap();
+    let rt_odf = reloaded.odf::<f32>("amplitudes").unwrap();
+    assert_eq!(orig_odf.shape(), rt_odf.shape());
+
+    let max_diff = max_abs_diff(orig_odf.as_flat_slice(), rt_odf.as_flat_slice());
+    assert!(max_diff < 0.02, "preserved fz ODF max diff {max_diff}");
 }
 
 #[test]

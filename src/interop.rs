@@ -229,9 +229,6 @@ fn prepare_dsistudio_dataset(
         );
         parts.header.canonical_dense_representation = Some(CanonicalDenseRepresentation::Odf);
         parts.header.odf_sample_domain = Some("hemisphere".into());
-    } else {
-        parts.odf.remove("amplitudes");
-        parts.header.odf_sample_domain = None;
     }
 
     let (offsets, directions, amplitudes) = match options.peak_source {
