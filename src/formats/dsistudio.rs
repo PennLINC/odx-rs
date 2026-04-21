@@ -37,10 +37,7 @@ fn get_required<'a>(mat: &'a MatCatalog, key: &str) -> Result<MatRecord<'a>> {
         .ok_or_else(|| OdxError::Format(format!("missing required key '{key}' in dsistudio file")))
 }
 
-fn load_dsistudio_mat(
-    path: &Path,
-    affine: Option<[[f64; 4]; 4]>,
-) -> Result<OdxDataset> {
+fn load_dsistudio_mat(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxDataset> {
     let mat = mat4::read_mat4_gz(path)?;
 
     let dim_arr = get_required(&mat, "dimension")?;
@@ -475,34 +472,25 @@ fn split_trailing_index(name: &str) -> Option<(&str, usize)> {
     Some((prefix, suffix.parse().ok()?))
 }
 
-// NIfTI affine (voxel→RAS+ mm) = diag(-1,-1,1,1) · DSI Studio `trans` (voxel→LPS+ mm).
+// DSI Studio `trans` stores the full voxel→RAS+ world affine directly.
+// The voxel index ordering in DSI Studio files is still reoriented into LPS+
+// array order, but the affine output space itself is RAS+.
 fn dsistudio_trans_to_nifti_affine(flat: Vec<f32>) -> [[f64; 4]; 4] {
-    let mut lps = [[0.0f64; 4]; 4];
+    let mut ras = [[0.0f64; 4]; 4];
     for r in 0..4 {
         for c in 0..4 {
             let idx = r * 4 + c;
             if idx < flat.len() {
-                lps[r][c] = flat[idx] as f64;
+                ras[r][c] = flat[idx] as f64;
             }
         }
     }
-    [
-        [-lps[0][0], -lps[0][1], -lps[0][2], -lps[0][3]],
-        [-lps[1][0], -lps[1][1], -lps[1][2], -lps[1][3]],
-        [lps[2][0], lps[2][1], lps[2][2], lps[2][3]],
-        [lps[3][0], lps[3][1], lps[3][2], lps[3][3]],
-    ]
+    ras
 }
 
-// DSI Studio `trans` (voxel→LPS+ mm) = diag(-1,-1,1,1) · NIfTI affine (voxel→RAS+ mm).
+// DSI Studio `trans` stores the full voxel→RAS+ world affine directly.
 fn nifti_affine_to_dsistudio_trans(aff: [[f64; 4]; 4]) -> Vec<f32> {
-    let lps = [
-        [-aff[0][0], -aff[0][1], -aff[0][2], -aff[0][3]],
-        [-aff[1][0], -aff[1][1], -aff[1][2], -aff[1][3]],
-        [aff[2][0], aff[2][1], aff[2][2], aff[2][3]],
-        [aff[3][0], aff[3][1], aff[3][2], aff[3][3]],
-    ];
-    lps.into_iter()
+    aff.into_iter()
         .flat_map(|row| row.into_iter().map(|v| v as f32))
         .collect()
 }
@@ -729,8 +717,9 @@ fn build_dsistudio_records(odx: &OdxDataset, masked_sloped: bool) -> Result<Vec<
     let (dst_dims_usize, vox_size, c_to_f, reoriented_aff) =
         build_dsistudio_export_geometry(*aff, [si, sj, sk], reorient_to_lps);
     let (di, dj, dk) = (dst_dims_usize[0], dst_dims_usize[1], dst_dims_usize[2]);
-    // `trans` stores the voxel→LPS+ mm affine. We derive it from the reoriented
-    // NIfTI affine (voxel→RAS+ mm) by flipping the RAS+ output space to LPS+ mm.
+    // `trans` stores the voxel→RAS+ mm affine directly, even though the DSI
+    // Studio voxel arrays themselves are reoriented into LPS+ index space.
+    // The reoriented affine already reflects the index-space transform.
     // DSI Studio uses this full 4×4 for NIfTI I/O and tract I/O;
     // `initial_LPS_nifti_srow` is only a fallback when `trans` is absent
     // (fib_data.cpp:752-754). `apply_trans`/`apply_inverse_trans` are diagonal-only

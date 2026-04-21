@@ -1,14 +1,37 @@
 use std::path::Path;
 
+use odx_rs::formats::mat4;
 use odx_rs::{dsistudio, read_reference_affine, OdxDataset};
 
 const FIB_PATH: &str =
     "../test_data/sub-NDARAE199TDD_ses-1_acq-64dirVARIANTVar1e_space-ACPC_model-ss3t_dwimap.fib.gz";
 const REF_AFFINE_PATH: &str =
     "../test_data/sub-NDARAE199TDD_ses-1_acq-64dirVARIANTVar1e_space-ACPC_model-tensor_param-fa_dwimap.nii.gz";
+const SUB20124_FZ_PATH: &str = "../test_data/sub-20124_ses-1_space-ACPC_desc-preproc_dwi.gqi.fz";
+const SUB20124_FIB_PATH: &str = "../test_data/sub-20124_ses-1_space-ACPC_model-gqi_dwimap.fib.gz";
+const SUB20124_REF_AFFINE_PATH: &str =
+    "../test_data/sub-20124_ses-1_space-ACPC_model-tensor_param-fa_dwimap.nii.gz";
 
 fn fixture_reference_affine() -> [[f64; 4]; 4] {
     read_reference_affine(Path::new(REF_AFFINE_PATH)).unwrap()
+}
+
+fn sub20124_reference_affine() -> [[f64; 4]; 4] {
+    read_reference_affine(Path::new(SUB20124_REF_AFFINE_PATH)).unwrap()
+}
+
+fn assert_affine_close(actual: [[f64; 4]; 4], expected: [[f64; 4]; 4], tol: f64) {
+    for row in 0..4 {
+        for col in 0..4 {
+            let diff = (actual[row][col] - expected[row][col]).abs();
+            assert!(
+                diff <= tol,
+                "affine mismatch at [{row}][{col}]: actual={} expected={} diff={diff}",
+                actual[row][col],
+                expected[row][col]
+            );
+        }
+    }
 }
 
 #[test]
@@ -205,6 +228,21 @@ fn fz_round_trip_to_odx() {
         odx.header().nb_sphere_vertices
     );
     assert_eq!(odx2.header().nb_sphere_faces, odx.header().nb_sphere_faces);
+    assert_affine_close(
+        odx2.header().voxel_to_rasmm,
+        odx.header().voxel_to_rasmm,
+        1e-6,
+    );
+
+    let mat = mat4::read_mat4_gz(&fz_out).unwrap();
+    let raw_trans = mat.get("trans").unwrap().as_f32_vec();
+    let expected_trans: Vec<f32> = odx
+        .header()
+        .voxel_to_rasmm
+        .into_iter()
+        .flat_map(|row| row.into_iter().map(|v| v as f32))
+        .collect();
+    assert_eq!(raw_trans, expected_trans);
 
     let orig_odf = odx.odf::<f32>("amplitudes").unwrap();
     let rt_odf = odx2.odf::<f32>("amplitudes").unwrap();
@@ -216,6 +254,50 @@ fn fz_round_trip_to_odx() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     assert!(max_diff < 0.02, "fz ODF max difference: {max_diff}");
+}
+
+#[test]
+fn sub20124_fz_trans_matches_raw_storage_and_reference_affine() {
+    let path = Path::new(SUB20124_FZ_PATH);
+    let reference = Path::new(SUB20124_REF_AFFINE_PATH);
+    if !path.exists() || !reference.exists() {
+        eprintln!("skipping missing sub-20124 fixture");
+        return;
+    }
+
+    let odx = dsistudio::load_fz(path, None).unwrap();
+    let trusted = sub20124_reference_affine();
+    assert_affine_close(odx.header().voxel_to_rasmm, trusted, 1e-5);
+
+    let mat = mat4::read_mat4_gz(path).unwrap();
+    let raw_trans = mat.get("trans").unwrap().as_f32_vec();
+    let expected_trans: Vec<f32> = trusted
+        .into_iter()
+        .flat_map(|row| row.into_iter().map(|v| v as f32))
+        .collect();
+    assert_eq!(raw_trans, expected_trans);
+}
+
+#[test]
+fn sub20124_fz_and_fibgz_reference_affines_have_matching_sign_pattern() {
+    let fz = Path::new(SUB20124_FZ_PATH);
+    let fib = Path::new(SUB20124_FIB_PATH);
+    let reference = Path::new(SUB20124_REF_AFFINE_PATH);
+    if !fz.exists() || !fib.exists() || !reference.exists() {
+        eprintln!("skipping missing sub-20124 fixtures");
+        return;
+    }
+
+    let fz_odx = dsistudio::load_fz(fz, None).unwrap();
+    let fib_odx = dsistudio::load_fibgz(fib, Some(sub20124_reference_affine())).unwrap();
+    let trusted = sub20124_reference_affine();
+
+    assert_affine_close(fz_odx.header().voxel_to_rasmm, trusted, 1e-5);
+    assert_affine_close(fib_odx.header().voxel_to_rasmm, trusted, 1e-5);
+
+    assert!(fz_odx.header().voxel_to_rasmm[0][0] < 0.0);
+    assert!(fz_odx.header().voxel_to_rasmm[1][1] < 0.0);
+    assert!(fz_odx.header().voxel_to_rasmm[2][2] > 0.0);
 }
 
 #[test]

@@ -463,11 +463,11 @@ mod tests {
             mat.get("fa0").unwrap().as_f32_vec(),
             vec![40.0, 20.0, 30.0, 10.0]
         );
-        // identity affine + x/y flip → reoriented RAS [[-1,0,0,1],[0,-1,0,1],[0,0,1,0]]
-        // → LPS (negate rows 0,1): [[1,0,0,-1],[0,1,0,-1],[0,0,1,0]]
+        // identity affine + x/y flip from the voxel reorientation
+        // → reoriented RAS [[-1,0,0,1],[0,-1,0,1],[0,0,1,0]]
         assert_eq!(
             mat.get("trans").unwrap().as_f32_vec(),
-            vec![1.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,]
+            vec![-1.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,]
         );
     }
 }
