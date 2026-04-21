@@ -23,6 +23,7 @@ pub use formats::dsistudio;
 pub use formats::mif;
 pub use formats::mrtrix;
 pub use formats::pam;
+pub use formats::tortoise_mapmri;
 pub use header::{CanonicalDenseRepresentation, Header, QuantizationSpec};
 pub use interop::{
     dsistudio_to_mrtrix, mrtrix_to_dsistudio, DenseOdfMode, DsistudioFormat,

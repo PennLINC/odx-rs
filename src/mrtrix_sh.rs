@@ -23,6 +23,17 @@ pub fn lmax_for_ncoeffs(n: usize) -> Result<usize> {
     }
 }
 
+pub fn max_lmax_for_direction_count(ndir: usize) -> usize {
+    let mut lmax = 0usize;
+    loop {
+        let next = lmax + 2;
+        if ncoeffs_for_lmax(next) > ndir {
+            return lmax;
+        }
+        lmax = next;
+    }
+}
+
 /// MRtrix stores the real even-order basis using index = l(l+1)/2 + m.
 ///
 /// Keeping the exact indexing rule here avoids drift between the Rust sampling
@@ -229,6 +240,45 @@ impl RowSamplePlan {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RowFitPlan {
+    transform: Array2<f32>,
+    ndir: usize,
+    ncoeffs: usize,
+}
+
+impl RowFitPlan {
+    pub fn for_amplitudes(dirs_ras: &[[f32; 3]], lmax: usize) -> Result<Self> {
+        let transform = amp2sh_cart(dirs_ras, lmax)?;
+        let (ncoeffs, ndir) = transform.dim();
+        Ok(Self {
+            transform,
+            ndir,
+            ncoeffs,
+        })
+    }
+
+    pub fn source_dir_count(&self) -> usize {
+        self.ndir
+    }
+
+    pub fn target_coeff_count(&self) -> usize {
+        self.ncoeffs
+    }
+
+    pub fn apply_row_into(&self, src: &[f32], dst: &mut [f32]) {
+        assert_eq!(src.len(), self.ndir);
+        assert_eq!(dst.len(), self.ncoeffs);
+        apply_transform_row_into(&self.transform, src, dst);
+    }
+
+    pub fn apply_row(&self, src: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; self.ncoeffs];
+        self.apply_row_into(src, &mut out);
+        out
+    }
+}
+
 pub fn sh2amp_cart(dirs_ras: &[[f32; 3]], lmax: usize) -> Array2<f32> {
     let mut data = Vec::with_capacity(dirs_ras.len() * ncoeffs_for_lmax(lmax));
     for &dir in dirs_ras {
@@ -267,7 +317,7 @@ pub fn resolve_lmax_for_directions(
     requested_lmax: Option<usize>,
     default_lmax: usize,
 ) -> usize {
-    let lmax_from_ndir = lmax_for_ncoeffs(dirs_ras.len()).unwrap_or(0);
+    let lmax_from_ndir = max_lmax_for_direction_count(dirs_ras.len());
     let mut lmax = requested_lmax.unwrap_or(lmax_from_ndir.min(default_lmax));
     if lmax > lmax_from_ndir {
         lmax = lmax_from_ndir;
@@ -310,14 +360,14 @@ pub fn fit_rows_from_amplitudes(
     dirs_ras: &[[f32; 3]],
     lmax: usize,
 ) -> Result<Vec<f32>> {
-    let transform = amp2sh_cart(dirs_ras, lmax)?;
-    let ncoeffs = transform.dim().0;
-    let ndir = transform.dim().1;
+    let plan = RowFitPlan::for_amplitudes(dirs_ras, lmax)?;
+    let ncoeffs = plan.target_coeff_count();
+    let ndir = plan.source_dir_count();
     let mut out = vec![0.0f32; nrows * ncoeffs];
     for row in 0..nrows {
         let src = &amplitudes[row * ndir..(row + 1) * ndir];
         let dst = &mut out[row * ncoeffs..(row + 1) * ncoeffs];
-        apply_transform_row_into(&transform, src, dst);
+        plan.apply_row_into(src, dst);
     }
     Ok(out)
 }
@@ -344,6 +394,7 @@ fn apply_transform_row_into(transform: &Array2<f32>, src: &[f32], dst: &mut [f32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::dsistudio_odf8;
 
     #[test]
     fn lmax_and_ncoeffs_round_trip() {
@@ -351,6 +402,23 @@ mod tests {
             let n = ncoeffs_for_lmax(lmax);
             assert_eq!(lmax_for_ncoeffs(n).unwrap(), lmax);
         }
+    }
+
+    #[test]
+    fn max_lmax_for_direction_count_supports_overdetermined_fits() {
+        assert_eq!(max_lmax_for_direction_count(1), 0);
+        assert_eq!(max_lmax_for_direction_count(6), 2);
+        assert_eq!(max_lmax_for_direction_count(15), 4);
+        assert_eq!(max_lmax_for_direction_count(28), 6);
+        assert_eq!(max_lmax_for_direction_count(45), 8);
+        assert_eq!(max_lmax_for_direction_count(200), 18);
+        assert_eq!(max_lmax_for_direction_count(321), 22);
+    }
+
+    #[test]
+    fn resolve_lmax_uses_direction_capacity_not_exact_cardinality() {
+        let dirs = dsistudio_odf8::hemisphere_vertices_ras().to_vec();
+        assert_eq!(resolve_lmax_for_directions(&dirs, None, 8), 8);
     }
 
     #[test]
@@ -411,5 +479,31 @@ mod tests {
         assert!(out.iter().all(|value| value.is_finite()));
         let second = plan.apply_row(&coeffs);
         assert_eq!(out, second);
+    }
+
+    #[test]
+    fn row_fit_plan_matches_batch_fitting() {
+        let dirs = vec![
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.57735026, 0.57735026, 0.57735026],
+            [-0.57735026, 0.57735026, 0.57735026],
+            [0.57735026, -0.57735026, 0.57735026],
+        ];
+        let amplitudes = vec![
+            1.0, 0.8, 0.7, 0.9, 0.6, 0.5, //
+            0.5, 0.6, 0.7, 0.4, 0.3, 0.2,
+        ];
+        let expected = fit_rows_from_amplitudes(&amplitudes, 2, &dirs, 2).unwrap();
+        let plan = RowFitPlan::for_amplitudes(&dirs, 2).unwrap();
+        let mut actual = vec![0.0f32; expected.len()];
+        for row in 0..2 {
+            plan.apply_row_into(
+                &amplitudes[row * plan.source_dir_count()..(row + 1) * plan.source_dir_count()],
+                &mut actual[row * plan.target_coeff_count()..(row + 1) * plan.target_coeff_count()],
+            );
+        }
+        assert_eq!(actual, expected);
     }
 }

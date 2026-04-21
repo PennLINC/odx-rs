@@ -4,7 +4,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::error::{OdxError, Result};
-use crate::formats::{dsistudio, mrtrix, pam};
+use crate::formats::{dsistudio, mrtrix, pam, tortoise_mapmri};
 use crate::header::CanonicalDenseRepresentation;
 use crate::reference_affine::read_reference_affine;
 use crate::{validate_dataset_detailed, OdxDataset, ValidationIssue, ValidationSeverity};
@@ -17,6 +17,7 @@ pub enum DetectedFormat {
     DsistudioFibGz,
     DsistudioFz,
     DipyPam5,
+    TortoiseMapmriNifti,
     MrtrixShImage,
     MrtrixFixelDir,
 }
@@ -29,6 +30,7 @@ impl DetectedFormat {
             Self::DsistudioFibGz => "dsistudio_fibgz",
             Self::DsistudioFz => "dsistudio_fz",
             Self::DipyPam5 => "dipy_pam5",
+            Self::TortoiseMapmriNifti => "tortoise_mapmri_nifti",
             Self::MrtrixShImage => "mrtrix_sh_image",
             Self::MrtrixFixelDir => "mrtrix_fixel_dir",
         }
@@ -40,6 +42,8 @@ pub struct LoadDatasetOptions<'a> {
     pub sh_path: Option<&'a Path>,
     pub fixel_dir: Option<&'a Path>,
     pub reference_affine: Option<&'a Path>,
+    pub mapmri_tensor_path: Option<&'a Path>,
+    pub mapmri_uvec_path: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -178,11 +182,19 @@ pub fn load_dataset_with_format(
                 options.sh_path,
                 options.fixel_dir,
                 options.reference_affine,
+                options.mapmri_tensor_path,
+                options.mapmri_uvec_path,
             )?;
             OdxDataset::load(path)?
         }
         DetectedFormat::DsistudioFibGz | DetectedFormat::DsistudioFz => {
-            reject_mrtrix_companions(detected, options.sh_path, options.fixel_dir)?;
+            reject_mrtrix_companions(
+                detected,
+                options.sh_path,
+                options.fixel_dir,
+                options.mapmri_tensor_path,
+                options.mapmri_uvec_path,
+            )?;
             let affine = options
                 .reference_affine
                 .map(read_reference_affine)
@@ -199,10 +211,43 @@ pub fn load_dataset_with_format(
                 options.sh_path,
                 options.fixel_dir,
                 options.reference_affine,
+                options.mapmri_tensor_path,
+                options.mapmri_uvec_path,
             )?;
             pam::load_pam5(path)?
         }
+        DetectedFormat::TortoiseMapmriNifti => {
+            reject_companion_inputs(
+                detected,
+                options.sh_path,
+                options.fixel_dir,
+                options.reference_affine,
+                None,
+                None,
+            )?;
+            let tensor_path = options.mapmri_tensor_path.ok_or_else(|| {
+                OdxError::Argument(
+                    "--mapmri-tensor is required for tortoise_mapmri_nifti inputs".into(),
+                )
+            })?;
+            let uvec_path = options.mapmri_uvec_path.ok_or_else(|| {
+                OdxError::Argument(
+                    "--mapmri-uvec is required for tortoise_mapmri_nifti inputs".into(),
+                )
+            })?;
+            tortoise_mapmri::load_tortoise_mapmri(path, tensor_path, uvec_path)?
+        }
         DetectedFormat::MrtrixShImage => {
+            if options.mapmri_tensor_path.is_some() {
+                return Err(OdxError::Argument(
+                    "--mapmri-tensor is only valid for TORTOISE MAPMRI inputs".into(),
+                ));
+            }
+            if options.mapmri_uvec_path.is_some() {
+                return Err(OdxError::Argument(
+                    "--mapmri-uvec is only valid for TORTOISE MAPMRI inputs".into(),
+                ));
+            }
             if options.sh_path.is_some() {
                 return Err(OdxError::Argument(
                     "--sh is only valid when the primary input is a MRtrix fixel directory".into(),
@@ -216,6 +261,16 @@ pub fn load_dataset_with_format(
             mrtrix::load_mrtrix_dataset(Some(path), options.fixel_dir)?
         }
         DetectedFormat::MrtrixFixelDir => {
+            if options.mapmri_tensor_path.is_some() {
+                return Err(OdxError::Argument(
+                    "--mapmri-tensor is only valid for TORTOISE MAPMRI inputs".into(),
+                ));
+            }
+            if options.mapmri_uvec_path.is_some() {
+                return Err(OdxError::Argument(
+                    "--mapmri-uvec is only valid for TORTOISE MAPMRI inputs".into(),
+                ));
+            }
             if options.fixel_dir.is_some() {
                 return Err(OdxError::Argument(
                     "--fixel-dir is only valid when the primary input is an SH image".into(),
@@ -460,8 +515,16 @@ fn reject_companion_inputs(
     sh_path: Option<&Path>,
     fixel_dir: Option<&Path>,
     reference_affine: Option<&Path>,
+    mapmri_tensor_path: Option<&Path>,
+    mapmri_uvec_path: Option<&Path>,
 ) -> Result<()> {
-    reject_mrtrix_companions(format, sh_path, fixel_dir)?;
+    reject_mrtrix_companions(
+        format,
+        sh_path,
+        fixel_dir,
+        mapmri_tensor_path,
+        mapmri_uvec_path,
+    )?;
     if reference_affine.is_some() {
         return Err(OdxError::Argument(
             "--reference-affine is only valid for DSI Studio inputs".into(),
@@ -474,10 +537,16 @@ fn reject_mrtrix_companions(
     format: DetectedFormat,
     sh_path: Option<&Path>,
     fixel_dir: Option<&Path>,
+    mapmri_tensor_path: Option<&Path>,
+    mapmri_uvec_path: Option<&Path>,
 ) -> Result<()> {
-    if sh_path.is_some() || fixel_dir.is_some() {
+    if sh_path.is_some()
+        || fixel_dir.is_some()
+        || mapmri_tensor_path.is_some()
+        || mapmri_uvec_path.is_some()
+    {
         return Err(OdxError::Argument(format!(
-            "{} inputs do not accept MRtrix companion flags",
+            "{} inputs do not accept companion input flags",
             format.as_str()
         )));
     }

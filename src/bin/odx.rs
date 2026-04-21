@@ -53,10 +53,14 @@ struct CommonInputArgs {
     sh: Option<PathBuf>,
     #[arg(long = "fixel-dir")]
     fixel_dir: Option<PathBuf>,
+    #[arg(long = "mapmri-tensor")]
+    mapmri_tensor: Option<PathBuf>,
+    #[arg(long = "mapmri-uvec")]
+    mapmri_uvec: Option<PathBuf>,
     #[arg(long = "reference-affine")]
     reference_affine: Option<PathBuf>,
     #[arg(long = "input-format", value_enum)]
-    input_format: Option<FormatOverride>,
+    input_format: Option<InputFormatOverride>,
     #[arg(long)]
     json: bool,
     #[arg(long)]
@@ -71,12 +75,16 @@ struct ConvertArgs {
     sh: Option<PathBuf>,
     #[arg(long = "fixel-dir")]
     fixel_dir: Option<PathBuf>,
+    #[arg(long = "mapmri-tensor")]
+    mapmri_tensor: Option<PathBuf>,
+    #[arg(long = "mapmri-uvec")]
+    mapmri_uvec: Option<PathBuf>,
     #[arg(long = "reference-affine")]
     reference_affine: Option<PathBuf>,
     #[arg(long = "input-format", value_enum)]
-    input_format: Option<FormatOverride>,
+    input_format: Option<InputFormatOverride>,
     #[arg(long = "output-format", value_enum)]
-    output_format: Option<FormatOverride>,
+    output_format: Option<OutputFormatOverride>,
     #[arg(long)]
     overwrite: bool,
     #[arg(long)]
@@ -118,10 +126,14 @@ struct ValidateArgs {
     sh: Option<PathBuf>,
     #[arg(long = "fixel-dir")]
     fixel_dir: Option<PathBuf>,
+    #[arg(long = "mapmri-tensor")]
+    mapmri_tensor: Option<PathBuf>,
+    #[arg(long = "mapmri-uvec")]
+    mapmri_uvec: Option<PathBuf>,
     #[arg(long = "reference-affine")]
     reference_affine: Option<PathBuf>,
     #[arg(long = "input-format", value_enum)]
-    input_format: Option<FormatOverride>,
+    input_format: Option<InputFormatOverride>,
     #[arg(long)]
     json: bool,
     #[arg(long)]
@@ -135,10 +147,14 @@ struct QcArgs {
     sh: Option<PathBuf>,
     #[arg(long = "fixel-dir")]
     fixel_dir: Option<PathBuf>,
+    #[arg(long = "mapmri-tensor")]
+    mapmri_tensor: Option<PathBuf>,
+    #[arg(long = "mapmri-uvec")]
+    mapmri_uvec: Option<PathBuf>,
     #[arg(long = "reference-affine")]
     reference_affine: Option<PathBuf>,
     #[arg(long = "input-format", value_enum)]
-    input_format: Option<FormatOverride>,
+    input_format: Option<InputFormatOverride>,
     #[arg(long = "primary-dpf")]
     primary_dpf: Option<String>,
     #[arg(long = "threshold", value_enum, default_value = "otsu")]
@@ -156,7 +172,19 @@ struct QcArgs {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum FormatOverride {
+enum InputFormatOverride {
+    OdxDirectory,
+    OdxArchive,
+    DsistudioFibgz,
+    DsistudioFz,
+    DipyPam5,
+    TortoiseMapmriNifti,
+    MrtrixShImage,
+    MrtrixFixelDir,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum OutputFormatOverride {
     OdxDirectory,
     OdxArchive,
     DsistudioFibgz,
@@ -218,16 +246,31 @@ enum QcThresholdArg {
     Value,
 }
 
-impl From<FormatOverride> for DetectedFormat {
-    fn from(value: FormatOverride) -> Self {
+impl From<InputFormatOverride> for DetectedFormat {
+    fn from(value: InputFormatOverride) -> Self {
         match value {
-            FormatOverride::OdxDirectory => DetectedFormat::OdxDirectory,
-            FormatOverride::OdxArchive => DetectedFormat::OdxArchive,
-            FormatOverride::DsistudioFibgz => DetectedFormat::DsistudioFibGz,
-            FormatOverride::DsistudioFz => DetectedFormat::DsistudioFz,
-            FormatOverride::DipyPam5 => DetectedFormat::DipyPam5,
-            FormatOverride::MrtrixShImage => DetectedFormat::MrtrixShImage,
-            FormatOverride::MrtrixFixelDir => DetectedFormat::MrtrixFixelDir,
+            InputFormatOverride::OdxDirectory => DetectedFormat::OdxDirectory,
+            InputFormatOverride::OdxArchive => DetectedFormat::OdxArchive,
+            InputFormatOverride::DsistudioFibgz => DetectedFormat::DsistudioFibGz,
+            InputFormatOverride::DsistudioFz => DetectedFormat::DsistudioFz,
+            InputFormatOverride::DipyPam5 => DetectedFormat::DipyPam5,
+            InputFormatOverride::TortoiseMapmriNifti => DetectedFormat::TortoiseMapmriNifti,
+            InputFormatOverride::MrtrixShImage => DetectedFormat::MrtrixShImage,
+            InputFormatOverride::MrtrixFixelDir => DetectedFormat::MrtrixFixelDir,
+        }
+    }
+}
+
+impl From<OutputFormatOverride> for DetectedFormat {
+    fn from(value: OutputFormatOverride) -> Self {
+        match value {
+            OutputFormatOverride::OdxDirectory => DetectedFormat::OdxDirectory,
+            OutputFormatOverride::OdxArchive => DetectedFormat::OdxArchive,
+            OutputFormatOverride::DsistudioFibgz => DetectedFormat::DsistudioFibGz,
+            OutputFormatOverride::DsistudioFz => DetectedFormat::DsistudioFz,
+            OutputFormatOverride::DipyPam5 => DetectedFormat::DipyPam5,
+            OutputFormatOverride::MrtrixShImage => DetectedFormat::MrtrixShImage,
+            OutputFormatOverride::MrtrixFixelDir => DetectedFormat::MrtrixFixelDir,
         }
     }
 }
@@ -315,6 +358,8 @@ fn run_info(args: CommonInputArgs) -> odx_rs::Result<()> {
         &args.input,
         args.sh.as_deref(),
         args.fixel_dir.as_deref(),
+        args.mapmri_tensor.as_deref(),
+        args.mapmri_uvec.as_deref(),
         args.reference_affine.as_deref(),
         args.input_format,
     )?;
@@ -342,6 +387,8 @@ fn run_validate(args: ValidateArgs) -> odx_rs::Result<()> {
         &args.input,
         args.sh.as_deref(),
         args.fixel_dir.as_deref(),
+        args.mapmri_tensor.as_deref(),
+        args.mapmri_uvec.as_deref(),
         args.reference_affine.as_deref(),
         args.input_format,
     )?;
@@ -368,6 +415,8 @@ fn run_qc(args: QcArgs) -> odx_rs::Result<()> {
         &args.input,
         args.sh.as_deref(),
         args.fixel_dir.as_deref(),
+        args.mapmri_tensor.as_deref(),
+        args.mapmri_uvec.as_deref(),
         args.reference_affine.as_deref(),
         args.input_format,
     )?;
@@ -459,6 +508,8 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
         &args.input,
         args.sh.as_deref(),
         args.fixel_dir.as_deref(),
+        args.mapmri_tensor.as_deref(),
+        args.mapmri_uvec.as_deref(),
         args.reference_affine.as_deref(),
         args.input_format,
     )?;
@@ -491,6 +542,11 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
         }
         DetectedFormat::DipyPam5 => {
             pam::save_pam5(&odx, &args.output, &PamWriteOptions::default())?;
+        }
+        DetectedFormat::TortoiseMapmriNifti => {
+            return Err(OdxError::Argument(
+                "TORTOISE MAPMRI output is not supported; this format is import-only".into(),
+            ));
         }
         DetectedFormat::MrtrixFixelDir => {
             mrtrix::save_mrtrix_fixels(
@@ -582,8 +638,10 @@ fn load_from_args(
     input: &Path,
     sh: Option<&Path>,
     fixel_dir: Option<&Path>,
+    mapmri_tensor: Option<&Path>,
+    mapmri_uvec: Option<&Path>,
     reference_affine: Option<&Path>,
-    input_override: Option<FormatOverride>,
+    input_override: Option<InputFormatOverride>,
 ) -> odx_rs::Result<(OdxDataset, DetectedFormat)> {
     if let Some(format) = input_override {
         let detected: DetectedFormat = format.into();
@@ -593,6 +651,8 @@ fn load_from_args(
             LoadDatasetOptions {
                 sh_path: sh,
                 fixel_dir,
+                mapmri_tensor_path: mapmri_tensor,
+                mapmri_uvec_path: mapmri_uvec,
                 reference_affine,
             },
         )?;
@@ -603,6 +663,8 @@ fn load_from_args(
         LoadDatasetOptions {
             sh_path: sh,
             fixel_dir,
+            mapmri_tensor_path: mapmri_tensor,
+            mapmri_uvec_path: mapmri_uvec,
             reference_affine,
         },
     )
@@ -610,7 +672,7 @@ fn load_from_args(
 
 fn resolve_output_format(
     output: &Path,
-    output_format: Option<FormatOverride>,
+    output_format: Option<OutputFormatOverride>,
     odx_layout: Option<OdxLayoutArg>,
     dsi_format: Option<DsistudioFormatArg>,
 ) -> odx_rs::Result<DetectedFormat> {

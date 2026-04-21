@@ -853,6 +853,11 @@ fn load_nifti_f32(path: &Path) -> Result<LoadedF32Image> {
     Ok(loaded)
 }
 
+pub(crate) fn load_nifti_f32_volume(path: &Path) -> Result<(Vec<usize>, [[f64; 4]; 4], Vec<f32>)> {
+    let loaded = load_nifti_f32(path)?;
+    Ok((loaded.dims, loaded.affine, loaded.data))
+}
+
 fn load_nifti_u32(path: &Path) -> Result<LoadedU32Image> {
     let image = read_nifti(path, ExpectedNiftiType::UInt32)?;
     let mut loaded = LoadedU32Image {

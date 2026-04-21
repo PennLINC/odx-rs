@@ -4,3 +4,4 @@ pub mod mat4;
 pub mod mif;
 pub mod mrtrix;
 pub mod pam;
+pub mod tortoise_mapmri;

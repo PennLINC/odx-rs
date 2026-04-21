@@ -37,7 +37,10 @@ fn get_required<'a>(mat: &'a MatCatalog, key: &str) -> Result<MatRecord<'a>> {
         .ok_or_else(|| OdxError::Format(format!("missing required key '{key}' in dsistudio file")))
 }
 
-fn load_dsistudio_mat(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxDataset> {
+fn load_dsistudio_mat(
+    path: &Path,
+    affine: Option<[[f64; 4]; 4]>,
+) -> Result<OdxDataset> {
     let mat = mat4::read_mat4_gz(path)?;
 
     let dim_arr = get_required(&mat, "dimension")?;
@@ -310,7 +313,6 @@ fn load_dsistudio_mat(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxD
             ),
         );
     }
-
     let header = crate::header::Header {
         voxel_to_rasmm,
         dimensions,
