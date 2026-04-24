@@ -34,6 +34,109 @@ pub enum ThresholdMode {
     Value(f32),
 }
 
+/// Which sample set to use when computing a fixel-level Otsu threshold.
+///
+/// The default, `AllFixels`, mirrors `compute_fixel_qc`'s existing
+/// behavior: the histogram covers every stored per-fixel value, so
+/// smaller-but-real secondary peaks still influence the split. The
+/// `PrimaryPeak` mode matches DSI-Studio's `fa_otsu` convention
+/// (`fib_data.cpp::set_tracking_index`): project the DPF to one value
+/// per voxel by taking the primary peak (`dpf[offsets[voxel]]`) and
+/// Otsu that vector instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OtsuScope {
+    AllFixels,
+    PrimaryPeak,
+}
+
+impl Default for OtsuScope {
+    fn default() -> Self {
+        Self::AllFixels
+    }
+}
+
+/// Result of `compute_fixel_otsu`: the resolved metric name, scope used,
+/// the Otsu threshold in the metric's native units, and the sample
+/// count the histogram was built from.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FixelOtsu {
+    pub metric_name: String,
+    pub scope: OtsuScope,
+    pub threshold: f32,
+    pub n_values: usize,
+}
+
+/// Compute an Otsu threshold over per-fixel scalar values.
+///
+/// When `metric` is `None`, falls back to the same priority used by
+/// `compute_fixel_qc`: `amplitude` → `afd` → `qa`. Errors cleanly if
+/// none of those (or the user-named metric) resolve.
+///
+/// `scope` controls whether the histogram is built from every fixel
+/// (`AllFixels`, catches secondary peaks) or only from the primary
+/// peak per voxel (`PrimaryPeak`, DSI-Studio parity).
+pub fn compute_fixel_otsu(
+    odx: &OdxDataset,
+    metric: Option<&str>,
+    scope: OtsuScope,
+) -> Result<FixelOtsu> {
+    let primary = resolve_primary_metric(odx, metric)?;
+    let values: Vec<f32> = match scope {
+        OtsuScope::AllFixels => primary.values,
+        OtsuScope::PrimaryPeak => primary_peak_projection(odx, &primary.values)?,
+    };
+    if values.is_empty() {
+        return Err(OdxError::Argument(format!(
+            "primary DPF '{}' yielded no samples under scope {:?}",
+            primary.name, scope
+        )));
+    }
+    let threshold = otsu_threshold(&values);
+    Ok(FixelOtsu {
+        metric_name: primary.name,
+        scope,
+        threshold,
+        n_values: values.len(),
+    })
+}
+
+/// Project a per-fixel DPF vector to a per-voxel vector by taking the
+/// primary peak's value at each masked voxel with at least one fixel.
+/// Voxels with zero fixels are skipped (no zero-padding bias).
+fn primary_peak_projection(odx: &OdxDataset, dpf_values: &[f32]) -> Result<Vec<f32>> {
+    primary_peak_projection_from_offsets(odx.offsets(), dpf_values)
+}
+
+/// Pure-slice variant of `primary_peak_projection` so we can unit-test
+/// the projection logic without constructing an `OdxDataset`.
+fn primary_peak_projection_from_offsets(
+    offsets: &[u32],
+    dpf_values: &[f32],
+) -> Result<Vec<f32>> {
+    if offsets.len() <= 1 {
+        return Ok(Vec::new());
+    }
+    let expected = *offsets
+        .last()
+        .expect("offsets has at least one element") as usize;
+    if dpf_values.len() != expected {
+        return Err(OdxError::Argument(format!(
+            "DPF vector length {} does not match offsets[last]={}",
+            dpf_values.len(),
+            expected
+        )));
+    }
+    let mut out = Vec::with_capacity(offsets.len() - 1);
+    for window in offsets.windows(2) {
+        let (start, end) = (window[0] as usize, window[1] as usize);
+        if end > start {
+            out.push(dpf_values[start]);
+        }
+    }
+    Ok(out)
+}
+
 /// Options controlling fixel coherence QC.
 ///
 /// `primary_metric` must resolve to a scalar nonnegative DPF. When it is not
@@ -643,7 +746,12 @@ fn neighbor_offsets() -> [[i32; 3]; 13] {
     offsets
 }
 
-fn otsu_threshold(values: &[f32]) -> f32 {
+/// Classical Otsu (max between-class variance) threshold over a sample
+/// vector. 256-bin histogram, robust to degenerate / empty input (returns
+/// `0.0` for empty, `min_value.max(0.0)` for all-equal). Public so other
+/// crates can reuse the same implementation (e.g. trxviz-core drives it
+/// through `compute_fixel_otsu`).
+pub fn otsu_threshold(values: &[f32]) -> f32 {
     const BINS: usize = 256;
 
     if values.is_empty() {
@@ -718,6 +826,25 @@ mod tests {
     #[test]
     fn otsu_handles_degenerate_input() {
         assert_eq!(otsu_threshold(&[2.5, 2.5, 2.5]), 2.5);
+    }
+
+    #[test]
+    fn primary_peak_projection_keeps_first_fixel_per_voxel() {
+        // offsets=[0, 2, 2, 5] → voxel 0: fixels 0..2, voxel 1: empty, voxel 2: fixels 2..5.
+        // Expected primary-peak vector: [dpf[0], dpf[2]] (voxel 1 skipped).
+        use super::primary_peak_projection_from_offsets;
+        let offsets = vec![0u32, 2, 2, 5];
+        let dpf = vec![0.9f32, 0.1, 0.3, 0.2, 0.1];
+        let projection = primary_peak_projection_from_offsets(&offsets, &dpf).unwrap();
+        assert_eq!(projection, vec![0.9, 0.3]);
+    }
+
+    #[test]
+    fn primary_peak_projection_rejects_mismatched_length() {
+        use super::primary_peak_projection_from_offsets;
+        let offsets = vec![0u32, 2, 5];
+        let dpf = vec![0.9f32, 0.1]; // last offset says 5, got 2
+        assert!(primary_peak_projection_from_offsets(&offsets, &dpf).is_err());
     }
 
     #[test]
