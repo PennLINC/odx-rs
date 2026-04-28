@@ -236,7 +236,35 @@ fn rust_sh_sampling_matches_external_sh2amp_when_available() {
     )
     .unwrap();
 
+    // `sampled` is mask-packed (one row per in-mask voxel, in mask iteration
+    // order). `sh2amp`'s output is dense (one row per voxel in the full grid).
+    // Compare only at the in-mask voxels.
     let external = mif::read_mif(&out_mif).unwrap().logical_f32_vec().unwrap();
-    let diff = max_abs_diff(&sampled, &external);
+    let mask = odx.mask();
+    let dims = odx.header().dimensions;
+    let nvox_dense = dims[0] as usize * dims[1] as usize * dims[2] as usize;
+    let ndir = dsistudio_odf8::hemisphere_vertices_ras().len();
+    assert_eq!(mask.len(), nvox_dense, "mask length must match dense voxel count");
+    assert_eq!(external.len(), nvox_dense * ndir, "external must be dense × ndir");
+    assert_eq!(sampled.len(), sh_view.nrows() * ndir, "sampled must be packed × ndir");
+
+    let mut packed_idx = 0usize;
+    let mut diff = 0.0f32;
+    for v in 0..nvox_dense {
+        if mask[v] == 0 {
+            continue;
+        }
+        let s_row = &sampled[packed_idx * ndir..(packed_idx + 1) * ndir];
+        let e_row = &external[v * ndir..(v + 1) * ndir];
+        for (s, e) in s_row.iter().zip(e_row.iter()) {
+            diff = diff.max((s - e).abs());
+        }
+        packed_idx += 1;
+    }
+    assert_eq!(
+        packed_idx,
+        sh_view.nrows(),
+        "in-mask voxel count must equal sh row count"
+    );
     assert!(diff <= 1e-5, "sh2amp oracle max diff {diff}");
 }

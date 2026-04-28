@@ -117,7 +117,6 @@ pub fn load_tortoise_mapmri(
     let candidate_voxels = coeff_rows.iter().filter(|row| row[0] != 0.0).count();
     let mut mask = vec![0u8; voxel_count];
     let mut coeffs = Vec::with_capacity(candidate_voxels * sh_ncoeffs);
-    let mut anisotropic_power = Vec::with_capacity(candidate_voxels);
     let mut kept_voxels = 0usize;
     let mut excluded_zero_uvec = 0usize;
     let mut excluded_zero_tensor = 0usize;
@@ -155,7 +154,6 @@ pub fn load_tortoise_mapmri(
         mask[voxel] = 1;
         kept_voxels += 1;
         voxel_maxima.push(odf_row.iter().copied().fold(f32::NEG_INFINITY, f32::max));
-        anisotropic_power.push(sh_row.iter().map(|value| value * value).sum::<f32>());
         coeffs.extend_from_slice(&sh_row);
     }
 
@@ -165,10 +163,19 @@ pub fn load_tortoise_mapmri(
         for value in &mut coeffs {
             *value /= display_scale;
         }
-        let power_scale = display_scale * display_scale;
-        for value in &mut anisotropic_power {
-            *value /= power_scale;
-        }
+    }
+
+    // Compute anisotropic power on the post-scale coefficients so it reflects
+    // the values actually written to disk. The log-shifted formula doesn't
+    // factor cleanly out of `display_scale`, so we cannot rescale a precomputed
+    // sum-of-squares the way the previous implementation tried to.
+    let mut anisotropic_power = Vec::with_capacity(kept_voxels);
+    for chunk in coeffs.chunks_exact(sh_ncoeffs) {
+        anisotropic_power.push(mrtrix_sh::anisotropic_power(
+            chunk,
+            sh_lmax,
+            mrtrix_sh::ANISOTROPIC_POWER_NORM_FACTOR,
+        ));
     }
 
     let mut extra = HashMap::new();
@@ -229,6 +236,8 @@ pub fn load_tortoise_mapmri(
             nb_sphere_faces: None,
             sh_order: Some(sh_lmax as u64),
             sh_basis: Some("tournier07".into()),
+            sh_full_basis: None,
+            sh_legacy: None,
             canonical_dense_representation: Some(CanonicalDenseRepresentation::Sh),
             sphere_id: None,
             odf_sample_domain: None,

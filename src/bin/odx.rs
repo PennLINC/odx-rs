@@ -17,8 +17,8 @@ use odx_rs::mrtrix::{
 };
 use odx_rs::pam::{self, PamWriteOptions};
 use odx_rs::{
-    compute_fixel_qc, write_qc_class_dpf, FixelQcOptions, FixelQcReport, OdxDataset, OdxError,
-    OdxWritePolicy, ThresholdMode,
+    compare_odx, compute_fixel_qc, write_qc_class_dpf, CompareOptions, CompareReport,
+    FixelQcOptions, FixelQcReport, OdxDataset, OdxError, OdxWritePolicy, ThresholdMode,
 };
 
 #[derive(Parser, Debug)]
@@ -39,11 +39,47 @@ enum Command {
     Validate(ValidateArgs),
     /// Compute fixel coherence QC metrics and connected/disconnected summaries.
     Qc(QcArgs),
+    /// Pairwise fixel comparison between two ODX files (matching, DPF diffs).
+    Compare(CompareArgs),
+    /// Convert a pyAFQ asymmetric ODF (`*_param-aodf_dwimap.nii.gz`) into ODX.
+    /// Stores full-basis descoteaux07 SH and precomputes per-voxel asymmetric peaks.
+    ImportAodf(ImportAodfArgs),
     /// Generate shell completions.
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+}
+
+#[derive(Args, Debug)]
+struct ImportAodfArgs {
+    /// Path to the aodf NIfTI (e.g. `..._model-csd_param-aodf_dwimap.nii.gz`).
+    input: PathBuf,
+    /// Output ODX directory or `.odx` archive.
+    output: PathBuf,
+    /// Optional sidecar JSON; if omitted we look beside the NIfTI.
+    #[arg(long = "sidecar")]
+    sidecar: Option<PathBuf>,
+    /// Use legacy descoteaux SH (|m| in m<0). Defaults to non-legacy
+    /// (matches modern dipy ≥ 1.7 and pyAFQ's `is_legacy=False` default).
+    #[arg(long = "legacy-basis")]
+    legacy_basis: bool,
+    /// Relative peak threshold passed to `peak_directions`-style filtering.
+    #[arg(long = "relative-peak-threshold", default_value_t = 0.5)]
+    relative_peak_threshold: f32,
+    /// Minimum angular separation between accepted peaks (degrees).
+    #[arg(long = "min-separation-deg", default_value_t = 25.0)]
+    min_separation_deg: f32,
+    /// Cap on peaks per voxel.
+    #[arg(long = "max-peaks", default_value_t = 5)]
+    max_peaks: usize,
+    /// Overwrite an existing output path.
+    #[arg(long)]
+    overwrite: bool,
+    #[arg(long = "odx-layout", value_enum, default_value = "directory")]
+    odx_layout: OdxLayoutArg,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -117,6 +153,12 @@ struct ConvertArgs {
     amplitude_key: Option<String>,
     #[arg(long = "z0", value_enum, default_value = "auto")]
     z0: Z0PolicyArg,
+    /// MRtrix-NIfTI only: preserve the input NIfTI's on-disk affine and
+    /// (i,j,k) ordering instead of canonicalizing to RAS+. Use when the
+    /// resulting ODX must compare with one produced via nibabel-style
+    /// ingestion (e.g. cs-odf coeffs.odx).
+    #[arg(long = "preserve-affine")]
+    preserve_affine: bool,
 }
 
 #[derive(Args, Debug)]
@@ -167,6 +209,37 @@ struct QcArgs {
     write_qc_class: bool,
     #[arg(long = "overwrite-qc-class")]
     overwrite_qc_class: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct CompareArgs {
+    /// First ODX file (the geometry of the comparison ODX mirrors this one).
+    #[arg(long)]
+    a: PathBuf,
+    /// Second ODX file.
+    #[arg(long)]
+    b: PathBuf,
+    /// Output directory for per-voxel NIfTIs and the comparison ODX.
+    #[arg(long = "out-dir")]
+    out_dir: PathBuf,
+    /// Optional explicit primary DPF metric (default: amplitude → afd → qa).
+    #[arg(long = "primary-dpf")]
+    primary_dpf: Option<String>,
+    #[arg(long = "threshold", value_enum, default_value = "otsu")]
+    threshold: QcThresholdArg,
+    #[arg(long = "threshold-value")]
+    threshold_value: Option<f32>,
+    /// Coherence trajectory/match angle (degrees) passed to the QC pass.
+    #[arg(long = "coherence-angle-deg", default_value_t = 15.0)]
+    coherence_angle_deg: f32,
+    /// Maximum angle (degrees) for fixel mutual matching across A and B.
+    #[arg(long = "match-angle-deg", default_value_t = 30.0)]
+    match_angle_deg: f32,
+    /// Skip writing the comparison.odx archive (NIfTIs only).
+    #[arg(long = "no-comparison-odx", default_value_t = false)]
+    no_comparison_odx: bool,
     #[arg(long)]
     json: bool,
 }
@@ -345,6 +418,8 @@ fn run(cli: Cli) -> odx_rs::Result<()> {
         Command::Convert(args) => run_convert(args),
         Command::Validate(args) => run_validate(args),
         Command::Qc(args) => run_qc(args),
+        Command::Compare(args) => run_compare(args),
+        Command::ImportAodf(args) => run_import_aodf(args),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "odx", &mut io::stdout());
@@ -362,6 +437,7 @@ fn run_info(args: CommonInputArgs) -> odx_rs::Result<()> {
         args.mapmri_uvec.as_deref(),
         args.reference_affine.as_deref(),
         args.input_format,
+        false,
     )?;
     let summary = summarize_dataset(&odx, detected);
     if args.json {
@@ -391,6 +467,7 @@ fn run_validate(args: ValidateArgs) -> odx_rs::Result<()> {
         args.mapmri_uvec.as_deref(),
         args.reference_affine.as_deref(),
         args.input_format,
+        false,
     )?;
     let report = validation_report(&odx);
     if args.json {
@@ -419,6 +496,7 @@ fn run_qc(args: QcArgs) -> odx_rs::Result<()> {
         args.mapmri_uvec.as_deref(),
         args.reference_affine.as_deref(),
         args.input_format,
+        false,
     )?;
     if args.overwrite_qc_class && !args.write_qc_class {
         return Err(OdxError::Argument(
@@ -485,6 +563,101 @@ fn run_qc(args: QcArgs) -> odx_rs::Result<()> {
     Ok(())
 }
 
+fn run_compare(args: CompareArgs) -> odx_rs::Result<()> {
+    let threshold = match args.threshold {
+        QcThresholdArg::Otsu => {
+            if args.threshold_value.is_some() {
+                return Err(OdxError::Argument(
+                    "--threshold-value is only valid with --threshold value".into(),
+                ));
+            }
+            ThresholdMode::Otsu
+        }
+        QcThresholdArg::Positive => {
+            if args.threshold_value.is_some() {
+                return Err(OdxError::Argument(
+                    "--threshold-value is only valid with --threshold value".into(),
+                ));
+            }
+            ThresholdMode::Positive
+        }
+        QcThresholdArg::All => {
+            if args.threshold_value.is_some() {
+                return Err(OdxError::Argument(
+                    "--threshold-value is only valid with --threshold value".into(),
+                ));
+            }
+            ThresholdMode::All
+        }
+        QcThresholdArg::Value => ThresholdMode::Value(args.threshold_value.ok_or_else(|| {
+            OdxError::Argument("--threshold value requires --threshold-value <f32>".into())
+        })?),
+    };
+
+    let a = OdxDataset::open(&args.a)?;
+    let b = OdxDataset::open(&args.b)?;
+    let report = compare_odx(
+        &a,
+        &b,
+        &args.out_dir,
+        &CompareOptions {
+            primary_metric: args.primary_dpf,
+            threshold,
+            coherence_angle_deg: args.coherence_angle_deg,
+            match_angle_deg: args.match_angle_deg,
+            write_comparison_odx: !args.no_comparison_odx,
+        },
+    )?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_compare_report(&report));
+    }
+    Ok(())
+}
+
+fn render_compare_report(report: &CompareReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("primary_metric: {}\n", report.primary_metric));
+    out.push_str(&format!(
+        "coherence_angle_deg: {:.3}\n",
+        report.coherence_angle_deg
+    ));
+    out.push_str(&format!("match_angle_deg: {:.3}\n", report.match_angle_deg));
+    out.push_str(&format!(
+        "voxels: a={}, b={}, intersection={}\n",
+        report.n_voxels_a, report.n_voxels_b, report.n_voxels_intersection
+    ));
+    out.push_str(&format!(
+        "fixels: a={}, b={}\n",
+        report.n_fixels_a, report.n_fixels_b
+    ));
+    out.push_str(&format!(
+        "matched: mutual={}, unmatched_a={}, unmatched_b={}\n",
+        report.n_mutual_matches, report.n_unmatched_a, report.n_unmatched_b
+    ));
+    out.push_str(&format!(
+        "mean_match_angle_deg: {}\n",
+        render_optional_f64(report.mean_match_angle_deg)
+    ));
+    out.push_str(&format!(
+        "coherence_index: a={}, b={}\n",
+        render_optional_f64(report.coherence_index_a),
+        render_optional_f64(report.coherence_index_b)
+    ));
+    out.push_str(&format!(
+        "shared_dpf_keys: {}\n",
+        if report.shared_dpf_keys.is_empty() {
+            "none".to_string()
+        } else {
+            report.shared_dpf_keys.join(", ")
+        }
+    ));
+    out.push_str(&format!("written: {} files\n", report.written_paths.len()));
+    out
+}
+
 fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
     let output_format = resolve_output_format(
         &args.output,
@@ -512,6 +685,7 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
         args.mapmri_uvec.as_deref(),
         args.reference_affine.as_deref(),
         args.input_format,
+        args.preserve_affine,
     )?;
 
     let quant_policy = OdxWritePolicy {
@@ -634,6 +808,57 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
     Ok(())
 }
 
+fn run_import_aodf(args: ImportAodfArgs) -> odx_rs::Result<()> {
+    use odx_rs::formats::pyafq_aodf::{load_pyafq_aodf_with, ImportOptions};
+
+    if args.output.exists() && !args.overwrite {
+        return Err(OdxError::Format(format!(
+            "output '{}' already exists (pass --overwrite to replace)",
+            args.output.display()
+        )));
+    }
+
+    let options = ImportOptions {
+        sidecar_path: args.sidecar,
+        legacy_basis: Some(args.legacy_basis),
+        relative_peak_threshold: args.relative_peak_threshold,
+        min_separation_deg: args.min_separation_deg,
+        max_peaks_per_voxel: args.max_peaks,
+    };
+    let dataset = load_pyafq_aodf_with(&args.input, options)?;
+
+    let policy = OdxWritePolicy {
+        quantize_dense: false,
+        quantize_min_len: 4096,
+    };
+    match args.odx_layout {
+        OdxLayoutArg::Directory => dataset.save_directory_with_policy(&args.output, policy)?,
+        OdxLayoutArg::Archive => dataset.save_archive_with_policy(&args.output, policy)?,
+    }
+
+    if args.json {
+        let summary = serde_json::json!({
+            "output": args.output.display().to_string(),
+            "nb_voxels": dataset.header().nb_voxels,
+            "nb_peaks": dataset.header().nb_peaks,
+            "sh_basis": dataset.header().sh_basis,
+            "sh_order": dataset.header().sh_order,
+            "sh_full_basis": dataset.header().sh_full_basis,
+            "sh_legacy": dataset.header().sh_legacy,
+        });
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "wrote {} ({} voxels, {} peaks; SH basis=descoteaux07 order={} full_basis=true)",
+            args.output.display(),
+            dataset.header().nb_voxels,
+            dataset.header().nb_peaks,
+            dataset.header().sh_order.unwrap_or(0)
+        );
+    }
+    Ok(())
+}
+
 fn load_from_args(
     input: &Path,
     sh: Option<&Path>,
@@ -642,32 +867,22 @@ fn load_from_args(
     mapmri_uvec: Option<&Path>,
     reference_affine: Option<&Path>,
     input_override: Option<InputFormatOverride>,
+    preserve_nifti_affine: bool,
 ) -> odx_rs::Result<(OdxDataset, DetectedFormat)> {
+    let opts = LoadDatasetOptions {
+        sh_path: sh,
+        fixel_dir,
+        mapmri_tensor_path: mapmri_tensor,
+        mapmri_uvec_path: mapmri_uvec,
+        reference_affine,
+        preserve_nifti_affine,
+    };
     if let Some(format) = input_override {
         let detected: DetectedFormat = format.into();
-        let dataset = load_dataset_with_format(
-            input,
-            detected,
-            LoadDatasetOptions {
-                sh_path: sh,
-                fixel_dir,
-                mapmri_tensor_path: mapmri_tensor,
-                mapmri_uvec_path: mapmri_uvec,
-                reference_affine,
-            },
-        )?;
+        let dataset = load_dataset_with_format(input, detected, opts)?;
         return Ok((dataset, detected));
     }
-    load_dataset(
-        input,
-        LoadDatasetOptions {
-            sh_path: sh,
-            fixel_dir,
-            mapmri_tensor_path: mapmri_tensor,
-            mapmri_uvec_path: mapmri_uvec,
-            reference_affine,
-        },
-    )
+    load_dataset(input, opts)
 }
 
 fn resolve_output_format(

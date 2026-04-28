@@ -22,6 +22,8 @@ pub struct OdxBuilder {
     dpf: HashMap<String, (Vec<u8>, usize, DType)>,
     sh_order: Option<u64>,
     sh_basis: Option<String>,
+    sh_full_basis: Option<bool>,
+    sh_legacy: Option<bool>,
     canonical_dense_representation: Option<CanonicalDenseRepresentation>,
     sphere_id: Option<String>,
     odf_sample_domain: Option<String>,
@@ -50,6 +52,8 @@ impl OdxBuilder {
             dpf: HashMap::new(),
             sh_order: None,
             sh_basis: None,
+            sh_full_basis: None,
+            sh_legacy: None,
             canonical_dense_representation: None,
             sphere_id: None,
             odf_sample_domain: None,
@@ -83,6 +87,14 @@ impl OdxBuilder {
         self.sh_order = Some(order);
         self.sh_basis = Some(basis);
         self.canonical_dense_representation = Some(CanonicalDenseRepresentation::Sh);
+    }
+
+    pub fn set_sh_full_basis(&mut self, full_basis: bool) {
+        self.sh_full_basis = Some(full_basis);
+    }
+
+    pub fn set_sh_legacy(&mut self, legacy: bool) {
+        self.sh_legacy = Some(legacy);
     }
 
     pub fn set_canonical_dense_representation(
@@ -146,11 +158,16 @@ impl OdxBuilder {
             validate_rows("dpf", name, data, *ncols, *dtype, nb_peaks)?;
         }
         if let Some(order) = self.sh_order {
-            let expected = ((order + 1) * (order + 2) / 2) as usize;
+            let full = self.sh_full_basis.unwrap_or(false);
+            let expected = if full {
+                ((order + 1) * (order + 1)) as usize
+            } else {
+                ((order + 1) * (order + 2) / 2) as usize
+            };
             for (name, (_, ncols, _)) in &self.sh {
                 if *ncols != expected {
                     return Err(OdxError::Format(format!(
-                        "SH array '{name}' has {ncols} columns, expected {expected} for order {order}"
+                        "SH array '{name}' has {ncols} columns, expected {expected} for order {order} (full_basis={full})"
                     )));
                 }
             }
@@ -172,6 +189,8 @@ impl OdxBuilder {
             nb_sphere_faces: self.sphere_faces.as_ref().map(|f| f.len() as u64),
             sh_order: self.sh_order,
             sh_basis: self.sh_basis,
+            sh_full_basis: self.sh_full_basis,
+            sh_legacy: self.sh_legacy,
             canonical_dense_representation: self.canonical_dense_representation,
             sphere_id: self.sphere_id,
             odf_sample_domain: self.odf_sample_domain,

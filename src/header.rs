@@ -44,6 +44,12 @@ pub struct Header {
     #[serde(rename = "SH_BASIS", skip_serializing_if = "Option::is_none")]
     pub sh_basis: Option<String>,
 
+    #[serde(rename = "SH_FULL_BASIS", skip_serializing_if = "Option::is_none")]
+    pub sh_full_basis: Option<bool>,
+
+    #[serde(rename = "SH_LEGACY", skip_serializing_if = "Option::is_none")]
+    pub sh_legacy: Option<bool>,
+
     #[serde(
         rename = "CANONICAL_DENSE_REPRESENTATION",
         skip_serializing_if = "Option::is_none"
@@ -113,6 +119,8 @@ mod tests {
             nb_sphere_faces: Some(1280),
             sh_order: Some(8),
             sh_basis: Some("descoteaux07".into()),
+            sh_full_basis: None,
+            sh_legacy: None,
             canonical_dense_representation: Some(CanonicalDenseRepresentation::Sh),
             sphere_id: Some("odf8".into()),
             odf_sample_domain: Some("hemisphere".into()),

@@ -385,6 +385,8 @@ pub fn load_pam5(path: &Path) -> Result<OdxDataset> {
         nb_sphere_faces: None,
         sh_order,
         sh_basis,
+        sh_full_basis: None,
+        sh_legacy: None,
         canonical_dense_representation: canonical_dense,
         sphere_id: None,
         odf_sample_domain,

@@ -168,6 +168,8 @@ fn header_round_trip() {
         nb_sphere_faces: Some(1280),
         sh_order: Some(8),
         sh_basis: Some("descoteaux07".into()),
+        sh_full_basis: None,
+        sh_legacy: None,
         canonical_dense_representation: None,
         sphere_id: None,
         odf_sample_domain: None,
