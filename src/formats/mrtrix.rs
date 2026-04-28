@@ -4,7 +4,6 @@ use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use nalgebra::Matrix3;
 use ndarray::{Array, IxDyn};
 use nifti::{NiftiHeader, NiftiType};
 
@@ -39,12 +38,22 @@ pub enum MrtrixFixelContainer {
 #[derive(Debug, Clone)]
 pub struct MrtrixDatasetLoadOptions {
     pub mask_policy: MrtrixMaskPolicy,
+    /// When true, NIfTI inputs are loaded with their on-disk (i,j,k) ordering
+    /// preserved — `canonicalize_spatial_axes_to_ras_*` is skipped for NIfTI
+    /// only. The affine that comes out is exactly what nibabel would read
+    /// (sform/qform unmodified). MIF inputs are still canonicalized because
+    /// MIF carries explicit "Data strides" that disagree from one writer to
+    /// the next — NIfTI's sform/qform is unambiguous and doesn't need it.
+    /// This is required when comparing against ODXs produced by Python
+    /// pipelines that ingest via nibabel without reorienting (e.g. cs-odf).
+    pub preserve_nifti_affine: bool,
 }
 
 impl Default for MrtrixDatasetLoadOptions {
     fn default() -> Self {
         Self {
             mask_policy: MrtrixMaskPolicy::FixelSupport,
+            preserve_nifti_affine: false,
         }
     }
 }
@@ -135,14 +144,14 @@ pub fn load_mrtrix_dataset_with_options(
     fixel_dir: Option<&Path>,
     options: &MrtrixDatasetLoadOptions,
 ) -> Result<OdxDataset> {
-    let _ = options;
+    let preserve_nifti = options.preserve_nifti_affine;
     let fixels = if let Some(dir) = fixel_dir {
-        Some(load_canonical_fixels(dir)?)
+        Some(load_canonical_fixels(dir, preserve_nifti)?)
     } else {
         None
     };
     let sh = if let Some(path) = sh_path {
-        Some(load_f32_image(path)?)
+        Some(load_f32_image(path, preserve_nifti)?)
     } else {
         None
     };
@@ -303,10 +312,11 @@ pub fn save_mrtrix_fixels(
                 .ok_or_else(|| OdxError::Argument(format!("missing DPF array '{name}'")))?;
             let values = arr.to_f32_vec()?;
             let dims = [arr.nrows(), info.ncols, 1];
+            let file_stem = mrtrix_fixel_dpf_filename_stem(name);
             match options.container {
                 MrtrixFixelContainer::Mif => {
                     write_mif_f32(
-                        &dir.join(format!("{name}.mif")),
+                        &dir.join(format!("{file_stem}.mif")),
                         &dims,
                         &odx.header().voxel_to_rasmm,
                         &values,
@@ -314,7 +324,7 @@ pub fn save_mrtrix_fixels(
                 }
                 MrtrixFixelContainer::Nifti => {
                     write_mrtrix_nifti2_f32(
-                        &dir.join(format!("{name}.nii")),
+                        &dir.join(format!("{file_stem}.nii")),
                         &dims,
                         &odx.header().voxel_to_rasmm,
                         &values,
@@ -381,6 +391,7 @@ fn build_sh_only_dataset(sh: LoadedF32Image) -> Result<OdxDataset> {
         .get(3)
         .ok_or_else(|| OdxError::Format("MRtrix SH image must be 4D".into()))?;
     let order = infer_sh_order(ncoeffs)?;
+    let lmax = order as usize;
     let mut mask = vec![0u8; voxel_count];
     let mut masked = Vec::with_capacity(sh.data.len());
     let mut anisotropic_power: Vec<f32> = Vec::with_capacity(voxel_count);
@@ -392,7 +403,11 @@ fn build_sh_only_dataset(sh: LoadedF32Image) -> Result<OdxDataset> {
         if coeff_sum_abs > SH_MASK_EPSILON {
             mask[voxel] = 1;
             masked.extend_from_slice(row);
-            anisotropic_power.push(row.iter().map(|value| value * value).sum());
+            anisotropic_power.push(crate::mrtrix_sh::anisotropic_power(
+                row,
+                lmax,
+                crate::mrtrix_sh::ANISOTROPIC_POWER_NORM_FACTOR,
+            ));
         }
     }
     let masked_voxel_count = mask.iter().filter(|&&m| m != 0).count();
@@ -412,6 +427,8 @@ fn build_sh_only_dataset(sh: LoadedF32Image) -> Result<OdxDataset> {
             nb_sphere_faces: None,
             sh_order: Some(order),
             sh_basis: Some("tournier07".into()),
+            sh_full_basis: None,
+            sh_legacy: None,
             canonical_dense_representation: Some(CanonicalDenseRepresentation::Sh),
             sphere_id: None,
             odf_sample_domain: None,
@@ -468,6 +485,7 @@ fn build_fixels_dataset(fixels: CanonicalFixels, sh: Option<LoadedF32Image>) -> 
             .get(3)
             .ok_or_else(|| OdxError::Format("MRtrix SH image must be 4D".into()))?;
         let order = infer_sh_order(ncoeffs)?;
+        let lmax = order as usize;
         let masked_rows = mask.iter().filter(|&&m| m != 0).count();
         let mut masked = vec![0.0f32; masked_rows * ncoeffs];
         let mut anisotropic_power = vec![0.0f32; masked_rows];
@@ -481,7 +499,11 @@ fn build_fixels_dataset(fixels: CanonicalFixels, sh: Option<LoadedF32Image>) -> 
             let dst = masked_row * ncoeffs;
             let row = &sh_image.data[start..start + ncoeffs];
             masked[dst..dst + ncoeffs].copy_from_slice(row);
-            anisotropic_power[masked_row] = row.iter().map(|value| value * value).sum();
+            anisotropic_power[masked_row] = crate::mrtrix_sh::anisotropic_power(
+                row,
+                lmax,
+                crate::mrtrix_sh::ANISOTROPIC_POWER_NORM_FACTOR,
+            );
             masked_row += 1;
         }
         builder.set_sh_info(order, "tournier07".into());
@@ -503,11 +525,33 @@ fn build_fixels_dataset(fixels: CanonicalFixels, sh: Option<LoadedF32Image>) -> 
     builder.finalize()
 }
 
-fn load_canonical_fixels(dir: &Path) -> Result<CanonicalFixels> {
+/// Normalize MRtrix `fod2fixel` payload stems to ODX-canonical DPF names so that
+/// fixel ODXs from different upstream pipelines (cs-odf, MRtrix) share a primary
+/// metric name. `fod2fixel` writes peak amplitude as `peak_amp.{mif,nii.gz}`;
+/// the rest of the ecosystem (and `odx compare`'s `amplitude → afd → qa`
+/// auto-detect chain) expects `amplitude`.
+fn canonical_fixel_dpf_name(stem: &str) -> String {
+    match stem {
+        "peak_amp" => "amplitude".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Inverse of `canonical_fixel_dpf_name` for the write path: when emitting an
+/// MRtrix fixel directory, restore the upstream stem so MRtrix tools recognize
+/// the file (e.g. ODX `amplitude` → `peak_amp.{mif,nii}`).
+fn mrtrix_fixel_dpf_filename_stem(name: &str) -> &str {
+    match name {
+        "amplitude" => "peak_amp",
+        other => other,
+    }
+}
+
+fn load_canonical_fixels(dir: &Path, preserve_nifti: bool) -> Result<CanonicalFixels> {
     let index_path = find_required_file(dir, "index")?;
     let directions_path = find_required_file(dir, "directions")?;
 
-    let index = load_u32_image(&index_path)?;
+    let index = load_u32_image(&index_path, preserve_nifti)?;
     if index.dims.len() != 4 || index.dims[3] != 2 {
         return Err(OdxError::Format(format!(
             "MRtrix fixel index image must have shape (x,y,z,2), found {:?}",
@@ -531,7 +575,7 @@ fn load_canonical_fixels(dir: &Path) -> Result<CanonicalFixels> {
         }
     }
 
-    let dirs = load_f32_image(&directions_path)?;
+    let dirs = load_f32_image(&directions_path, preserve_nifti)?;
     if dirs.dims.len() != 3 || dirs.dims[1] != 3 || dirs.dims[2] != 1 {
         return Err(OdxError::Format(format!(
             "MRtrix directions file must have shape (n,3,1), found {:?}",
@@ -564,7 +608,7 @@ fn load_canonical_fixels(dir: &Path) -> Result<CanonicalFixels> {
             continue;
         }
         let stem = path_stem_without_image_ext(&path)?;
-        let image = load_f32_image(&path)?;
+        let image = load_f32_image(&path, preserve_nifti)?;
         if image.dims.len() >= 3 && image.dims[0] == total_fixels && image.dims[2] == 1 {
             let ncols = image.dims[1];
             let mut values = Vec::with_capacity(total_fixels * ncols);
@@ -577,7 +621,7 @@ fn load_canonical_fixels(dir: &Path) -> Result<CanonicalFixels> {
                 let end = (first + count) * ncols;
                 values.extend_from_slice(&image.data[start..end]);
             }
-            dpf.insert(stem, (values, ncols));
+            dpf.insert(canonical_fixel_dpf_name(&stem), (values, ncols));
         } else if image.dims.len() >= 3
             && image.dims[0] == dims3[0] as usize
             && image.dims[1] == dims3[1] as usize
@@ -607,13 +651,13 @@ fn load_canonical_fixels(dir: &Path) -> Result<CanonicalFixels> {
     })
 }
 
-fn load_f32_image(path: &Path) -> Result<LoadedF32Image> {
+fn load_f32_image(path: &Path, preserve_nifti: bool) -> Result<LoadedF32Image> {
     if is_mif_path(path) {
         let mut loaded = load_mif_f32_image(path)?;
         canonicalize_spatial_axes_to_ras_f32(&mut loaded);
         Ok(loaded)
     } else if is_nifti_path(path) {
-        load_nifti_f32(path)
+        load_nifti_f32(path, preserve_nifti)
     } else {
         Err(OdxError::Argument(format!(
             "unsupported MRtrix image path '{}'",
@@ -622,13 +666,13 @@ fn load_f32_image(path: &Path) -> Result<LoadedF32Image> {
     }
 }
 
-fn load_u32_image(path: &Path) -> Result<LoadedU32Image> {
+fn load_u32_image(path: &Path, preserve_nifti: bool) -> Result<LoadedU32Image> {
     if is_mif_path(path) {
         let mut loaded = load_mif_u32_image(path)?;
         canonicalize_spatial_axes_to_ras_u32(&mut loaded);
         Ok(loaded)
     } else if is_nifti_path(path) {
-        load_nifti_u32(path)
+        load_nifti_u32(path, preserve_nifti)
     } else {
         Err(OdxError::Argument(format!(
             "unsupported MRtrix image path '{}'",
@@ -840,7 +884,7 @@ fn read_8(payload: &[u8], offset: usize) -> Result<[u8; 8]> {
         .map_err(|_| OdxError::Format("short MIF payload while reading 8-byte value".into()))
 }
 
-fn load_nifti_f32(path: &Path) -> Result<LoadedF32Image> {
+fn load_nifti_f32(path: &Path, preserve_affine: bool) -> Result<LoadedF32Image> {
     let image = read_nifti(path, ExpectedNiftiType::Float32)?;
     let mut loaded = LoadedF32Image {
         dims: image.dims,
@@ -849,16 +893,18 @@ fn load_nifti_f32(path: &Path) -> Result<LoadedF32Image> {
             OdxError::Format(format!("expected float32 NIfTI '{}'", path.display()))
         })?,
     };
-    canonicalize_spatial_axes_to_ras_f32(&mut loaded);
+    if !preserve_affine {
+        canonicalize_spatial_axes_to_ras_f32(&mut loaded);
+    }
     Ok(loaded)
 }
 
 pub(crate) fn load_nifti_f32_volume(path: &Path) -> Result<(Vec<usize>, [[f64; 4]; 4], Vec<f32>)> {
-    let loaded = load_nifti_f32(path)?;
+    let loaded = load_nifti_f32(path, false)?;
     Ok((loaded.dims, loaded.affine, loaded.data))
 }
 
-fn load_nifti_u32(path: &Path) -> Result<LoadedU32Image> {
+fn load_nifti_u32(path: &Path, preserve_affine: bool) -> Result<LoadedU32Image> {
     let image = read_nifti(path, ExpectedNiftiType::UInt32)?;
     let mut loaded = LoadedU32Image {
         dims: image.dims,
@@ -867,7 +913,9 @@ fn load_nifti_u32(path: &Path) -> Result<LoadedU32Image> {
             OdxError::Format(format!("expected uint32 NIfTI '{}'", path.display()))
         })?,
     };
-    canonicalize_spatial_axes_to_ras_u32(&mut loaded);
+    if !preserve_affine {
+        canonicalize_spatial_axes_to_ras_u32(&mut loaded);
+    }
     Ok(loaded)
 }
 
@@ -1041,31 +1089,13 @@ fn parse_nifti_payload(
 }
 
 fn canonicalize_spatial_axes_to_ras_f32(image: &mut LoadedF32Image) {
-    let xform = spatial_ornt_transform_to_ras(image.affine);
-    if orientation_is_identity(xform) {
-        return;
-    }
-    let original_dims = image.dims.clone();
-    image.data = reorient_spatial_axes(&image.data, &original_dims, xform);
-    image.affine = compose_affines(
-        image.affine,
-        nibabel_inv_ornt_aff(xform, &original_dims[..3]),
-    );
-    image.dims = reoriented_dims(&original_dims, xform);
+    let xf = crate::nifti_canon::CanonTransform::from_affine(image.affine);
+    xf.apply_in_place(&mut image.dims, &mut image.affine, &mut image.data);
 }
 
 fn canonicalize_spatial_axes_to_ras_u32(image: &mut LoadedU32Image) {
-    let xform = spatial_ornt_transform_to_ras(image.affine);
-    if orientation_is_identity(xform) {
-        return;
-    }
-    let original_dims = image.dims.clone();
-    image.data = reorient_spatial_axes(&image.data, &original_dims, xform);
-    image.affine = compose_affines(
-        image.affine,
-        nibabel_inv_ornt_aff(xform, &original_dims[..3]),
-    );
-    image.dims = reoriented_dims(&original_dims, xform);
+    let xf = crate::nifti_canon::CanonTransform::from_affine(image.affine);
+    xf.apply_in_place(&mut image.dims, &mut image.affine, &mut image.data);
 }
 
 fn mrtrix_nifti_axis_flips(dims: &[usize]) -> [bool; 3] {
@@ -1125,179 +1155,6 @@ fn flip_spatial_axes_in_affine(
         }
     }
     affine
-}
-
-fn spatial_ornt_transform_to_ras(affine: [[f64; 4]; 4]) -> [[i8; 2]; 3] {
-    // MRtrix realigns spatial axes to a near-RAS canonical image ordering
-    // after decoding storage strides. Mirror that behavior here so MIF layout
-    // handling and anatomical orientation stay as separate concerns.
-    let start = nibabel_io_orientation(affine);
-    let end = [[0, 1], [1, 1], [2, 1]];
-    nibabel_ornt_transform(start, end)
-}
-
-fn orientation_is_identity(ornt: [[i8; 2]; 3]) -> bool {
-    ornt == [[0, 1], [1, 1], [2, 1]]
-}
-
-fn reoriented_dims(dims: &[usize], ornt: [[i8; 2]; 3]) -> Vec<usize> {
-    let mut out = dims.to_vec();
-    for (src_axis, [dst_axis, _]) in ornt.into_iter().enumerate() {
-        out[dst_axis as usize] = dims[src_axis];
-    }
-    out
-}
-
-fn reorient_spatial_axes<T: Copy + Default>(
-    data: &[T],
-    dims: &[usize],
-    ornt: [[i8; 2]; 3],
-) -> Vec<T> {
-    if dims.len() < 3 {
-        return data.to_vec();
-    }
-    let new_dims = reoriented_dims(dims, ornt);
-    let old_spatial = [dims[0], dims[1], dims[2]];
-    let new_spatial = [new_dims[0], new_dims[1], new_dims[2]];
-    let ncols = dims[3..].iter().product::<usize>().max(1);
-    let mut out = vec![T::default(); data.len()];
-
-    for x in 0..old_spatial[0] {
-        for y in 0..old_spatial[1] {
-            for z in 0..old_spatial[2] {
-                let old = [x, y, z];
-                let mut new = [0usize; 3];
-                for src_axis in 0..3 {
-                    let mut coord = old[src_axis];
-                    if ornt[src_axis][1] == -1 {
-                        coord = old_spatial[src_axis] - 1 - coord;
-                    }
-                    new[ornt[src_axis][0] as usize] = coord;
-                }
-                let src = ((x * old_spatial[1] + y) * old_spatial[2] + z) * ncols;
-                let dst = ((new[0] * new_spatial[1] + new[1]) * new_spatial[2] + new[2]) * ncols;
-                out[dst..dst + ncols].copy_from_slice(&data[src..src + ncols]);
-            }
-        }
-    }
-    out
-}
-
-fn compose_affines(a: [[f64; 4]; 4], b: [[f64; 4]; 4]) -> [[f64; 4]; 4] {
-    let mut out = [[0.0f64; 4]; 4];
-    for row in 0..4 {
-        for col in 0..4 {
-            out[row][col] = (0..4).map(|k| a[row][k] * b[k][col]).sum();
-        }
-    }
-    out
-}
-
-fn nibabel_inv_ornt_aff(ornt: [[i8; 2]; 3], shape: &[usize]) -> [[f64; 4]; 4] {
-    let shape = [shape[0] as f64, shape[1] as f64, shape[2] as f64];
-    let center = [
-        -(shape[0] - 1.0) / 2.0,
-        -(shape[1] - 1.0) / 2.0,
-        -(shape[2] - 1.0) / 2.0,
-    ];
-
-    let mut undo_reorder = [[0.0f64; 4]; 4];
-    for row in 0..3 {
-        undo_reorder[row][ornt[row][0] as usize] = 1.0;
-    }
-    undo_reorder[3][3] = 1.0;
-
-    let mut undo_flip = [[0.0f64; 4]; 4];
-    for axis in 0..3 {
-        let flip = f64::from(ornt[axis][1]);
-        undo_flip[axis][axis] = flip;
-        undo_flip[axis][3] = (flip * center[axis]) - center[axis];
-    }
-    undo_flip[3][3] = 1.0;
-    compose_affines(undo_flip, undo_reorder)
-}
-
-fn nibabel_io_orientation(aff: [[f64; 4]; 4]) -> [[i8; 2]; 3] {
-    let rzs = Matrix3::new(
-        aff[0][0], aff[0][1], aff[0][2], aff[1][0], aff[1][1], aff[1][2], aff[2][0], aff[2][1],
-        aff[2][2],
-    );
-    let zooms = affine_column_norms(aff);
-    let rs = Matrix3::new(
-        rzs[(0, 0)] / f64::from(zooms[0].max(1e-12)),
-        rzs[(0, 1)] / f64::from(zooms[1].max(1e-12)),
-        rzs[(0, 2)] / f64::from(zooms[2].max(1e-12)),
-        rzs[(1, 0)] / f64::from(zooms[0].max(1e-12)),
-        rzs[(1, 1)] / f64::from(zooms[1].max(1e-12)),
-        rzs[(1, 2)] / f64::from(zooms[2].max(1e-12)),
-        rzs[(2, 0)] / f64::from(zooms[0].max(1e-12)),
-        rzs[(2, 1)] / f64::from(zooms[1].max(1e-12)),
-        rzs[(2, 2)] / f64::from(zooms[2].max(1e-12)),
-    );
-    let svd = rs.svd(true, true);
-    let u = svd.u.expect("requested U from SVD");
-    let vt = svd.v_t.expect("requested V^T from SVD");
-    let s = svd.singular_values;
-    let tol = s.max() * 3.0 * f64::EPSILON;
-    let mut r = Matrix3::<f64>::zeros();
-    for idx in 0..3 {
-        if s[idx] > tol {
-            let ui = u.column(idx);
-            let vti = vt.row(idx);
-            r += ui * vti;
-        }
-    }
-
-    let mut in_axes = [0usize, 1, 2];
-    in_axes.sort_by(|&a, &b| {
-        let sa = (0..3).map(|row| r[(row, a)].powi(2)).fold(0.0, f64::max);
-        let sb = (0..3).map(|row| r[(row, b)].powi(2)).fold(0.0, f64::max);
-        sb.total_cmp(&sa)
-    });
-
-    let mut ornt = [[-1i8, 1i8]; 3];
-    let mut work = r;
-    for in_ax in in_axes {
-        let mut out_ax = 0usize;
-        let mut best = 0.0f64;
-        for row in 0..3 {
-            let value = work[(row, in_ax)].abs();
-            if value > best {
-                best = value;
-                out_ax = row;
-            }
-        }
-        ornt[in_ax][0] = out_ax as i8;
-        ornt[in_ax][1] = if work[(out_ax, in_ax)] < 0.0 { -1 } else { 1 };
-        for col in 0..3 {
-            work[(out_ax, col)] = 0.0;
-        }
-    }
-    ornt
-}
-
-fn nibabel_ornt_transform(start_ornt: [[i8; 2]; 3], end_ornt: [[i8; 2]; 3]) -> [[i8; 2]; 3] {
-    let mut result = [[0i8, 1i8]; 3];
-    for (end_in_idx, [end_out_idx, end_flip]) in end_ornt.into_iter().enumerate() {
-        for (start_in_idx, [start_out_idx, start_flip]) in start_ornt.into_iter().enumerate() {
-            if end_out_idx == start_out_idx {
-                result[start_in_idx] = [
-                    end_in_idx as i8,
-                    if start_flip == end_flip { 1 } else { -1 },
-                ];
-                break;
-            }
-        }
-    }
-    result
-}
-
-fn affine_column_norms(aff: [[f64; 4]; 4]) -> [f32; 3] {
-    [
-        (aff[0][0] * aff[0][0] + aff[1][0] * aff[1][0] + aff[2][0] * aff[2][0]).sqrt() as f32,
-        (aff[0][1] * aff[0][1] + aff[1][1] * aff[1][1] + aff[2][1] * aff[2][1]).sqrt() as f32,
-        (aff[0][2] * aff[0][2] + aff[1][2] * aff[1][2] + aff[2][2] * aff[2][2]).sqrt() as f32,
-    ]
 }
 
 fn infer_sh_order(ncoeffs: usize) -> Result<u64> {
@@ -1850,7 +1707,7 @@ mod tests {
 
     #[test]
     fn sh_only_dataset_derives_mask_from_sampled_amplitudes() {
-        let dims = vec![2usize, 1, 1, 6];
+        let dims = vec![3usize, 1, 1, 6];
         let affine = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
@@ -1861,23 +1718,29 @@ mod tests {
             dims,
             affine,
             data: vec![
-                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, // positive isotropic voxel
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, // pure ℓ=0 voxel: AP must be 0
+                0.0, 1.0, 0.0, 0.0, 0.0, 0.0, // ℓ=2 (m=-2): AP_raw = 1/5
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // empty voxel
             ],
         };
 
         let odx = build_sh_only_dataset(sh).unwrap();
-        assert_eq!(odx.header().dimensions, [2, 1, 1]);
-        assert_eq!(odx.nb_voxels(), 1);
-        assert_eq!(odx.mask(), &[1, 0]);
+        assert_eq!(odx.header().dimensions, [3, 1, 1]);
+        assert_eq!(odx.nb_voxels(), 2);
+        assert_eq!(odx.mask(), &[1, 1, 0]);
 
         let coeffs = odx.sh::<f32>("coefficients").unwrap();
-        assert_eq!(coeffs.nrows(), 1);
+        assert_eq!(coeffs.nrows(), 2);
         assert_eq!(coeffs.row(0), &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(coeffs.row(1), &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
 
         let anisotropic_power = odx.dpv::<f32>(ANISOTROPIC_POWER_DPV_NAME).unwrap();
-        assert_eq!(anisotropic_power.nrows(), 1);
-        assert_eq!(anisotropic_power.row(0), &[1.0]);
+        assert_eq!(anisotropic_power.nrows(), 2);
+        // Pure ℓ=0 → no anisotropy.
+        assert_eq!(anisotropic_power.row(0), &[0.0]);
+        // Single ℓ=2 coefficient: AP = max(0, ln(1/5) − ln(1e-5)).
+        let expected = (0.2_f64.ln() - 1e-5_f64.ln()) as f32;
+        assert!((anisotropic_power.row(1)[0] - expected).abs() < 1e-5);
     }
 
     #[test]
@@ -1902,8 +1765,10 @@ mod tests {
             return;
         }
 
-        let nii = load_u32_image(nifti).unwrap();
-        let mif = load_u32_image(mif_path).unwrap();
+        // Both sides canonicalize on load (preserve_nifti=false), so the
+        // dims and per-voxel counts compare apples-to-apples.
+        let nii = load_u32_image(nifti, false).unwrap();
+        let mif = load_u32_image(mif_path, false).unwrap();
         assert_eq!(nii.dims, mif.dims);
         let voxel_count = nii.dims[0] * nii.dims[1] * nii.dims[2];
         for voxel in 0..voxel_count {
@@ -1924,7 +1789,7 @@ mod tests {
         ];
         let path = std::env::temp_dir().join("odx_mrtrix_nifti2_u32_test.nii");
         write_nifti2_u32_raw(&path, &dims, &affine, &data).unwrap();
-        let parsed = load_u32_image(&path).unwrap();
+        let parsed = load_u32_image(&path, true).unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(parsed.dims, dims);
         assert_eq!(parsed.data, data);
@@ -1963,7 +1828,9 @@ mod tests {
             &index,
         )
         .unwrap();
-        let parsed = load_u32_image(&path).unwrap();
+        // Round-trip via the same canonicalize-on-load path the writer
+        // assumes; the index buffer is already in canonical (RAS+) order.
+        let parsed = load_u32_image(&path, false).unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(parsed.dims, vec![dims3[0], dims3[1], dims3[2], 2]);
         assert_eq!(parsed.data, index);

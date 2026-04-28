@@ -1,3 +1,15 @@
+// Portions of this file (notably `sh_derivatives` and its helpers `index_mpos`,
+// `nfor_l_mpos`, and `pack_al`) are derivative works ported from MRtrix3
+// (https://www.mrtrix.org/), specifically `Math::SH::derivatives` in
+// `core/math/SH.h`.
+//
+// Original copyright: Copyright (c) 2008-2026 the MRtrix3 contributors.
+//
+// Those portions are made available under the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at http://mozilla.org/MPL/2.0/. A copy of the license is
+// also included in the odx-rs source tree at `LICENSE-MRTRIX`.
+
 use nalgebra::DMatrix;
 use ndarray::Array2;
 
@@ -21,6 +33,39 @@ pub fn lmax_for_ncoeffs(n: usize) -> Result<usize> {
             "coefficient count {n} is not a feasible MRtrix SH cardinality"
         )))
     }
+}
+
+/// Default `norm_factor` used by dipy's `reconst.shm.anisotropic_power`.
+pub const ANISOTROPIC_POWER_NORM_FACTOR: f64 = 1e-5;
+
+/// Anisotropic-power scalar (Dell'Acqua 2014; matches dipy
+/// `reconst.shm.anisotropic_power`).
+///
+/// Computes the mean of squared SH coefficients within each even ℓ ≥ 2 band,
+/// sums across bands, then returns `max(0, log(AP_raw) − log(norm_factor))`.
+/// The ℓ = 0 band is skipped because it carries the isotropic baseline. `sh`
+/// must be in even-only Tournier ordering with `(lmax+1)(lmax+2)/2` entries.
+pub fn anisotropic_power(sh: &[f32], lmax: usize, norm_factor: f64) -> f32 {
+    debug_assert_eq!(sh.len(), ncoeffs_for_lmax(lmax));
+    let mut start = 1_usize; // skip ℓ=0
+    let mut ap_raw = 0.0_f64;
+    let mut ell = 2_usize;
+    while ell <= lmax {
+        let len = 2 * ell + 1;
+        let stop = start + len;
+        let mut s = 0.0_f64;
+        for c in &sh[start..stop] {
+            s += (*c as f64) * (*c as f64);
+        }
+        ap_raw += s / len as f64;
+        start = stop;
+        ell += 2;
+    }
+    if ap_raw <= 0.0 {
+        return 0.0;
+    }
+    let v = ap_raw.ln() - norm_factor.ln();
+    if v <= 0.0 { 0.0 } else { v as f32 }
 }
 
 pub fn max_lmax_for_direction_count(ndir: usize) -> usize {
@@ -81,6 +126,136 @@ fn plm_sph_array(lmax: usize, m: usize, x: f64) -> Vec<f64> {
         out[n] *= f;
     }
     out
+}
+
+/// AL slot count for `index_mpos` packing — `(lmax/2 + 1)²`.
+fn nfor_l_mpos(lmax: usize) -> usize {
+    let k = lmax / 2 + 1;
+    k * k
+}
+
+/// MRtrix `index_mpos(l, m) = l*l/4 + m`. Valid for non-negative `m`.
+fn index_mpos(l: usize, m: usize) -> usize {
+    l * l / 4 + m
+}
+
+/// Pack `Plm_sph(l, m, cos_el)` into the MRtrix AL layout for all even `l`
+/// in `0..=lmax` and `m` in `0..=l`.
+fn pack_al(lmax: usize, cos_el: f64) -> Vec<f64> {
+    let mut al = vec![0.0_f64; nfor_l_mpos(lmax)];
+    for m in 0..=lmax {
+        let buf = plm_sph_array(lmax, m, cos_el);
+        let l_start = if m % 2 == 1 { m + 1 } else { m };
+        let mut l = l_start;
+        while l <= lmax {
+            al[index_mpos(l, m)] = buf[l];
+            l += 2;
+        }
+    }
+    al
+}
+
+/// First and second partial derivatives of an MRtrix SH series at
+/// `(elevation, azimuth)`, returning
+/// `(amplitude, ∂/∂el, ∂/∂az, ∂²/∂el², ∂²/∂el∂az, ∂²/∂az²)`.
+///
+/// Mirrors `Math::SH::derivatives` from
+/// `trx-mrtrix2/cpp/core/math/SH.h`. Used by the Newton peak refinement.
+pub(crate) fn sh_derivatives(
+    sh: &[f32],
+    lmax: usize,
+    el: f64,
+    az: f64,
+) -> (f64, f64, f64, f64, f64, f64) {
+    debug_assert_eq!(sh.len(), ncoeffs_for_lmax(lmax));
+    let sin_el = el.sin();
+    let cos_el = el.cos();
+    let atpole = sin_el < 1e-4;
+
+    let al = pack_al(lmax, cos_el);
+
+    let mut amplitude = sh[coefficient_index(0, 0)] as f64 * al[index_mpos(0, 0)];
+    let mut d_sh_del = 0.0_f64;
+    let mut d_sh_daz = 0.0_f64;
+    let mut d2_sh_del2 = 0.0_f64;
+    let mut d2_sh_deldaz = 0.0_f64;
+    let mut d2_sh_daz2 = 0.0_f64;
+
+    let mut l = 2_usize;
+    while l <= lmax {
+        let v = sh[coefficient_index(l, 0)] as f64;
+        amplitude += v * al[index_mpos(l, 0)];
+        d_sh_del += v * ((l * (l + 1)) as f64).sqrt() * al[index_mpos(l, 1)];
+        let term = ((l * (l + 1) * (l - 1) * (l + 2)) as f64).sqrt() * al[index_mpos(l, 2)]
+            - (l * (l + 1)) as f64 * al[index_mpos(l, 0)];
+        d2_sh_del2 += v * term / 2.0;
+        l += 2;
+    }
+
+    let sqrt2 = std::f64::consts::SQRT_2;
+    for m in 1..=lmax {
+        let mf = m as f64;
+        let caz = sqrt2 * (mf * az).cos();
+        let saz = sqrt2 * (mf * az).sin();
+        let l_start = if m % 2 == 1 { m + 1 } else { m };
+        let mut l = l_start;
+        while l <= lmax {
+            let vp = sh[coefficient_index(l, m as isize)] as f64;
+            let vm = sh[coefficient_index(l, -(m as isize))] as f64;
+            let cs = vp * caz + vm * saz;
+            let sc = vm * caz - vp * saz;
+
+            amplitude += cs * al[index_mpos(l, m)];
+
+            let mut tmp = (((l + m) * (l - m + 1)) as f64).sqrt() * al[index_mpos(l, m - 1)];
+            if l > m {
+                tmp -= (((l - m) * (l + m + 1)) as f64).sqrt() * al[index_mpos(l, m + 1)];
+            }
+            tmp /= -2.0;
+            d_sh_del += cs * tmp;
+
+            let mut tmp2 = -(((l + m) * (l - m + 1) + (l - m) * (l + m + 1)) as f64)
+                * al[index_mpos(l, m)];
+            if m == 1 {
+                tmp2 -= (((l + m) * (l - m + 1) * (l + m - 1) * (l - m + 2)) as f64).sqrt()
+                    * al[index_mpos(l, 1)];
+            } else {
+                tmp2 += (((l + m) * (l - m + 1) * (l + m - 1) * (l - m + 2)) as f64).sqrt()
+                    * al[index_mpos(l, m - 2)];
+            }
+            if l > m + 1 {
+                tmp2 += (((l - m) * (l + m + 1) * (l - m - 1) * (l + m + 2)) as f64).sqrt()
+                    * al[index_mpos(l, m + 2)];
+            }
+            tmp2 /= 4.0;
+            d2_sh_del2 += cs * tmp2;
+
+            if atpole {
+                d_sh_daz += sc * tmp;
+            } else {
+                d2_sh_deldaz += mf * sc * tmp;
+                d_sh_daz += mf * sc * al[index_mpos(l, m)];
+                d2_sh_daz2 -= cs * (mf * mf) * al[index_mpos(l, m)];
+            }
+
+            l += 2;
+        }
+    }
+
+    if !atpole {
+        d_sh_daz /= sin_el;
+        d2_sh_deldaz /= sin_el;
+        d2_sh_daz2 /= sin_el * sin_el;
+    }
+
+    (
+        amplitude,
+        d_sh_del,
+        d_sh_daz,
+        d2_sh_del2,
+        d2_sh_deldaz,
+        d2_sh_daz2,
+    )
 }
 
 fn sh_transform_row(dir: [f32; 3], lmax: usize) -> Vec<f32> {
@@ -479,6 +654,142 @@ mod tests {
         assert!(out.iter().all(|value| value.is_finite()));
         let second = plan.apply_row(&coeffs);
         assert_eq!(out, second);
+    }
+
+    #[test]
+    fn anisotropic_power_is_zero_for_pure_ell0() {
+        // Pure isotropic SH (only ℓ=0 nonzero) has no anisotropy.
+        let sh = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let ap = anisotropic_power(&sh, 2, ANISOTROPIC_POWER_NORM_FACTOR);
+        assert_eq!(ap, 0.0);
+    }
+
+    #[test]
+    fn anisotropic_power_logs_band_mean_squared() {
+        // lmax=2, ncoeffs=6: ℓ=0 → idx 0, ℓ=2 → idx 1..6 (5 coeffs).
+        // AP_raw = (0² + 1² + 0² + 0² + 0²)/5 = 0.2; AP = ln(0.2) − ln(1e-5).
+        let sh = vec![0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let ap = anisotropic_power(&sh, 2, 1e-5);
+        let expected = (0.2_f64.ln() - 1e-5_f64.ln()) as f32;
+        assert!((ap - expected).abs() < 1e-6, "ap={ap}, expected={expected}");
+    }
+
+    #[test]
+    fn anisotropic_power_skips_ell0_band() {
+        // Identical ℓ=2 content with different ℓ=0 content must produce identical AP.
+        let sh_a = vec![0.0_f32, 0.3, 0.4, 0.5, 0.0, 0.0];
+        let sh_b = vec![5.0_f32, 0.3, 0.4, 0.5, 0.0, 0.0];
+        let ap_a = anisotropic_power(&sh_a, 2, ANISOTROPIC_POWER_NORM_FACTOR);
+        let ap_b = anisotropic_power(&sh_b, 2, ANISOTROPIC_POWER_NORM_FACTOR);
+        assert_eq!(ap_a, ap_b);
+    }
+
+    #[test]
+    fn anisotropic_power_clamps_to_zero_below_norm_factor() {
+        // tiny ℓ=2 energy below norm_factor: AP_raw ≪ norm_factor → clamp to 0.
+        let sh = vec![0.0_f32, 1e-6, 0.0, 0.0, 0.0, 0.0];
+        let ap = anisotropic_power(&sh, 2, 1e-5);
+        assert_eq!(ap, 0.0);
+    }
+
+    #[test]
+    fn sh_derivatives_amplitude_matches_basis_dot_product() {
+        // Amplitude returned by sh_derivatives must equal the dot product of
+        // sh_transform_row(dir) and the SH coefficients.
+        let lmax = 8;
+        let n = ncoeffs_for_lmax(lmax);
+        let mut sh = vec![0.0_f32; n];
+        // Arbitrary deterministic SH values.
+        for i in 0..n {
+            sh[i] = ((i as f32 * 0.137).sin() * 0.5 + 0.1).abs();
+        }
+        let dirs: [[f32; 3]; 5] = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.5773502, 0.5773502, 0.5773502],
+            [-0.6, 0.5, 0.6244998],
+        ];
+        for dir in dirs {
+            let row = sh_transform_row(dir, lmax);
+            let expected: f64 = row
+                .iter()
+                .zip(sh.iter())
+                .map(|(a, b)| (*a as f64) * (*b as f64))
+                .sum();
+            let z = dir[2] as f64;
+            let el = (((dir[0] as f64).powi(2) + (dir[1] as f64).powi(2)).sqrt()).atan2(z);
+            let az = (dir[1] as f64).atan2(dir[0] as f64);
+            let (amp, _, _, _, _, _) = sh_derivatives(&sh, lmax, el, az);
+            assert!(
+                (amp - expected).abs() < 1e-3,
+                "amplitude mismatch at dir={:?}: derivatives={amp}, basis-dot={expected}",
+                dir
+            );
+        }
+    }
+
+    #[test]
+    fn sh_derivatives_pure_ell0_is_flat() {
+        // Pure ℓ=0 SH is constant across the sphere, so all derivatives must vanish.
+        let lmax = 4;
+        let n = ncoeffs_for_lmax(lmax);
+        let mut sh = vec![0.0_f32; n];
+        sh[0] = 1.0;
+        let (_, dsh_del, dsh_daz, d2_del, d2_da, d2_az) =
+            sh_derivatives(&sh, lmax, 0.7, 1.3);
+        assert!(dsh_del.abs() < 1e-12);
+        assert!(dsh_daz.abs() < 1e-12);
+        assert!(d2_del.abs() < 1e-12);
+        assert!(d2_da.abs() < 1e-12);
+        assert!(d2_az.abs() < 1e-12);
+    }
+
+    #[test]
+    fn sh_derivatives_match_finite_differences() {
+        // Compare analytical derivatives to centered finite differences for a
+        // generic SH at random-ish (el, az), away from the pole.
+        let lmax = 6;
+        let n = ncoeffs_for_lmax(lmax);
+        let mut sh = vec![0.0_f32; n];
+        for i in 0..n {
+            sh[i] = ((i as f32 * 0.31 + 0.2).cos() * 0.4) as f32;
+        }
+        let el = 0.9_f64;
+        let az = 1.7_f64;
+        let h = 1e-4_f64;
+        let (_, dsh_del, dsh_daz, d2_del2, d2_deldaz, d2_daz2) =
+            sh_derivatives(&sh, lmax, el, az);
+
+        let f = |e: f64, a: f64| -> f64 { sh_derivatives(&sh, lmax, e, a).0 };
+        let fd_del = (f(el + h, az) - f(el - h, az)) / (2.0 * h);
+        let fd_daz = (f(el, az + h) - f(el, az - h)) / (2.0 * h);
+        let fd_d2_del2 = (f(el + h, az) - 2.0 * f(el, az) + f(el - h, az)) / (h * h);
+        let fd_d2_daz2 = (f(el, az + h) - 2.0 * f(el, az) + f(el, az - h)) / (h * h);
+        let fd_d2_deldaz = (f(el + h, az + h) - f(el + h, az - h) - f(el - h, az + h)
+            + f(el - h, az - h))
+            / (4.0 * h * h);
+        // Note: derivatives() returns ∂/∂az already divided by sin(el) (and
+        // ∂²/∂az² by sin²(el)), but the *finite differences* of f with
+        // respect to az do NOT include that factor. Undo it before comparing.
+        let sin_el = el.sin();
+        let dsh_daz_raw = dsh_daz * sin_el;
+        let d2_daz2_raw = d2_daz2 * sin_el * sin_el;
+        let d2_deldaz_raw = d2_deldaz * sin_el;
+        assert!((dsh_del - fd_del).abs() < 1e-3, "dSH_del: {dsh_del} vs {fd_del}");
+        assert!((dsh_daz_raw - fd_daz).abs() < 1e-3, "dSH_daz: {dsh_daz_raw} vs {fd_daz}");
+        assert!(
+            (d2_del2 - fd_d2_del2).abs() < 1e-2,
+            "d2_del2: {d2_del2} vs {fd_d2_del2}"
+        );
+        assert!(
+            (d2_daz2_raw - fd_d2_daz2).abs() < 1e-2,
+            "d2_daz2: {d2_daz2_raw} vs {fd_d2_daz2}"
+        );
+        assert!(
+            (d2_deldaz_raw - fd_d2_deldaz).abs() < 1e-2,
+            "d2_deldaz: {d2_deldaz_raw} vs {fd_d2_deldaz}"
+        );
     }
 
     #[test]

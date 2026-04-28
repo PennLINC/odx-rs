@@ -37,13 +37,19 @@ impl DetectedFormat {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LoadDatasetOptions<'a> {
     pub sh_path: Option<&'a Path>,
     pub fixel_dir: Option<&'a Path>,
     pub reference_affine: Option<&'a Path>,
     pub mapmri_tensor_path: Option<&'a Path>,
     pub mapmri_uvec_path: Option<&'a Path>,
+    /// MRtrix-only: when true, NIfTI inputs keep their on-disk affine and
+    /// (i,j,k) ordering instead of being canonicalized to RAS+. Set this when
+    /// comparing against ODXs produced by Python pipelines that ingest via
+    /// nibabel without reorienting (e.g. cs-odf), since nibabel reads the
+    /// sform/qform untouched.
+    pub preserve_nifti_affine: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +69,8 @@ pub struct DatasetSummary {
     pub voxel_to_rasmm: [[f64; 4]; 4],
     pub sh_basis: Option<String>,
     pub sh_order: Option<u64>,
+    pub sh_full_basis: Option<bool>,
+    pub sh_legacy: Option<bool>,
     pub canonical_dense_representation: Option<String>,
     pub odf_sample_domain: Option<String>,
     pub sphere_id: Option<String>,
@@ -258,7 +266,14 @@ pub fn load_dataset_with_format(
                     "--reference-affine is only valid for DSI Studio inputs".into(),
                 ));
             }
-            mrtrix::load_mrtrix_dataset(Some(path), options.fixel_dir)?
+            mrtrix::load_mrtrix_dataset_with_options(
+                Some(path),
+                options.fixel_dir,
+                &mrtrix::MrtrixDatasetLoadOptions {
+                    preserve_nifti_affine: options.preserve_nifti_affine,
+                    ..Default::default()
+                },
+            )?
         }
         DetectedFormat::MrtrixFixelDir => {
             if options.mapmri_tensor_path.is_some() {
@@ -281,7 +296,14 @@ pub fn load_dataset_with_format(
                     "--reference-affine is only valid for DSI Studio inputs".into(),
                 ));
             }
-            mrtrix::load_mrtrix_dataset(options.sh_path, Some(path))?
+            mrtrix::load_mrtrix_dataset_with_options(
+                options.sh_path,
+                Some(path),
+                &mrtrix::MrtrixDatasetLoadOptions {
+                    preserve_nifti_affine: options.preserve_nifti_affine,
+                    ..Default::default()
+                },
+            )?
         }
     };
     Ok(dataset)
@@ -342,6 +364,8 @@ pub fn summarize_dataset(odx: &OdxDataset, detected_format: DetectedFormat) -> D
         voxel_to_rasmm: odx.header().voxel_to_rasmm,
         sh_basis: odx.header().sh_basis.clone(),
         sh_order: odx.header().sh_order,
+        sh_full_basis: odx.header().sh_full_basis,
+        sh_legacy: odx.header().sh_legacy,
         canonical_dense_representation: odx
             .header()
             .canonical_dense_representation
@@ -385,11 +409,19 @@ pub fn render_summary(summary: &DatasetSummary) -> String {
     ));
 
     if let Some(order) = summary.sh_order {
-        out.push_str(&format!(
-            "sh: basis={} order={}\n",
+        let mut line = format!(
+            "sh: basis={} order={}",
             summary.sh_basis.as_deref().unwrap_or("unknown"),
             order
-        ));
+        );
+        if let Some(full) = summary.sh_full_basis {
+            line.push_str(&format!(" full_basis={full}"));
+        }
+        if let Some(legacy) = summary.sh_legacy {
+            line.push_str(&format!(" legacy={legacy}"));
+        }
+        line.push('\n');
+        out.push_str(&line);
     }
     if let Some(rep) = summary.canonical_dense_representation.as_deref() {
         out.push_str(&format!("canonical_dense_representation: {rep}\n"));

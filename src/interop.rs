@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::Path;
 
 use serde_json::Value;
@@ -13,6 +12,7 @@ use crate::header::CanonicalDenseRepresentation;
 use crate::mmap_backing::{vec_to_bytes, MmapBacking};
 use crate::mrtrix_sh;
 use crate::odx_file::{OdxDataset, OdxParts};
+use crate::peak_finder::{PeakFinderConfig, SpherePeakFinder};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DsistudioFormat {
@@ -339,66 +339,15 @@ fn peaks_from_sampled_odf(
     odx: &OdxDataset,
     odf_rows: &[f32],
 ) -> (Vec<u32>, Vec<[f32; 3]>, Vec<f32>) {
-    let neighbors = hemisphere_neighbors();
-    let hemisphere = dsistudio_odf8::hemisphere_vertices_ras();
-    let ncols = hemisphere.len();
-    let mut offsets = Vec::with_capacity(odx.nb_voxels() + 1);
-    let mut directions = Vec::new();
-    let mut amplitudes = Vec::new();
-    offsets.push(0);
-
-    for voxel in 0..odx.nb_voxels() {
-        let row = &odf_rows[voxel * ncols..(voxel + 1) * ncols];
-        let mut maxima = Vec::new();
-        for vertex in 0..ncols {
-            let value = row[vertex];
-            if value <= 0.0 {
-                continue;
-            }
-            if neighbors[vertex].iter().all(|&nbr| value >= row[nbr]) {
-                maxima.push((value, vertex));
-            }
-        }
-        maxima.sort_by(|a, b| b.0.total_cmp(&a.0));
-        if maxima.is_empty() {
-            let (best_idx, best_val) = row
-                .iter()
-                .copied()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(&b.1))
-                .unwrap_or((0, 0.0));
-            maxima.push((best_val.max(1e-6), best_idx));
-        }
-        for (value, idx) in maxima.into_iter().take(5) {
-            directions.push(hemisphere[idx]);
-            amplitudes.push(value.max(1e-6));
-        }
-        offsets.push(directions.len() as u32);
-    }
-    (offsets, directions, amplitudes)
-}
-
-fn hemisphere_neighbors() -> &'static [Vec<usize>] {
-    static NEIGHBORS: std::sync::OnceLock<Vec<Vec<usize>>> = std::sync::OnceLock::new();
-    NEIGHBORS.get_or_init(|| {
-        let hemisphere_len = dsistudio_odf8::hemisphere_vertices_ras().len();
-        let mut neighbors = vec![HashSet::new(); hemisphere_len];
-        for face in dsistudio_odf8::faces() {
-            let ids = [face[0] as usize, face[1] as usize, face[2] as usize];
-            if ids.iter().all(|&idx| idx < hemisphere_len) {
-                for i in 0..3 {
-                    let a = ids[i];
-                    let b = ids[(i + 1) % 3];
-                    neighbors[a].insert(b);
-                    neighbors[b].insert(a);
-                }
-            }
-        }
-        neighbors
-            .into_iter()
-            .map(|set| set.into_iter().collect::<Vec<_>>())
-            .collect()
-    })
+    static FINDER: std::sync::OnceLock<SpherePeakFinder> = std::sync::OnceLock::new();
+    let finder = FINDER.get_or_init(|| {
+        SpherePeakFinder::for_dsistudio_odf8(PeakFinderConfig {
+            npeaks: 5,
+            relative_peak_threshold: 0.5,
+            min_separation_angle_deg: 25.0,
+        })
+    });
+    finder.find_peaks_rows(odf_rows, odx.nb_voxels())
 }
 
 fn replace_peaks(

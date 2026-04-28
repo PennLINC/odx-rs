@@ -1,7 +1,18 @@
+//! DSI Studio (.fib.gz / .fz) format adapter.
+//!
+//! ---------------------------------------------------------------------------
+//! Third-party attribution: nibabel
+//!
+//! The voxel-grid reorientation in [`build_dsistudio_export_geometry`] is
+//! computed by calling through to [`crate::nifti_canon`], whose
+//! `nibabel_io_orientation` and `nibabel_ornt_transform` helpers are ports of
+//! routines from the `nibabel.orientations` module of nibabel
+//! (<https://nipy.org/nibabel/>), copyright (c) 2009-2024 the nibabel
+//! developers. Those portions are made available under the MIT License; see
+//! `odx-rs/LICENSE-NIBABEL` for the full notice.
+
 use std::collections::HashMap;
 use std::path::Path;
-
-use nalgebra::Matrix3;
 
 use crate::data_array::DataArray;
 use crate::dtype::DType;
@@ -12,6 +23,7 @@ use crate::formats::mat4::{
 };
 use crate::header::CanonicalDenseRepresentation;
 use crate::mmap_backing::{vec_to_bytes, MmapBacking};
+use crate::nifti_canon::{affine_column_norms, nibabel_io_orientation, nibabel_ornt_transform};
 use crate::odx_file::{OdxDataset, OdxParts};
 
 pub fn load_fibgz(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxDataset> {
@@ -319,6 +331,8 @@ fn load_dsistudio_mat(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxD
         nb_sphere_faces: sphere_faces.as_ref().map(|f| f.len() as u64),
         sh_order: None,
         sh_basis: None,
+        sh_full_basis: None,
+        sh_legacy: None,
         canonical_dense_representation: if odf.is_empty() {
             None
         } else {
@@ -493,92 +507,6 @@ fn nifti_affine_to_dsistudio_trans(aff: [[f64; 4]; 4]) -> Vec<f32> {
     aff.into_iter()
         .flat_map(|row| row.into_iter().map(|v| v as f32))
         .collect()
-}
-
-fn affine_column_norms(aff: [[f64; 4]; 4]) -> [f32; 3] {
-    [
-        (aff[0][0] * aff[0][0] + aff[1][0] * aff[1][0] + aff[2][0] * aff[2][0]).sqrt() as f32,
-        (aff[0][1] * aff[0][1] + aff[1][1] * aff[1][1] + aff[2][1] * aff[2][1]).sqrt() as f32,
-        (aff[0][2] * aff[0][2] + aff[1][2] * aff[1][2] + aff[2][2] * aff[2][2]).sqrt() as f32,
-    ]
-}
-
-fn nibabel_io_orientation(aff: [[f64; 4]; 4]) -> [[i8; 2]; 3] {
-    // This mirrors nibabel.orientations.io_orientation(): derive the closest
-    // voxel-axis -> world-axis mapping from the affine, rather than assuming
-    // voxel axes already correspond to x/y/z in anatomical order.
-    let rzs = Matrix3::new(
-        aff[0][0], aff[0][1], aff[0][2], aff[1][0], aff[1][1], aff[1][2], aff[2][0], aff[2][1],
-        aff[2][2],
-    );
-    let zooms = affine_column_norms(aff);
-    let rs = Matrix3::new(
-        rzs[(0, 0)] / f64::from(zooms[0].max(1e-12)),
-        rzs[(0, 1)] / f64::from(zooms[1].max(1e-12)),
-        rzs[(0, 2)] / f64::from(zooms[2].max(1e-12)),
-        rzs[(1, 0)] / f64::from(zooms[0].max(1e-12)),
-        rzs[(1, 1)] / f64::from(zooms[1].max(1e-12)),
-        rzs[(1, 2)] / f64::from(zooms[2].max(1e-12)),
-        rzs[(2, 0)] / f64::from(zooms[0].max(1e-12)),
-        rzs[(2, 1)] / f64::from(zooms[1].max(1e-12)),
-        rzs[(2, 2)] / f64::from(zooms[2].max(1e-12)),
-    );
-    let svd = rs.svd(true, true);
-    let u = svd.u.expect("requested U from SVD");
-    let vt = svd.v_t.expect("requested V^T from SVD");
-    let s = svd.singular_values;
-    let tol = s.max() * 3.0 * f64::EPSILON;
-    let mut r = Matrix3::<f64>::zeros();
-    for idx in 0..3 {
-        if s[idx] > tol {
-            let ui = u.column(idx);
-            let vti = vt.row(idx);
-            r += ui * vti;
-        }
-    }
-
-    let mut in_axes = [0usize, 1, 2];
-    in_axes.sort_by(|&a, &b| {
-        let sa = (0..3).map(|row| r[(row, a)].powi(2)).fold(0.0, f64::max);
-        let sb = (0..3).map(|row| r[(row, b)].powi(2)).fold(0.0, f64::max);
-        sb.total_cmp(&sa)
-    });
-
-    let mut ornt = [[-1i8, 1i8]; 3];
-    let mut work = r;
-    for in_ax in in_axes {
-        let mut out_ax = 0usize;
-        let mut best = 0.0f64;
-        for row in 0..3 {
-            let value = work[(row, in_ax)].abs();
-            if value > best {
-                best = value;
-                out_ax = row;
-            }
-        }
-        ornt[in_ax][0] = out_ax as i8;
-        ornt[in_ax][1] = if work[(out_ax, in_ax)] < 0.0 { -1 } else { 1 };
-        for col in 0..3 {
-            work[(out_ax, col)] = 0.0;
-        }
-    }
-    ornt
-}
-
-fn nibabel_ornt_transform(start_ornt: [[i8; 2]; 3], end_ornt: [[i8; 2]; 3]) -> [[i8; 2]; 3] {
-    let mut result = [[0i8, 1i8]; 3];
-    for (end_in_idx, [end_out_idx, end_flip]) in end_ornt.into_iter().enumerate() {
-        for (start_in_idx, [start_out_idx, start_flip]) in start_ornt.into_iter().enumerate() {
-            if end_out_idx == start_out_idx {
-                result[start_in_idx] = [
-                    end_in_idx as i8,
-                    if start_flip == end_flip { 1 } else { -1 },
-                ];
-                break;
-            }
-        }
-    }
-    result
 }
 
 fn build_reoriented_dsistudio_c_to_f(

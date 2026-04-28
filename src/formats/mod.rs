@@ -4,4 +4,5 @@ pub mod mat4;
 pub mod mif;
 pub mod mrtrix;
 pub mod pam;
+pub mod pyafq_aodf;
 pub mod tortoise_mapmri;
