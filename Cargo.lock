@@ -635,6 +635,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "itk-transforms-rs"
+version = "0.1.0"
+source = "git+https://github.com/PennLINC/itk-transforms-rs#ccd61d034da6a14150491a092e3cf182daff5cd2"
+dependencies = [
+ "hdf5-metno",
+ "nalgebra",
+ "ndarray",
+ "nifti",
+ "thiserror",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -802,12 +814,14 @@ dependencies = [
  "byteordered",
  "either",
  "flate2",
+ "nalgebra",
  "ndarray",
  "num-complex",
  "num-derive",
  "num-traits",
  "quick-error",
  "rgb",
+ "simba",
 ]
 
 [[package]]
@@ -889,6 +903,7 @@ dependencies = [
  "flate2",
  "half",
  "hdf5-metno",
+ "itk-transforms-rs",
  "memmap2",
  "nalgebra",
  "ndarray",

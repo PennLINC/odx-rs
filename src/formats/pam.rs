@@ -15,21 +15,6 @@ const PAM_BASIS_ASSUMED: &str = "_ODX_PAM_SH_BASIS_ASSUMED";
 #[derive(Debug, Clone, Default)]
 pub struct PamWriteOptions;
 
-#[cfg(not(feature = "pam5"))]
-pub fn load_pam5(_path: &Path) -> Result<OdxDataset> {
-    Err(OdxError::Argument(
-        "PAM5 support is disabled; rebuild with the 'pam5' feature".into(),
-    ))
-}
-
-#[cfg(not(feature = "pam5"))]
-pub fn save_pam5(_odx: &OdxDataset, _path: &Path, _options: &PamWriteOptions) -> Result<()> {
-    Err(OdxError::Argument(
-        "PAM5 support is disabled; rebuild with the 'pam5' feature".into(),
-    ))
-}
-
-#[cfg(feature = "pam5")]
 pub fn load_pam5(path: &Path) -> Result<OdxDataset> {
     use hdf5_metno::types::VarLenUnicode;
     use hdf5_metno::File;
@@ -411,7 +396,6 @@ pub fn load_pam5(path: &Path) -> Result<OdxDataset> {
     }))
 }
 
-#[cfg(feature = "pam5")]
 pub fn save_pam5(odx: &OdxDataset, path: &Path, _options: &PamWriteOptions) -> Result<()> {
     use hdf5_metno::types::VarLenUnicode;
     use hdf5_metno::File;
@@ -633,7 +617,6 @@ pub fn save_pam5(odx: &OdxDataset, path: &Path, _options: &PamWriteOptions) -> R
     Ok(())
 }
 
-#[cfg(feature = "pam5")]
 fn sparse_from_dense_rows(values: &[f64], mask: &[u8], ncols: usize) -> Vec<f64> {
     let mut out = Vec::new();
     for (idx, &flag) in mask.iter().enumerate() {
@@ -646,7 +629,6 @@ fn sparse_from_dense_rows(values: &[f64], mask: &[u8], ncols: usize) -> Vec<f64>
     out
 }
 
-#[cfg(feature = "pam5")]
 fn sparse_from_dense_scalar(values: &[f64], mask: &[u8]) -> Vec<f64> {
     let mut out = Vec::new();
     for (idx, &flag) in mask.iter().enumerate() {
@@ -657,7 +639,6 @@ fn sparse_from_dense_scalar(values: &[f64], mask: &[u8]) -> Vec<f64> {
     out
 }
 
-#[cfg(feature = "pam5")]
 fn sparse_voxel_indices(mask: &[u8]) -> Vec<usize> {
     mask.iter()
         .enumerate()
@@ -665,7 +646,6 @@ fn sparse_voxel_indices(mask: &[u8]) -> Vec<usize> {
         .collect()
 }
 
-#[cfg(feature = "pam5")]
 fn infer_sh_order(ncols: usize) -> Option<u64> {
     let mut order = 0u64;
     loop {
@@ -680,7 +660,6 @@ fn infer_sh_order(ncols: usize) -> Option<u64> {
     }
 }
 
-#[cfg(feature = "pam5")]
 fn orientation_matrix(affine: &[[f64; 4]; 4]) -> [[f32; 3]; 3] {
     let mut out = [[0.0f32; 3]; 3];
     for col in 0..3 {
@@ -697,12 +676,10 @@ fn orientation_matrix(affine: &[[f64; 4]; 4]) -> [[f32; 3]; 3] {
     out
 }
 
-#[cfg(feature = "pam5")]
 fn rotate_dir_pam_to_ras(dir: [f32; 3], affine: &[[f64; 4]; 4]) -> [f32; 3] {
     normalize_dir(apply_mat3(&orientation_matrix(affine), dir))
 }
 
-#[cfg(feature = "pam5")]
 fn rotate_dir_ras_to_pam(dir: [f32; 3], orientation: &[[f32; 3]; 3]) -> [f32; 3] {
     let transposed = [
         [orientation[0][0], orientation[1][0], orientation[2][0]],
@@ -712,7 +689,6 @@ fn rotate_dir_ras_to_pam(dir: [f32; 3], orientation: &[[f32; 3]; 3]) -> [f32; 3]
     normalize_dir(apply_mat3(&transposed, dir))
 }
 
-#[cfg(feature = "pam5")]
 fn apply_mat3(mat: &[[f32; 3]; 3], dir: [f32; 3]) -> [f32; 3] {
     [
         mat[0][0] * dir[0] + mat[0][1] * dir[1] + mat[0][2] * dir[2],
@@ -721,7 +697,6 @@ fn apply_mat3(mat: &[[f32; 3]; 3], dir: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-#[cfg(feature = "pam5")]
 fn normalize_dir(dir: [f32; 3]) -> [f32; 3] {
     let norm = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
     if norm <= f32::EPSILON {
@@ -731,7 +706,6 @@ fn normalize_dir(dir: [f32; 3]) -> [f32; 3] {
     }
 }
 
-#[cfg(feature = "pam5")]
 fn reusable_peak_indices(odx: &OdxDataset, sphere: &SphereRows<'_>) -> Result<Vec<Option<i32>>> {
     let indices = match odx.dpf::<i32>("pam_peak_index") {
         Ok(values) => values,
@@ -755,14 +729,12 @@ fn reusable_peak_indices(odx: &OdxDataset, sphere: &SphereRows<'_>) -> Result<Ve
     Ok(indices.as_flat_slice().iter().copied().map(Some).collect())
 }
 
-#[cfg(feature = "pam5")]
 fn approx_dir_eq(left: [f32; 3], right: [f32; 3]) -> bool {
     (left[0] - right[0]).abs() <= 1e-5
         && (left[1] - right[1]).abs() <= 1e-5
         && (left[2] - right[2]).abs() <= 1e-5
 }
 
-#[cfg(feature = "pam5")]
 fn should_export_sh(odx: &OdxDataset) -> bool {
     match odx.header().sh_basis.as_deref() {
         Some("descoteaux07") => true,
@@ -776,7 +748,6 @@ fn should_export_sh(odx: &OdxDataset) -> bool {
     }
 }
 
-#[cfg(feature = "pam5")]
 fn quantize_to_sphere(dir: [f32; 3], sphere: &[[f32; 3]]) -> (usize, [f32; 3]) {
     let mut best_idx = 0usize;
     let mut best_abs_dot = f32::NEG_INFINITY;
@@ -801,7 +772,6 @@ fn quantize_to_sphere(dir: [f32; 3], sphere: &[[f32; 3]]) -> (usize, [f32; 3]) {
     )
 }
 
-#[cfg(feature = "pam5")]
 fn export_sphere_vertices<'a>(odx: &'a OdxDataset) -> Result<SphereRows<'a>> {
     if let Some(vertices) = odx.sphere_vertices() {
         return Ok(SphereRows::Borrowed(vertices));
@@ -814,12 +784,10 @@ fn export_sphere_vertices<'a>(odx: &'a OdxDataset) -> Result<SphereRows<'a>> {
     Ok(SphereRows::Owned(load_repulsion724_hemisphere()))
 }
 
-#[cfg(feature = "pam5")]
 fn flatten_affine(affine: [[f64; 4]; 4]) -> Vec<f64> {
     affine.into_iter().flat_map(|row| row.into_iter()).collect()
 }
 
-#[cfg(feature = "pam5")]
 fn load_repulsion724_hemisphere() -> Vec<[f32; 3]> {
     include_bytes!("pam_repulsion724_hemisphere_f32.bin")
         .chunks_exact(12)
@@ -832,13 +800,11 @@ fn load_repulsion724_hemisphere() -> Vec<[f32; 3]> {
         .collect()
 }
 
-#[cfg(feature = "pam5")]
 enum SphereRows<'a> {
     Borrowed(&'a [[f32; 3]]),
     Owned(Vec<[f32; 3]>),
 }
 
-#[cfg(feature = "pam5")]
 impl<'a> SphereRows<'a> {
     fn as_flat_slice(&self) -> &[[f32; 3]] {
         match self {
@@ -856,7 +822,6 @@ impl<'a> SphereRows<'a> {
     }
 }
 
-#[cfg(feature = "pam5")]
 fn write_dataset_f32_5d(
     group: &hdf5_metno::Group,
     name: &str,
@@ -875,7 +840,6 @@ fn write_dataset_f32_5d(
     Ok(())
 }
 
-#[cfg(feature = "pam5")]
 fn write_dataset_f32_4d(
     group: &hdf5_metno::Group,
     name: &str,
@@ -893,7 +857,6 @@ fn write_dataset_f32_4d(
     Ok(())
 }
 
-#[cfg(feature = "pam5")]
 fn write_dataset_i32_4d(
     group: &hdf5_metno::Group,
     name: &str,
@@ -911,7 +874,6 @@ fn write_dataset_i32_4d(
     Ok(())
 }
 
-#[cfg(feature = "pam5")]
 fn write_dataset_f32_3d(
     group: &hdf5_metno::Group,
     name: &str,
@@ -928,7 +890,6 @@ fn write_dataset_f32_3d(
     Ok(())
 }
 
-#[cfg(feature = "pam5")]
 fn write_dataset_f64_2d(
     group: &hdf5_metno::Group,
     name: &str,
@@ -941,7 +902,6 @@ fn write_dataset_f64_2d(
     Ok(())
 }
 
-#[cfg(feature = "pam5")]
 fn write_dataset_f32_2d(
     group: &hdf5_metno::Group,
     name: &str,
@@ -958,7 +918,6 @@ fn write_dataset_f32_2d(
     Ok(())
 }
 
-#[cfg(feature = "pam5")]
 fn write_dataset_f64_1d(group: &hdf5_metno::Group, name: &str, data: &[f64]) -> Result<()> {
     let ds = group
         .new_dataset::<f64>()

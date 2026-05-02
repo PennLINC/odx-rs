@@ -16,7 +16,7 @@ odx info sub-01.fib.gz
 Convert DSI Studio to ODX directory:
 
 ```bash
-odx convert input.fib.gz output.odx --odx-layout directory
+odx convert input.fib.gz output.odx --output-format odx-directory
 ```
 
 Convert DSI Studio to MRtrix fixels plus SH:
@@ -34,7 +34,7 @@ odx convert fixels_mif out.fz --sh fod.mif.gz
 Convert MRtrix SH plus fixels to ODX:
 
 ```bash
-odx convert fod.mif.gz output.odx --fixel-dir fixels_nii --odx-layout directory
+odx convert fod.mif.gz output.odx --fixel-dir fixels_nii --output-format odx-directory
 ```
 
 Validate a dataset:
@@ -90,7 +90,7 @@ Supported families:
 - DSI Studio ↔ MRtrix
 
 The CLI uses path-based detection by default. Use `--input-format` or `--output-format` only when detection is ambiguous.
-For ODX specifically, existing `.odx` paths are distinguished by filesystem type: directories load as ODX directories and files load as ODX ZIP archives. When creating a new `.odx` directory path, pass `--odx-layout directory` because the target does not exist yet.
+For ODX specifically, existing `.odx` paths are distinguished by filesystem type: directories load as ODX directories and files load as ODX ZIP archives. When creating a new `.odx` directory path, pass `--output-format odx-directory` because the target does not exist yet.
 
 Shared input options:
 
@@ -104,27 +104,26 @@ General output options:
 - `--quiet`
 - `--json`
 
+Output format selection:
+
+- `--output-format odx-directory|odx-archive|dsistudio-fibgz|dsistudio-fz|dipy-pam5|mrtrix-sh-image|mrtrix-fixel-dir`
+
 ODX options:
 
-- `--odx-layout directory|archive`
 - `--quantize-dense`
-- `--quantize-min-len <usize>`
 
 MRtrix options:
 
-- `--out-sh <path>`
-- `--mrtrix-fixel-container mif|nifti`
-- `--mrtrix-sh-container mif|nifti1|nifti2`
-- `--mrtrix-sh-gzip`
+- `--out-sh <path>` (write SH alongside a fixel-dir output)
+- `--fixel-container mif|nifti` (default `nifti`)
+- `--nifti2` (force NIfTI-2 when writing SH to `.nii`/`.nii.gz`)
 - `--sh-lmax <even-int>`
+
+The MRtrix SH container (mif vs nifti) and gzip compression are inferred from the output filename extension (`.mif`, `.mif.gz`, `.nii`, `.nii.gz`).
 
 DSI Studio options:
 
-- `--dsi-format fibgz|fz`
 - `--dense-odf off|from-sh`
-- `--peak-source fixels|sampled-odf`
-- `--amplitude-key <name>`
-- `--z0 auto|never|always`
 
 ### `odx validate`
 
@@ -195,6 +194,85 @@ with the fixed encoding:
 
 `--write-qc-class` is only valid for existing ODX directory or `.odx` archive
 inputs.
+
+### `odx transform`
+
+```bash
+odx transform <input.odx> <output.odx> --transform <h5> [options]
+```
+
+Warps an ODX dataset (SH coefficients, per-voxel scalars, fixels) onto a new
+spatial grid using an ANTs/ITK Composite `.h5` (with embedded warp + affines)
+an Insight Transform File V1.0 (`.txt`, affine-only), or an ITK MATLAB
+v4 binary (`.mat`, affine-only — what ANTs writes for `*0GenericAffine.mat`).
+
+#### Direction convention (cartoon BIDS)
+
+`odx transform` resamples a sampled grid, so it follows the **same-direction**
+h5 convention as `antsApplyTransforms` for an image — **not** the opposite-named
+convention used by `trxrs`/`giftirs` for points.
+
+| You have                                       | You want                              | Pass to `--transform`                            |
+| ---------------------------------------------- | ------------------------------------- | ------------------------------------------------ |
+| `sub-01_space-ACPC_dwimap.odx`                 | ODX in `MNI152NLin2009cAsym`          | `sub-01_from-ACPC_to-MNI152NLin2009cAsym_xfm.h5` |
+| `sub-01_space-MNI152NLin2009cAsym_dwimap.odx`  | ODX in `ACPC`                         | `sub-01_from-MNI152NLin2009cAsym_to-ACPC_xfm.h5` |
+
+Pull-based grid resampling means: at each output (target) voxel, the chain
+inside `from-X_to-Y_xfm.h5` returns the source X coordinate to sample from.
+That's also what `antsApplyTransforms` does for an image of the same space,
+so the file you pass is the same.
+
+For the same subject, contrast with `trxrs`:
+
+```text
+sub-01_space-ACPC_tracts.trx       → MNI:  trxrs       --transform sub-01_from-MNI...to-ACPC_xfm.h5
+sub-01_space-ACPC_dwimap.odx       → MNI:  odx transform --transform sub-01_from-ACPC_to-MNI..._xfm.h5
+                                                                       ^^^^^^ opposite naming
+```
+
+#### Worked example (mrtrix mode, default)
+
+```bash
+odx transform \
+    sub-01_space-ACPC_dwimap.odx \
+    sub-01_space-MNI152NLin2009cAsym_dwimap.odx \
+    --transform sub-01_from-ACPC_to-MNI152NLin2009cAsym_xfm.h5
+```
+
+The output grid (dimensions + voxel-to-world affine) is taken from the warp's
+displacement field embedded in the h5. For an affine-only h5, supply
+`--reference <target.nii.gz>` to specify the output grid explicitly.
+
+#### Modes: pull-everything (`mrtrix`) vs split (`ants`)
+
+- `--mode mrtrix` (default): SH, DPV, AND fixels are pulled via the single
+  `--transform` h5 (target → source). Matches `mrtransform` +
+  `fixeltransform` semantics. Fixels may be duplicated or dropped at
+  non-uniform warp regions (no fixel-correspondence guarantees).
+- `--mode ants`: SH and DPV are pulled via `--transform`, but fixels are
+  **pushed** via `--transform-inverse` (source → target). Each source fixel
+  maps to exactly one target voxel, preserving cardinality. Use when you
+  have an ANTs-style paired h5 set.
+
+```bash
+odx transform \
+    sub-01_space-ACPC_dwimap.odx \
+    sub-01_space-MNI152NLin2009cAsym_dwimap.odx \
+    --mode ants \
+    --transform         sub-01_from-ACPC_to-MNI152NLin2009cAsym_xfm.h5 \
+    --transform-inverse sub-01_from-MNI152NLin2009cAsym_to-ACPC_xfm.h5
+```
+
+#### Useful options
+
+- `--reference <target.nii.gz>`: required for affine-only chains; ignored when
+  the h5 contains a displacement field (the warp's grid wins).
+- `--invert`: numerically invert the chain. Affine-only chains only.
+- `--modulate`: mrtrix-style SH modulation (`‖J·d‖/det(J)`, equivalent to
+  `mrtransform -modulate fod`). Off by default. Fixels are never modulated.
+- `--apsf-dirs <N>`: number of fibonacci-spiral reference directions for
+  aPSF SH reorientation. Default 80 (covers lmax 8 reliably); use 300 for
+  lmax 12.
 
 ## Input Model
 

@@ -107,6 +107,8 @@ data.odx/
 | `NB_SPHERE_FACES` | `sphere/` exists | `u64` | Number of triangles in the sphere mesh. |
 | `SH_ORDER` | `sh/` exists | `u64` | Maximum spherical harmonic order. |
 | `SH_BASIS` | `sh/` exists | `string` | SH basis convention: `"descoteaux07"` (Dipy) or `"tournier07"` (MRtrix). |
+| `SH_FULL_BASIS` | optional | `bool` | When `true`, the SH array uses the full basis with both even and odd ℓ (ncoeffs = `(SH_ORDER + 1)²`); when `false` or absent, the symmetric even-only basis is used (ncoeffs = `(SH_ORDER + 1)(SH_ORDER + 2)/2`). Full basis is required for asymmetric ODFs (e.g. pyAFQ aodf). |
+| `SH_LEGACY` | optional | `bool` | Affects the descoteaux07 basis only. `false` (modern, dipy ≥ 1.7) and `true` (legacy, dipy ≤ 1.x default) differ in the sign convention for negative-`m` coefficients. Defaults to `false` when absent. |
 | `CANONICAL_DENSE_REPRESENTATION` | optional | `string` | Preferred dense representation: `"sh"` or `"odf"`. |
 | `SPHERE_ID` | optional | `string` | Canonical sphere identifier when `odf/` uses a standard sphere and explicit `sphere/` payloads can be omitted. |
 | `ARRAY_QUANTIZATION` | optional | `object` | Per-array linear quantization metadata for ODX-native `uint8 + slope/intercept` storage. |
@@ -203,19 +205,26 @@ Additional named ODF arrays may be placed in this directory (e.g.,
 Shape `(NB_VOXELS, ncoeffs)`. Row i contains the SH coefficients for masked
 voxel i.
 
-The number of coefficients for even-order symmetric SH of maximum order L is:
+The number of coefficients depends on whether the basis includes odd ℓ:
 
 ```
-ncoeffs = (L + 1)(L + 2) / 2
+SH_FULL_BASIS = false (default):  ncoeffs = (L + 1)(L + 2) / 2     (even ℓ only)
+SH_FULL_BASIS = true:             ncoeffs = (L + 1)²              (even and odd ℓ)
 ```
 
-For example: order 8 has 45 coefficients.
+For example, at order 8: 45 coefficients in the symmetric basis, 81 in the
+full basis.
 
-The `SH_ORDER` and `SH_BASIS` header fields define interpretation. Supported
-bases:
+The `SH_ORDER`, `SH_BASIS`, `SH_FULL_BASIS`, and `SH_LEGACY` header fields
+together define the interpretation. Supported bases:
 
-- `"descoteaux07"` — Descoteaux et al. 2007 real symmetric basis (Dipy convention)
-- `"tournier07"` — Tournier et al. 2007 basis (MRtrix convention)
+- `"descoteaux07"` — Descoteaux et al. 2007 real basis (Dipy convention).
+  May be even-only (`SH_FULL_BASIS = false`) or include odd ℓ for
+  asymmetric ODFs (`SH_FULL_BASIS = true`). Modern files set
+  `SH_LEGACY = false`; older dipy outputs may set it `true` (the two
+  differ in the sign convention for `m < 0`).
+- `"tournier07"` — Tournier et al. 2007 basis (MRtrix convention). Always
+  even-only; `SH_FULL_BASIS` does not apply.
 
 An ODX file may contain both `odf/` and `sh/` representations. When both are
 present, they should be consistent. `sh/` is the preferred compact dense

@@ -44,11 +44,127 @@ enum Command {
     /// Convert a pyAFQ asymmetric ODF (`*_param-aodf_dwimap.nii.gz`) into ODX.
     /// Stores full-basis descoteaux07 SH and precomputes per-voxel asymmetric peaks.
     ImportAodf(ImportAodfArgs),
+    /// Apply an ANTs/ITK spatial transform to an ODX dataset (grid-resample
+    /// SH/DPV, push or pull fixels).
+    ///
+    /// THE SAME-DIRECTION H5 RULE: this tool resamples a sampled grid, so it
+    /// follows the *image-warping* convention — pass the SAME-direction h5
+    /// you would give `antsApplyTransforms` for an image. To take an ODX
+    /// FROM space A TO space B, pass `from-A_to-B_xfm.h5`. (NOT the
+    /// opposite-named convention used by `trxrs`/`giftirs` for points.)
+    ///
+    /// CARTOON BIDS EXAMPLES — given `sub-01`'s paired h5 files:
+    ///
+    /// • You have `sub-01_space-ACPC_dwimap.odx` and want ODX in
+    ///   MNI152NLin2009cAsym → pass `sub-01_from-ACPC_to-MNI152NLin2009cAsym_xfm.h5`
+    ///
+    /// • You have `sub-01_space-MNI152NLin2009cAsym_dwimap.odx` and want ODX
+    ///   in ACPC → pass `sub-01_from-MNI152NLin2009cAsym_to-ACPC_xfm.h5`
+    ///
+    /// HEADS-UP: for the SAME subject going to the SAME target, the h5 you
+    /// pass to `odx transform` is the OTHER member of the BIDS pair than
+    /// the one you'd pass to `trxrs`/`giftirs`:
+    ///
+    ///   sub-01_space-ACPC_tracts.trx → MNI: trxrs --transform sub-01_from-MNI..._to-ACPC_xfm.h5
+    ///   sub-01_space-ACPC_dwimap.odx → MNI: odx   --transform sub-01_from-ACPC_to-MNI..._xfm.h5
+    ///
+    /// MODES:
+    ///
+    /// • `--mode mrtrix` (default): pull SH, DPV, AND fixels via the single
+    ///   `--transform` h5. Matches `mrtransform` + `fixeltransform`
+    ///   semantics. Fixels may be duplicated or dropped at non-uniform
+    ///   warp regions (no fixel-correspondence guarantees).
+    ///
+    /// • `--mode ants`: pull SH and DPV via `--transform` (target→source);
+    ///   PUSH fixels via `--transform-inverse` (source→target). Each source
+    ///   fixel maps to exactly one target voxel, preserving cardinality.
+    ///   Use with an ANTs-style paired h5 set.
+    ///
+    /// FULL INVOCATION (warp ACPC ODX into MNI, mrtrix mode):
+    ///   odx transform sub-01_space-ACPC_dwimap.odx
+    ///   sub-01_space-MNI152NLin2009cAsym_dwimap.odx
+    ///   --transform sub-01_from-ACPC_to-MNI152NLin2009cAsym_xfm.h5
+    ///
+    /// FULL INVOCATION (ants mode with paired h5s):
+    ///   odx transform sub-01_space-ACPC_dwimap.odx
+    ///   sub-01_space-MNI152NLin2009cAsym_dwimap.odx --mode ants
+    ///   --transform         sub-01_from-ACPC_to-MNI152NLin2009cAsym_xfm.h5
+    ///   --transform-inverse sub-01_from-MNI152NLin2009cAsym_to-ACPC_xfm.h5
+    Transform(TransformArgs),
     /// Generate shell completions.
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum TransformModeArg {
+    /// Pull SH, DPV, AND fixels via a single forward h5 (chain target→source).
+    /// Matches mrtrix3 `mrtransform` + `fixeltransform` conventions: simple,
+    /// works with one transform file, fixels may be duplicated or dropped at
+    /// non-uniform warp regions (no fixel-correspondence guarantees).
+    Mrtrix,
+    /// SH and DPV pulled via `--transform`; fixels *pushed* via
+    /// `--transform-inverse` (chain source→target). Each source fixel maps to
+    /// exactly one target voxel, so cardinality is preserved. Use this when
+    /// you have an ANTs-style paired h5 (e.g. `from-ACPC_to-MNI.h5` and
+    /// `from-MNI_to-ACPC.h5`).
+    Ants,
+}
+
+#[derive(Args, Debug)]
+struct TransformArgs {
+    /// Source ODX (directory or `.odx` archive), e.g.
+    /// `sub-01_space-ACPC_dwimap.odx`.
+    input: PathBuf,
+    /// Output ODX (directory or `.odx` archive), e.g.
+    /// `sub-01_space-MNI152NLin2009cAsym_dwimap.odx`.
+    output: PathBuf,
+    /// ANTs/ITK transform: `Composite.h5` (warp + affines), Insight
+    /// Transform File V1.0 (`.txt`, affine-only), or ITK MATLAB (`.mat`,
+    /// affine-only). Same-direction file as image warping: to take ODX
+    /// from space A onto space B's grid, pass `from-A_to-B_xfm.h5`.
+    /// Used to pull SH and DPV onto the target grid in both modes; also
+    /// pulls fixels in `--mode mrtrix`.
+    #[arg(long = "transform")]
+    transform: PathBuf,
+    /// Inverse ANTs/ITK transform (the *paired* h5 in BIDS naming).
+    /// Required for `--mode ants` — pushes each source fixel to its
+    /// corresponding target voxel, preserving fixel cardinality.
+    /// Forbidden in `--mode mrtrix`. To take ODX from space A onto
+    /// space B with paired h5s, pass `from-B_to-A_xfm.h5` here while
+    /// `--transform` gets `from-A_to-B_xfm.h5`.
+    #[arg(long = "transform-inverse")]
+    transform_inverse: Option<PathBuf>,
+    /// Workflow convention. `mrtrix` (default): pull-everything via a single
+    /// forward h5, mrtrix3-compatible. `ants`: SH pulled via forward h5,
+    /// fixels pushed via `--transform-inverse`.
+    #[arg(long = "mode", value_enum, default_value = "mrtrix")]
+    mode: TransformModeArg,
+    /// Reference NIfTI in target space. Required when the forward h5 has no
+    /// displacement field (affine-only).
+    #[arg(long = "reference")]
+    reference: Option<PathBuf>,
+    /// Swap the moving/fixed direction. Only valid with affine-only chains
+    /// (warps cannot be numerically inverted in v1).
+    #[arg(long)]
+    invert: bool,
+    /// Opt in to mrtrix-style SH modulation (per-direction
+    /// `‖J·d‖/det(J)`, equivalent to `mrtransform -modulate fod`). Off by
+    /// default. Fixels are never modulated.
+    #[arg(long)]
+    modulate: bool,
+    /// Number of fibonacci-spiral reference directions for aPSF SH
+    /// reorientation. 80 covers lmax 8 reliably; 300 for lmax 12.
+    #[arg(long = "apsf-dirs", default_value_t = 80)]
+    apsf_dirs: usize,
+    #[arg(long = "odx-layout", value_enum, default_value = "directory")]
+    odx_layout: OdxLayoutArg,
+    #[arg(long)]
+    overwrite: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -127,37 +243,32 @@ struct ConvertArgs {
     quiet: bool,
     #[arg(long)]
     json: bool,
-    #[arg(long = "odx-layout", value_enum)]
-    odx_layout: Option<OdxLayoutArg>,
     #[arg(long = "quantize-dense")]
     quantize_dense: bool,
-    #[arg(long = "quantize-min-len", default_value_t = 4096)]
+    #[arg(long = "quantize-min-len", default_value_t = 4096, hide = true)]
     quantize_min_len: usize,
     #[arg(long = "out-sh")]
     out_sh: Option<PathBuf>,
-    #[arg(long = "mrtrix-fixel-container", value_enum, default_value = "nifti")]
-    mrtrix_fixel_container: MrtrixFixelContainerArg,
-    #[arg(long = "mrtrix-sh-container", value_enum, default_value = "mif")]
-    mrtrix_sh_container: MrtrixShContainerArg,
-    #[arg(long = "mrtrix-sh-gzip")]
-    mrtrix_sh_gzip: bool,
+    #[arg(long = "fixel-container", value_enum, default_value = "nifti")]
+    fixel_container: MrtrixFixelContainerArg,
+    /// Force NIfTI-2 instead of NIfTI-1 when writing MRtrix SH to a `.nii`/`.nii.gz` output.
+    #[arg(long = "nifti2")]
+    nifti2: bool,
     #[arg(long = "sh-lmax")]
     sh_lmax: Option<u32>,
-    #[arg(long = "dsi-format", value_enum)]
-    dsi_format: Option<DsistudioFormatArg>,
     #[arg(long = "dense-odf", value_enum, default_value = "from-sh")]
     dense_odf: DenseOdfModeArg,
-    #[arg(long = "peak-source", value_enum, default_value = "fixels")]
+    #[arg(long = "peak-source", value_enum, default_value = "fixels", hide = true)]
     peak_source: PeakSourceArg,
-    #[arg(long = "amplitude-key")]
+    #[arg(long = "amplitude-key", hide = true)]
     amplitude_key: Option<String>,
-    #[arg(long = "z0", value_enum, default_value = "auto")]
+    #[arg(long = "z0", value_enum, default_value = "auto", hide = true)]
     z0: Z0PolicyArg,
     /// MRtrix-NIfTI only: preserve the input NIfTI's on-disk affine and
     /// (i,j,k) ordering instead of canonicalizing to RAS+. Use when the
     /// resulting ODX must compare with one produced via nibabel-style
     /// ingestion (e.g. cs-odf coeffs.odx).
-    #[arg(long = "preserve-affine")]
+    #[arg(long = "preserve-affine", hide = true)]
     preserve_affine: bool,
 }
 
@@ -280,19 +391,6 @@ enum MrtrixFixelContainerArg {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum MrtrixShContainerArg {
-    Mif,
-    Nifti1,
-    Nifti2,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum DsistudioFormatArg {
-    Fibgz,
-    Fz,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum DenseOdfModeArg {
     Off,
     FromSh,
@@ -357,25 +455,6 @@ impl From<MrtrixFixelContainerArg> for MrtrixFixelContainer {
     }
 }
 
-impl From<MrtrixShContainerArg> for MrtrixShContainer {
-    fn from(value: MrtrixShContainerArg) -> Self {
-        match value {
-            MrtrixShContainerArg::Mif => MrtrixShContainer::Mif,
-            MrtrixShContainerArg::Nifti1 => MrtrixShContainer::Nifti1,
-            MrtrixShContainerArg::Nifti2 => MrtrixShContainer::Nifti2,
-        }
-    }
-}
-
-impl From<DsistudioFormatArg> for DsistudioFormat {
-    fn from(value: DsistudioFormatArg) -> Self {
-        match value {
-            DsistudioFormatArg::Fibgz => DsistudioFormat::FibGz,
-            DsistudioFormatArg::Fz => DsistudioFormat::Fz,
-        }
-    }
-}
-
 impl From<DenseOdfModeArg> for DenseOdfMode {
     fn from(value: DenseOdfModeArg) -> Self {
         match value {
@@ -420,6 +499,7 @@ fn run(cli: Cli) -> odx_rs::Result<()> {
         Command::Qc(args) => run_qc(args),
         Command::Compare(args) => run_compare(args),
         Command::ImportAodf(args) => run_import_aodf(args),
+        Command::Transform(args) => run_transform(args),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "odx", &mut io::stdout());
@@ -659,12 +739,7 @@ fn render_compare_report(report: &CompareReport) -> String {
 }
 
 fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
-    let output_format = resolve_output_format(
-        &args.output,
-        args.output_format,
-        args.odx_layout,
-        args.dsi_format,
-    )?;
+    let output_format = resolve_output_format(&args.output, args.output_format)?;
 
     if output_format == DetectedFormat::MrtrixShImage && args.out_sh.is_some() {
         return Err(OdxError::Argument(
@@ -727,7 +802,7 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
                 &odx,
                 &args.output,
                 &MrtrixFixelWriteOptions {
-                    container: args.mrtrix_fixel_container.into(),
+                    container: args.fixel_container.into(),
                     include_dpf: true,
                     include_dpv: false,
                 },
@@ -750,8 +825,8 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
                     out_sh,
                     &MrtrixShWriteOptions {
                         array_name: "coefficients".into(),
-                        container: args.mrtrix_sh_container.into(),
-                        gzip: args.mrtrix_sh_gzip,
+                        container: infer_sh_container(out_sh, args.nifti2),
+                        gzip: infer_sh_gzip(out_sh),
                     },
                 )?;
             }
@@ -774,8 +849,8 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
                 &args.output,
                 &MrtrixShWriteOptions {
                     array_name: "coefficients".into(),
-                    container: args.mrtrix_sh_container.into(),
-                    gzip: args.mrtrix_sh_gzip,
+                    container: infer_sh_container(&args.output, args.nifti2),
+                    gzip: infer_sh_gzip(&args.output),
                 },
             )?;
         }
@@ -859,6 +934,70 @@ fn run_import_aodf(args: ImportAodfArgs) -> odx_rs::Result<()> {
     Ok(())
 }
 
+fn run_transform(args: TransformArgs) -> odx_rs::Result<()> {
+    use odx_rs::transform::{apply_transform_h5, TransformMode, TransformOptions};
+
+    ensure_output_path(&args.output, args.overwrite)?;
+    let input = OdxDataset::load(&args.input)?;
+
+    let mode = match args.mode {
+        TransformModeArg::Mrtrix => TransformMode::Mrtrix,
+        TransformModeArg::Ants => TransformMode::Ants,
+    };
+
+    let opts = TransformOptions {
+        modulate_sh: args.modulate,
+        // Fixels are never modulated via the CLI; matches mrtrix3
+        // `fixeltransform` (no-modulation) and ANTs-mode push semantics
+        // (cardinality already preserved).
+        modulate_fixel: false,
+        apsf_dirs: args.apsf_dirs,
+        ..Default::default()
+    };
+
+    let out = apply_transform_h5(
+        &input,
+        mode,
+        &args.transform,
+        args.transform_inverse.as_deref(),
+        args.reference.as_deref(),
+        args.invert,
+        &opts,
+    )?;
+
+    let policy = OdxWritePolicy::default();
+    match args.odx_layout {
+        OdxLayoutArg::Directory => out.save_directory_with_policy(&args.output, policy)?,
+        OdxLayoutArg::Archive => out.save_archive_with_policy(&args.output, policy)?,
+    }
+
+    if args.json {
+        let summary = serde_json::json!({
+            "output": args.output.display().to_string(),
+            "mode": match args.mode {
+                TransformModeArg::Mrtrix => "mrtrix",
+                TransformModeArg::Ants => "ants",
+            },
+            "input_nb_voxels": input.header().nb_voxels,
+            "input_nb_peaks": input.header().nb_peaks,
+            "output_nb_voxels": out.header().nb_voxels,
+            "output_nb_peaks": out.header().nb_peaks,
+            "modulate_sh": opts.modulate_sh,
+            "invert": args.invert,
+            "apsf_dirs": opts.apsf_dirs,
+        });
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "wrote {} ({} voxels, {} peaks)",
+            args.output.display(),
+            out.header().nb_voxels,
+            out.header().nb_peaks,
+        );
+    }
+    Ok(())
+}
+
 fn load_from_args(
     input: &Path,
     sh: Option<&Path>,
@@ -888,25 +1027,30 @@ fn load_from_args(
 fn resolve_output_format(
     output: &Path,
     output_format: Option<OutputFormatOverride>,
-    odx_layout: Option<OdxLayoutArg>,
-    dsi_format: Option<DsistudioFormatArg>,
 ) -> odx_rs::Result<DetectedFormat> {
     if let Some(format) = output_format {
         return Ok(format.into());
     }
-    if let Some(layout) = odx_layout {
-        return Ok(match layout {
-            OdxLayoutArg::Directory => DetectedFormat::OdxDirectory,
-            OdxLayoutArg::Archive => DetectedFormat::OdxArchive,
-        });
-    }
-    if let Some(dsi) = dsi_format {
-        return Ok(match dsi {
-            DsistudioFormatArg::Fibgz => DetectedFormat::DsistudioFibGz,
-            DsistudioFormatArg::Fz => DetectedFormat::DsistudioFz,
-        });
-    }
     detect_target_format(output)
+}
+
+fn infer_sh_container(path: &Path, nifti2: bool) -> MrtrixShContainer {
+    let s = path.to_string_lossy().to_lowercase();
+    if s.ends_with(".nii") || s.ends_with(".nii.gz") {
+        if nifti2 {
+            MrtrixShContainer::Nifti2
+        } else {
+            MrtrixShContainer::Nifti1
+        }
+    } else {
+        MrtrixShContainer::Mif
+    }
+}
+
+fn infer_sh_gzip(path: &Path) -> bool {
+    path.to_string_lossy()
+        .to_lowercase()
+        .ends_with(".gz")
 }
 
 fn render_fixel_qc(report: &FixelQcReport) -> String {

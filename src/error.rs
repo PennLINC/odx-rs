@@ -5,7 +5,6 @@ pub enum OdxError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[cfg(feature = "pam5")]
     #[error("HDF5 error: {0}")]
     Hdf5(#[from] hdf5_metno::Error),
 

@@ -18,6 +18,7 @@ pub mod qc;
 pub mod reference_affine;
 pub mod sh_basis_evaluator;
 pub mod stream;
+pub mod transform;
 pub mod typed_view;
 pub mod validate;
 
@@ -49,4 +50,7 @@ pub use stream::{OdxBuilder, OdxStream};
 pub use typed_view::TypedView2D;
 pub use validate::{
     validate_dataset, validate_dataset_detailed, ValidationIssue, ValidationSeverity,
+};
+pub use transform::{
+    apply_transform, apply_transform_h5, TransformMode, TransformOptions,
 };

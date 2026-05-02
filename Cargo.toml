@@ -3,10 +3,6 @@ name = "odx-rs"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-default = ["pam5"]
-pam5 = ["dep:hdf5-metno"]
-
 [dependencies]
 memmap2 = "0.9"
 bytemuck = { version = "1", features = ["derive"] }
@@ -22,7 +18,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tempfile = "3"
-hdf5-metno = { version = "0.12.4", optional = true, default-features = false, features = ["static", "zlib"] }
+hdf5-metno = { version = "0.12.4", default-features = false, features = ["static", "zlib"] }
+itk-transforms-rs = { version = "0.1.0", git = "https://github.com/PennLINC/itk-transforms-rs" }
 statrs = "0.18"
 
 [dev-dependencies]

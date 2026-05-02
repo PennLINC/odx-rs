@@ -116,8 +116,7 @@ fn convert_help_mentions_out_sh_and_dsi_options() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--out-sh"))
-        .stdout(predicate::str::contains("--dense-odf"))
-        .stdout(predicate::str::contains("--peak-source"));
+        .stdout(predicate::str::contains("--dense-odf"));
 }
 
 #[test]
@@ -473,8 +472,8 @@ fn convert_fib_to_odx_directory() {
             "convert",
             fib.to_str().unwrap(),
             out.to_str().unwrap(),
-            "--odx-layout",
-            "directory",
+            "--output-format",
+            "odx-directory",
             "--reference-affine",
             reference.to_str().unwrap(),
         ])
@@ -530,8 +529,8 @@ fn convert_odx_directory_to_mrtrix_fixels_and_sh() {
             "convert",
             fib.to_str().unwrap(),
             odx_dir.to_str().unwrap(),
-            "--odx-layout",
-            "directory",
+            "--output-format",
+            "odx-directory",
             "--reference-affine",
             reference.to_str().unwrap(),
         ])
@@ -593,6 +592,83 @@ fn convert_refuses_existing_output_without_overwrite() {
     Command::cargo_bin("odx")
         .unwrap()
         .args(["convert", fib.to_str().unwrap(), out.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"));
+}
+
+#[test]
+fn transform_help_lists_subcommand() {
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args(["transform", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Composite.h5"))
+        .stdout(predicate::str::contains("--transform"))
+        .stdout(predicate::str::contains("--transform-inverse"))
+        .stdout(predicate::str::contains("--mode"))
+        .stdout(predicate::str::contains("mrtrix"))
+        .stdout(predicate::str::contains("ants"))
+        .stdout(predicate::str::contains("--reference"))
+        .stdout(predicate::str::contains("--modulate"))
+        .stdout(predicate::str::contains("--invert"));
+}
+
+#[test]
+fn transform_affine_only_without_reference_errors_clearly() {
+    let fixture = "../nitransforms/nitransforms/tests/data/affine-antsComposite.h5";
+    if !Path::new(fixture).exists() {
+        eprintln!("skipping: {} not present", fixture);
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let in_odx = tmp.path().join("in.odx");
+    create_qc_fixture_odx_dir(&in_odx);
+
+    let out_odx = tmp.path().join("out.odx");
+
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "transform",
+            in_odx.to_str().unwrap(),
+            out_odx.to_str().unwrap(),
+            "--transform",
+            fixture,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("affine-only"))
+        .stderr(predicate::str::contains("--reference"));
+}
+
+#[test]
+fn transform_refuses_existing_output_without_overwrite() {
+    let fixture = "../nitransforms/nitransforms/tests/data/affine-antsComposite.h5";
+    if !Path::new(fixture).exists() {
+        eprintln!("skipping: {} not present", fixture);
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let in_odx = tmp.path().join("in.odx");
+    create_qc_fixture_odx_dir(&in_odx);
+
+    // Pre-create the output directory.
+    let out_odx = tmp.path().join("existing.odx");
+    fs::create_dir_all(&out_odx).unwrap();
+
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "transform",
+            in_odx.to_str().unwrap(),
+            out_odx.to_str().unwrap(),
+            "--transform",
+            fixture,
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("already exists"));
