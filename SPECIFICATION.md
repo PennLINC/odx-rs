@@ -231,6 +231,27 @@ present, they should be consistent. `sh/` is the preferred compact dense
 representation; `odf/` remains optional for sampled-ODF workflows and
 dsistudio-style interchange.
 
+### Additional `sh/` arrays (multi-tissue / companion fields)
+
+A file MAY contain additional named SH arrays beside `sh/coefficients`
+(e.g. `sh/gm.1.float32`, `sh/csf.1.float32` for the isotropic GM/CSF
+compartments emitted by SS3T). These follow the same on-disk encoding —
+`sh/<name>.{ncoeffs}.{dtype}` — and share the file's `SH_BASIS`,
+`SH_FULL_BASIS`, and `SH_LEGACY` settings.
+
+Constraints on companion SH arrays:
+
+- The canonical `sh/coefficients` array (when present) must have exactly
+  `ncoeffs` for the file's `SH_ORDER`.
+- Each companion array's `ncoeffs` must be a valid SH cardinality under the
+  current `SH_FULL_BASIS`, and must imply an `lmax ≤ SH_ORDER`. (`lmax = 0`
+  → 1 coefficient is always valid.)
+
+Readers that only know about `sh/coefficients` should ignore companion
+arrays. Readers that handle multi-tissue data should infer each companion
+array's order from its filename `ncoeffs` and the file's `SH_BASIS` /
+`SH_FULL_BASIS`.
+
 ## Per-Voxel Data (`dpv/`)
 
 One row per masked voxel (`NB_VOXELS` rows). Exactly analogous to TRX's

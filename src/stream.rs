@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::data_array::DataArray;
+use crate::descoteaux_sh;
 use crate::dtype::DType;
 use crate::error::{OdxError, Result};
 use crate::header::{CanonicalDenseRepresentation, Header};
@@ -159,15 +160,32 @@ impl OdxBuilder {
         }
         if let Some(order) = self.sh_order {
             let full = self.sh_full_basis.unwrap_or(false);
-            let expected = if full {
+            let canonical_ncoeffs = if full {
                 ((order + 1) * (order + 1)) as usize
             } else {
                 ((order + 1) * (order + 2) / 2) as usize
             };
             for (name, (_, ncols, _)) in &self.sh {
-                if *ncols != expected {
+                // The canonical `sh/coefficients` array must hit SH_ORDER
+                // exactly — readers that only know about it (and ignore
+                // additional named arrays) rely on this.
+                if name == "coefficients" && *ncols != canonical_ncoeffs {
                     return Err(OdxError::Format(format!(
-                        "SH array '{name}' has {ncols} columns, expected {expected} for order {order} (full_basis={full})"
+                        "SH array 'coefficients' has {ncols} columns, expected {canonical_ncoeffs} for order {order} (full_basis={full})"
+                    )));
+                }
+                // Other SH arrays (e.g. multi-tissue GM/CSF compartments
+                // stored at lmax=0) may have lower order. Each one's ncoeffs
+                // must still correspond to *some* valid lmax ≤ SH_ORDER under
+                // the current basis, so the file is self-consistent and
+                // round-trippable.
+                let array_lmax = descoteaux_sh::lmax_for_ncoeffs(*ncols, full)
+                    .map_err(|_| OdxError::Format(format!(
+                        "SH array '{name}' has {ncols} columns, which is not a valid SH cardinality (full_basis={full})"
+                    )))?;
+                if (array_lmax as u64) > order {
+                    return Err(OdxError::Format(format!(
+                        "SH array '{name}' has {ncols} columns implying lmax={array_lmax}, which exceeds SH_ORDER={order}"
                     )));
                 }
             }
@@ -259,3 +277,112 @@ fn validate_rows(
 }
 
 pub type OdxStream = OdxBuilder;
+
+#[cfg(test)]
+mod sh_validation_tests {
+    use super::*;
+
+    fn empty_builder(nb_voxels: usize) -> OdxBuilder {
+        let affine = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let dims = [nb_voxels as u64, 1, 1];
+        let mask = vec![1u8; nb_voxels];
+        let mut b = OdxBuilder::new(affine, dims, mask);
+        for _ in 0..nb_voxels {
+            b.push_voxel_peaks(&[]);
+        }
+        b
+    }
+
+    fn float_bytes(values: Vec<f32>) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() * 4);
+        for v in values {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn lower_order_companion_sh_arrays_validate() {
+        // Canonical WM SH at lmax=8 (45 coeffs) plus GM/CSF at lmax=0
+        // (1 coeff each) — multi-tissue layout that the relaxed validator
+        // must accept.
+        let n = 2;
+        let mut b = empty_builder(n);
+        b.set_sh_info(8, "tournier07".into());
+        b.set_sh_data(
+            "coefficients",
+            float_bytes(vec![0.0; n * 45]),
+            45,
+            DType::Float32,
+        );
+        b.set_sh_data("gm", float_bytes(vec![0.0; n]), 1, DType::Float32);
+        b.set_sh_data("csf", float_bytes(vec![0.0; n]), 1, DType::Float32);
+        b.finalize().expect("multi-tissue sh/ should validate");
+    }
+
+    #[test]
+    fn canonical_coefficients_must_match_sh_order() {
+        // The canonical name is still pinned to SH_ORDER; sneaking a smaller
+        // ncoeffs in under that name should still fail.
+        let n = 1;
+        let mut b = empty_builder(n);
+        b.set_sh_info(8, "tournier07".into());
+        b.set_sh_data(
+            "coefficients",
+            float_bytes(vec![0.0; n]),
+            1,
+            DType::Float32,
+        );
+        let err = b.finalize().unwrap_err();
+        assert!(format!("{err}").contains("'coefficients'"));
+    }
+
+    #[test]
+    fn companion_sh_array_above_sh_order_rejected() {
+        // A companion array implying lmax > SH_ORDER is rejected.
+        let n = 1;
+        let mut b = empty_builder(n);
+        b.set_sh_info(2, "tournier07".into()); // SH_ORDER=2 → 6 coeffs
+        b.set_sh_data(
+            "coefficients",
+            float_bytes(vec![0.0; n * 6]),
+            6,
+            DType::Float32,
+        );
+        b.set_sh_data(
+            "extra",
+            float_bytes(vec![0.0; n * 15]), // lmax=4 → 15
+            15,
+            DType::Float32,
+        );
+        let err = b.finalize().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("'extra'") && msg.contains("exceeds SH_ORDER"));
+    }
+
+    #[test]
+    fn companion_sh_array_with_invalid_ncoeffs_rejected() {
+        let n = 1;
+        let mut b = empty_builder(n);
+        b.set_sh_info(8, "tournier07".into());
+        b.set_sh_data(
+            "coefficients",
+            float_bytes(vec![0.0; n * 45]),
+            45,
+            DType::Float32,
+        );
+        b.set_sh_data(
+            "weird",
+            float_bytes(vec![0.0; n * 7]),
+            7, // not a valid even-only SH cardinality
+            DType::Float32,
+        );
+        let err = b.finalize().unwrap_err();
+        assert!(format!("{err}").contains("not a valid SH cardinality"));
+    }
+}

@@ -245,6 +245,40 @@ impl OdxDataset {
             .map(|(name, arr)| (name.as_str(), arr.info()))
     }
 
+    /// Attach (or replace) a per-fixel data array on this dataset.
+    ///
+    /// `data` is a row-major byte buffer with `nb_peaks() * ncols * dtype.size_of()` bytes.
+    /// The array is stored as owned bytes; subsequent `save*` calls will serialize it
+    /// alongside the existing DPF arrays.
+    pub fn insert_dpf(
+        &mut self,
+        name: &str,
+        data: Vec<u8>,
+        ncols: usize,
+        dtype: DType,
+    ) -> Result<()> {
+        let row_bytes = ncols.saturating_mul(dtype.size_of());
+        let expected = self.nb_peaks().saturating_mul(row_bytes);
+        if data.len() != expected {
+            return Err(OdxError::Argument(format!(
+                "DPF '{name}': expected {expected} bytes ({} peaks × {ncols} cols × {} B/{}), got {}",
+                self.nb_peaks(),
+                dtype.size_of(),
+                dtype,
+                data.len(),
+            )));
+        }
+        let arr = DataArray::owned_bytes(data, ncols, dtype);
+        self.dpf.insert(name.to_string(), arr);
+        Ok(())
+    }
+
+    /// Convenience wrapper around [`Self::insert_dpf`] for a single-column scalar
+    /// `uint8` array — handy for selection/mask outputs visualised in trxviz.
+    pub fn insert_dpf_u8(&mut self, name: &str, data: Vec<u8>) -> Result<()> {
+        self.insert_dpf(name, data, 1, DType::UInt8)
+    }
+
     pub(crate) fn odf_arrays(&self) -> &HashMap<String, DataArray> {
         &self.odf
     }
