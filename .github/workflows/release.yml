@@ -87,7 +87,14 @@ jobs:
           # abi3-py39 wheels work for all CPython >= 3.9.
           args: --release --out dist
           working-directory: python
-          manylinux: ${{ matrix.libc == 'manylinux' && 'auto' || 'musllinux_1_2' }}
+          # `2_28` (AlmaLinux 9 / glibc 2.28) instead of the older `auto`
+          # (= `2014` = manylinux_2_17, CentOS 7 / glibc 2.17). The 2014
+          # cross image ships Python 3.6, which maturin rejects (needs
+          # >=3.7) and which is below our abi3-py39 baseline. 2_28 has
+          # Python 3.9+ baked in. The compat trade-off is glibc 2.28+
+          # required at install time — i.e. RHEL/AlmaLinux 8+, Debian 10+,
+          # Ubuntu 18.10+ (essentially anything from the last ~6 years).
+          manylinux: ${{ matrix.libc == 'manylinux' && '2_28' || 'musllinux_1_2' }}
           before-script-linux: |
             # hdf5-metno-src builds HDF5 from source via cmake; it requires
             # CMake >= 3.26. Both manylinux_2_17 (AlmaLinux yum cmake 3.20)
@@ -147,6 +154,16 @@ jobs:
             fi
             echo "Using PIP_CMD='$PIP_CMD' (PYBIN='${PYBIN:-system}')"
 
+            # If we found a /opt/python/cp* Python, make sure it shadows
+            # any older system python3 on PATH. maturin invokes `python3`
+            # from PATH after this script runs, and we've seen older
+            # cross-compile images leave a too-old `/usr/bin/python3` in
+            # place (e.g., 3.6 on the legacy manylinux2014 cross image).
+            if [ -n "$PYBIN" ]; then
+              ln -sf "$PYBIN/python" /usr/local/bin/python3
+              ln -sf "$PYBIN/python" /usr/local/bin/python
+            fi
+
             # Install cmake>=3.26 from PyPI. `--break-system-packages` is
             # for PEP 668-marked Pythons (some distros); harmless on others.
             $PIP_CMD install --no-cache-dir --upgrade --break-system-packages "cmake>=3.26" 2>/dev/null \
@@ -199,20 +216,18 @@ jobs:
   # ─── macOS wheels (x86_64 + Apple Silicon) ─────────────────────────────────
   #
   # Runner mapping:
-  #   - aarch64  → macos-14    (Apple Silicon, free, ample capacity)
-  #   - x86_64   → macos-13-large (Intel, paid 6-core, much better queue
-  #                                priority than the free macos-13).
+  #   - aarch64  → macos-14         (Apple Silicon, free)
+  #   - x86_64   → macos-15-intel   (Intel x86_64 on macOS 15; GitHub's
+  #                                   recommended migration path for x86_64
+  #                                   builds, supported until August 2027).
   #
-  # macos-13 is the newest Intel macOS image GitHub offers (Apple stopped
-  # making Intel Macs), and the free macos-13 runner pool is usually
-  # under-provisioned. macos-13-large costs billing minutes but reliably
-  # picks up jobs in seconds rather than tens of minutes. If you'd rather
-  # not consume the budget, the cleanest alternative is to drop the
-  # x86_64 wheel altogether — the sdist + arm64 wheel cover ~all current
-  # macOS Python users.
+  # The older `macos-13` runner pool is queue-pressured; `macos-15-intel`
+  # is the current Intel target with much better availability. There's no
+  # `macos-15-intel-large` etc. — Intel hardware is being retired, so
+  # macos-15-intel is the long tail.
   macos:
     name: macOS ${{ matrix.target }}
-    runs-on: ${{ matrix.target == 'aarch64' && 'macos-14' || 'macos-13-large' }}
+    runs-on: ${{ matrix.target == 'aarch64' && 'macos-14' || 'macos-15-intel' }}
     needs: [verify-version]
     strategy:
       fail-fast: false
