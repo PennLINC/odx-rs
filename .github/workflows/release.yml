@@ -76,6 +76,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1
+        # Set the CMAKE env var so the cmake-rs crate (used by
+        # hdf5-metno-src's build script) uses our pip-installed cmake
+        # directly, sidestepping any PATH-resolution surprises.
+        # before-script-linux populates /opt/_pipcmake/bin/cmake.
+        env:
+          CMAKE: /opt/_pipcmake/bin/cmake
         with:
           target: ${{ matrix.target }}
           # abi3-py39 wheels work for all CPython >= 3.9.
@@ -83,15 +89,41 @@ jobs:
           working-directory: python
           manylinux: ${{ matrix.libc == 'manylinux' && 'auto' || 'musllinux_1_2' }}
           before-script-linux: |
-            # The hdf5-metno static feature builds HDF5 from source; needs a C
-            # compiler + cmake. manylinux/musllinux images already include these,
-            # but make sure cmake is recent enough.
-            if command -v apt-get >/dev/null 2>&1; then
-              apt-get update && apt-get install -y cmake
-            fi
+            # hdf5-metno-src builds HDF5 from source via cmake; it requires
+            # CMake >= 3.26. Both manylinux_2_17 (AlmaLinux yum cmake = 3.20)
+            # and musllinux_1_2 (Alpine apk cmake = 3.22) ship versions that
+            # are too old. Install a recent cmake from PyPI and shadow the
+            # system one in every standard location, plus expose it via
+            # CMAKE=... (above) so cmake-rs uses it deterministically.
+            set -e
             if command -v apk >/dev/null 2>&1; then
-              apk add --no-cache cmake make gcc g++ musl-dev
+              # musllinux: install build essentials hdf5's CMake build needs.
+              apk add --no-cache make gcc g++ musl-dev linux-headers perl
             fi
+            PYBIN=$(ls -d /opt/python/cp3*/bin 2>/dev/null | head -1)
+            if [ -z "$PYBIN" ]; then
+              echo "::error::no /opt/python/cp3*/bin found in build container"
+              exit 1
+            fi
+            echo "Installing cmake>=3.26 via pip from $PYBIN ..."
+            "$PYBIN/pip" install --quiet --upgrade "cmake>=3.26"
+            # Pin the new cmake under a stable path that the env: CMAKE setting
+            # above can target, plus shadow the system locations so any tool
+            # that does plain `cmake` resolution still picks the new one.
+            mkdir -p /opt/_pipcmake/bin
+            ln -sf "$PYBIN/cmake" /opt/_pipcmake/bin/cmake
+            for target in /usr/local/bin/cmake /usr/bin/cmake /usr/sbin/cmake; do
+              if [ -d "$(dirname "$target")" ]; then
+                ln -sf "$PYBIN/cmake" "$target"
+              fi
+            done
+            echo "cmake locations:"
+            command -v cmake || true
+            ls -la /opt/_pipcmake/bin/cmake /usr/local/bin/cmake /usr/bin/cmake 2>/dev/null || true
+            echo "cmake version (pip):"
+            "$PYBIN/cmake" --version
+            echo "cmake version (PATH):"
+            cmake --version
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}-${{ matrix.libc }}
