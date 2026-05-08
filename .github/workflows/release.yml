@@ -128,14 +128,18 @@ jobs:
             fi
 
             # Resolve a pip we can use. Prefer the PyPA-style /opt/python
-            # bundled CPython (manylinux_2_17 / musllinux_1_2 native images);
-            # fall back to system python3 (typical of cross-compile images).
+            # bundled CPython on native images; on *cross-compile* images
+            # (messense/*-cross), /opt/python contains TARGET-arch binaries
+            # that can't execute on the build host (kernel returns ENOEXEC,
+            # bash falls back to interpreting the pip script and chokes on
+            # Python syntax). Probe each candidate by running --version
+            # before committing to it.
             PIP_CMD=""
             PYBIN=""
             for cand in /opt/python/cp310-cp310/bin /opt/python/cp311-cp311/bin \
                         /opt/python/cp312-cp312/bin /opt/python/cp39-cp39/bin \
                         /opt/python/cp313-cp313/bin; do
-              if [ -d "$cand" ]; then
+              if [ -d "$cand" ] && "$cand/python" --version >/dev/null 2>&1; then
                 PYBIN="$cand"
                 PIP_CMD="$cand/pip"
                 break
