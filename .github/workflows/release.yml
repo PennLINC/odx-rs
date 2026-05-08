@@ -92,37 +92,66 @@ jobs:
             # hdf5-metno-src builds HDF5 from source via cmake; it requires
             # CMake >= 3.26. Both manylinux_2_17 (AlmaLinux yum cmake = 3.20)
             # and musllinux_1_2 (Alpine apk cmake = 3.22) ship versions that
-            # are too old. Install a recent cmake from PyPI and shadow the
-            # system one in every standard location, plus expose it via
-            # CMAKE=... (above) so cmake-rs uses it deterministically.
-            set -e
+            # are too old. Install a recent cmake from PyPI and pin its
+            # path via CMAKE=... (set on the step's env above) so the
+            # cmake-rs crate uses it deterministically.
+            #
+            # `set -ex` prints every command so failures are diagnosable
+            # from the workflow log without re-running.
+            set -ex
+
+            uname -a
+            cat /etc/os-release || true
+
+            # Detect package manager and install minimal build tools for
+            # the HDF5 source compile.
             if command -v apk >/dev/null 2>&1; then
-              # musllinux: install build essentials hdf5's CMake build needs.
-              apk add --no-cache make gcc g++ musl-dev linux-headers perl
+              # Alpine / musllinux. apk update so package metadata is fresh.
+              apk update
+              apk add --no-cache make gcc g++ musl-dev linux-headers perl bash
+            elif command -v dnf >/dev/null 2>&1; then
+              # AlmaLinux 9 / manylinux_2_28
+              dnf install -y make gcc gcc-c++ perl
+            elif command -v yum >/dev/null 2>&1; then
+              # AlmaLinux 8 / manylinux_2_17
+              yum install -y make gcc gcc-c++ perl
             fi
-            PYBIN=$(ls -d /opt/python/cp3*/bin 2>/dev/null | head -1)
+
+            # Find a CPython 3.x in the standard PyPA layout. Prefer 3.10
+            # since that's the abi3 minimum we promise; any cp3* works.
+            PYBIN=""
+            for d in /opt/python/cp310-cp310/bin /opt/python/cp311-cp311/bin \
+                     /opt/python/cp312-cp312/bin /opt/python/cp39-cp39/bin \
+                     /opt/python/cp313-cp313/bin; do
+              if [ -d "$d" ]; then PYBIN="$d"; break; fi
+            done
             if [ -z "$PYBIN" ]; then
-              echo "::error::no /opt/python/cp3*/bin found in build container"
+              echo "::error::No /opt/python/cp3*/bin found"
+              ls -la /opt/python/ 2>&1 || true
               exit 1
             fi
-            echo "Installing cmake>=3.26 via pip from $PYBIN ..."
-            "$PYBIN/pip" install --quiet --upgrade "cmake>=3.26"
-            # Pin the new cmake under a stable path that the env: CMAKE setting
-            # above can target, plus shadow the system locations so any tool
-            # that does plain `cmake` resolution still picks the new one.
+            echo "Selected PYBIN=$PYBIN"
+            "$PYBIN/python" --version
+
+            # Install a recent cmake from PyPI. Use --no-cache-dir so we
+            # don't blow up the build cache.
+            "$PYBIN/pip" install --no-cache-dir --upgrade "cmake>=3.26"
+
+            # Pin the cmake path to match the CMAKE env var set above.
             mkdir -p /opt/_pipcmake/bin
             ln -sf "$PYBIN/cmake" /opt/_pipcmake/bin/cmake
-            for target in /usr/local/bin/cmake /usr/bin/cmake /usr/sbin/cmake; do
-              if [ -d "$(dirname "$target")" ]; then
-                ln -sf "$PYBIN/cmake" "$target"
-              fi
+
+            # Shadow common system locations as a fallback for any tool
+            # that ignores CMAKE and just resolves `cmake` via PATH.
+            for target in /usr/local/bin/cmake /usr/bin/cmake; do
+              parent=$(dirname "$target")
+              [ -d "$parent" ] && ln -sf "$PYBIN/cmake" "$target" || true
             done
-            echo "cmake locations:"
+
+            # Diagnostic: show what's where so future failures are obvious.
             command -v cmake || true
-            ls -la /opt/_pipcmake/bin/cmake /usr/local/bin/cmake /usr/bin/cmake 2>/dev/null || true
-            echo "cmake version (pip):"
             "$PYBIN/cmake" --version
-            echo "cmake version (PATH):"
+            /opt/_pipcmake/bin/cmake --version
             cmake --version
       - uses: actions/upload-artifact@v4
         with:
