@@ -552,6 +552,23 @@ fn robust_positive_percentile(values: &[f32], percentile: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// Returns the three Tortoise fixture paths if all three exist on disk,
+    /// else `None`. The fixtures live outside the repo (in a sibling
+    /// `test_data/` directory) and aren't checked in, so CI runners and
+    /// fresh clones won't have them — those test runs skip cleanly via the
+    /// `else { return; }` pattern in each test below.
+    fn tortoise_fixtures() -> Option<(PathBuf, PathBuf, PathBuf)> {
+        let coeff = PathBuf::from("../test_data/xx_mapmri.nii");
+        let tensor = PathBuf::from("../test_data/xx_L1_DT.nii");
+        let uvec = PathBuf::from("../test_data/xx_uvec.nii");
+        if coeff.exists() && tensor.exists() && uvec.exists() {
+            Some((coeff, tensor, uvec))
+        } else {
+            None
+        }
+    }
 
     #[test]
     fn infers_tortoise_radial_order_four_from_fixture_coeff_count() {
@@ -560,12 +577,16 @@ mod tests {
 
     #[test]
     fn real_fixture_selected_voxel_projects_to_finite_sh() {
+        let Some((coeff_path, tensor_path, uvec_path)) = tortoise_fixtures() else {
+            eprintln!("Tortoise fixtures not found at ../test_data/; skipping.");
+            return;
+        };
         let (coeff_dims, _, coeff_data) =
-            mrtrix::load_nifti_f32_volume(Path::new("../test_data/xx_mapmri.nii")).unwrap();
+            mrtrix::load_nifti_f32_volume(&coeff_path).unwrap();
         let (tensor_dims, _, tensor_data) =
-            mrtrix::load_nifti_f32_volume(Path::new("../test_data/xx_L1_DT.nii")).unwrap();
+            mrtrix::load_nifti_f32_volume(&tensor_path).unwrap();
         let (uvec_dims, _, uvec_data) =
-            mrtrix::load_nifti_f32_volume(Path::new("../test_data/xx_uvec.nii")).unwrap();
+            mrtrix::load_nifti_f32_volume(&uvec_path).unwrap();
         let (dims3, ncoeffs) = normalize_trailing_channels(
             &coeff_dims,
             Path::new("xx_mapmri.nii"),
@@ -607,10 +628,12 @@ mod tests {
 
     #[test]
     fn real_fixture_has_two_coeff_supported_zero_uvec_voxels() {
-        let (coeff_dims, _, coeff_data) =
-            mrtrix::load_nifti_f32_volume(Path::new("../test_data/xx_mapmri.nii")).unwrap();
-        let (uvec_dims, _, uvec_data) =
-            mrtrix::load_nifti_f32_volume(Path::new("../test_data/xx_uvec.nii")).unwrap();
+        let Some((coeff_path, _, uvec_path)) = tortoise_fixtures() else {
+            eprintln!("Tortoise fixtures not found at ../test_data/; skipping.");
+            return;
+        };
+        let (coeff_dims, _, coeff_data) = mrtrix::load_nifti_f32_volume(&coeff_path).unwrap();
+        let (uvec_dims, _, uvec_data) = mrtrix::load_nifti_f32_volume(&uvec_path).unwrap();
         let (dims3, ncoeffs) = normalize_trailing_channels(
             &coeff_dims,
             Path::new("xx_mapmri.nii"),
@@ -641,12 +664,16 @@ mod tests {
 
     #[test]
     fn fixture_tensor_export_order_produces_positive_eigenvalues() {
+        let Some((coeff_path, tensor_path, uvec_path)) = tortoise_fixtures() else {
+            eprintln!("Tortoise fixtures not found at ../test_data/; skipping.");
+            return;
+        };
         let (coeff_dims, _, coeff_data) =
-            mrtrix::load_nifti_f32_volume(Path::new("../test_data/xx_mapmri.nii")).unwrap();
+            mrtrix::load_nifti_f32_volume(&coeff_path).unwrap();
         let (tensor_dims, _, tensor_data) =
-            mrtrix::load_nifti_f32_volume(Path::new("../test_data/xx_L1_DT.nii")).unwrap();
+            mrtrix::load_nifti_f32_volume(&tensor_path).unwrap();
         let (uvec_dims, _, uvec_data) =
-            mrtrix::load_nifti_f32_volume(Path::new("../test_data/xx_uvec.nii")).unwrap();
+            mrtrix::load_nifti_f32_volume(&uvec_path).unwrap();
         let (dims3, ncoeffs) = normalize_trailing_channels(
             &coeff_dims,
             Path::new("xx_mapmri.nii"),

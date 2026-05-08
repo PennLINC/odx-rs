@@ -818,7 +818,7 @@ mod tests {
         // produced silently-wrong peak amplitudes during pyAFQ aodf
         // import.
         let sh: Vec<f32> = (0..ncoeffs_for(4, true))
-            .map(|i| ((i as f32 * 0.137).sin() * 0.3 + (i as f32 * 0.21).cos() * 0.1))
+            .map(|i| (i as f32 * 0.137).sin() * 0.3 + (i as f32 * 0.21).cos() * 0.1)
             .collect();
 
         let test_dirs = [

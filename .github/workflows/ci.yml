@@ -27,10 +27,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo build (workspace)
-        run: cargo build --workspace --all-targets
+
+      # Build only the odx-rs core here. odx-py is a Python cdylib whose
+      # link step needs `-undefined dynamic_lookup` on macOS (configured in
+      # python/.cargo/config.toml, only visible when cargo runs from
+      # python/). The actual cdylib build happens in the python-tests job
+      # via maturin, which sets the right flags. We `cargo check` it here
+      # so Rust-level errors are still caught — `check` skips codegen and
+      # linking entirely.
+      - name: cargo build (odx-rs)
+        run: cargo build -p odx-rs --all-targets
+
+      - name: cargo check (odx-py)
+        run: cargo check -p odx-py
+
       - name: cargo test (odx-rs)
         run: cargo test -p odx-rs --lib
+
       - name: cargo test (integration)
         run: cargo test -p odx-rs --tests
 
