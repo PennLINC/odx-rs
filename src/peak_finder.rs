@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+//
 // Portions of this file (notably `refine_with_sh`, the Gauss-Newton constants
 // `MAX_DIR_CHANGE` / `ANGLE_TOLERANCE`, and the inner-loop arithmetic that
 // drives the Newton step) are derivative works ported from MRtrix3

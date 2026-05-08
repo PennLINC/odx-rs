@@ -18,6 +18,29 @@ pub struct QuantizationSpec {
     pub stored_dtype: String,
 }
 
+/// PAM5-derived metadata that doesn't have a natural home in the ODX core
+/// schema but must round-trip through `from_peaks_and_metrics` →
+/// `to_peaks_and_metrics`. These are dipy-specific semantics:
+///
+/// - `total_weight` / `ang_thr` come from `EuDXDirectionGetter` thresholds.
+/// - `basis_assumed` records the dipy basis name as understood at PAM5
+///   write time (used when reloading the file under a different default).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PamMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_weight: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ang_thr: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basis_assumed: Option<String>,
+}
+
+impl PamMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.total_weight.is_none() && self.ang_thr.is_none() && self.basis_assumed.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Header {
     #[serde(rename = "VOXEL_TO_RASMM")]
@@ -69,6 +92,11 @@ pub struct Header {
     )]
     pub array_quantization: HashMap<String, QuantizationSpec>,
 
+    /// PAM5-derived metadata that needs to ride along through
+    /// PAM ↔ ODX round-trips. See [`PamMetadata`].
+    #[serde(rename = "PAM_METADATA", skip_serializing_if = "Option::is_none", default)]
+    pub pam_metadata: Option<PamMetadata>,
+
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -102,6 +130,38 @@ impl Header {
     pub fn mask_volume_size(&self) -> usize {
         self.dimensions[0] as usize * self.dimensions[1] as usize * self.dimensions[2] as usize
     }
+
+    /// Single source of truth mapping `(sh_basis, sh_legacy)` → a canonical
+    /// dipy-style basis name. Returns `None` if the SH basis isn't set.
+    ///
+    /// - `tournier07` → `"tournier07"` (legacy ignored — tournier has no
+    ///   legacy variant in dipy).
+    /// - `descoteaux07`, legacy=false → `"descoteaux07"`.
+    /// - `descoteaux07`, legacy=true → `"descoteaux07_legacy"`.
+    pub fn dipy_basis_name(&self) -> Option<&'static str> {
+        let basis = self.sh_basis.as_deref()?.to_ascii_lowercase();
+        let legacy = self.sh_legacy.unwrap_or(false);
+        match basis.as_str() {
+            "tournier07" | "mrtrix" | "mrtrix3" => Some("tournier07"),
+            "descoteaux07" | "dipy" => {
+                if legacy {
+                    Some("descoteaux07_legacy")
+                } else {
+                    Some("descoteaux07")
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Set `sh_basis` and `sh_legacy` from a canonical dipy-style basis name.
+    /// Mirrors [`Self::dipy_basis_name`].
+    pub fn set_dipy_basis(&mut self, name: &str) -> Result<()> {
+        let (canonical, legacy) = crate::sh_basis_evaluator::parse_dipy_basis(name)?;
+        self.sh_basis = Some(canonical.to_string());
+        self.sh_legacy = Some(legacy);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +185,7 @@ mod tests {
             sphere_id: Some("odf8".into()),
             odf_sample_domain: Some("hemisphere".into()),
             array_quantization: HashMap::new(),
+            pam_metadata: None,
             extra: HashMap::new(),
         };
 

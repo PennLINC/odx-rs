@@ -242,6 +242,7 @@ pub fn load_tortoise_mapmri(
             sphere_id: None,
             odf_sample_domain: None,
             array_quantization: HashMap::new(),
+            pam_metadata: None,
             extra,
         },
         mask_backing: MmapBacking::Owned(mask),

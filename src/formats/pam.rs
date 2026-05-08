@@ -376,6 +376,7 @@ pub fn load_pam5(path: &Path) -> Result<OdxDataset> {
         sphere_id: None,
         odf_sample_domain,
         array_quantization: HashMap::new(),
+        pam_metadata: None,
         extra,
     };
 
@@ -749,27 +750,7 @@ fn should_export_sh(odx: &OdxDataset) -> bool {
 }
 
 fn quantize_to_sphere(dir: [f32; 3], sphere: &[[f32; 3]]) -> (usize, [f32; 3]) {
-    let mut best_idx = 0usize;
-    let mut best_abs_dot = f32::NEG_INFINITY;
-    let mut best_sign = 1.0f32;
-    for (idx, &candidate) in sphere.iter().enumerate() {
-        let dot = dir[0] * candidate[0] + dir[1] * candidate[1] + dir[2] * candidate[2];
-        let abs_dot = dot.abs();
-        if abs_dot > best_abs_dot {
-            best_idx = idx;
-            best_abs_dot = abs_dot;
-            best_sign = if dot < 0.0 { -1.0 } else { 1.0 };
-        }
-    }
-    let base = sphere[best_idx];
-    (
-        best_idx,
-        [
-            base[0] * best_sign,
-            base[1] * best_sign,
-            base[2] * best_sign,
-        ],
-    )
+    crate::sphere_lookup::nearest_vertex(dir, sphere, true)
 }
 
 fn export_sphere_vertices<'a>(odx: &'a OdxDataset) -> Result<SphereRows<'a>> {

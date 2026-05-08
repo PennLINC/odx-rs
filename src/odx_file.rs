@@ -303,6 +303,56 @@ impl OdxDataset {
         &self.dpg
     }
 
+    /// Public access to the SH data array store, used by external crates
+    /// (notably the Python wrapper) that need raw `DataArray` refs to
+    /// inspect or convert dtype.
+    pub fn get_sh(&self, name: &str) -> Option<&DataArray> {
+        self.sh.get(name)
+    }
+
+    pub fn get_odf(&self, name: &str) -> Option<&DataArray> {
+        self.odf.get(name)
+    }
+
+    pub fn get_dpv(&self, name: &str) -> Option<&DataArray> {
+        self.dpv.get(name)
+    }
+
+    pub fn get_dpf(&self, name: &str) -> Option<&DataArray> {
+        self.dpf.get(name)
+    }
+
+    /// Build a new dataset reusing this dataset's SH/ODF/DPV/sphere/mask
+    /// content but with peaks (offsets, directions) replaced and
+    /// `dpf/amplitude` set from the supplied amplitudes. Other DPF entries
+    /// are dropped (they're per-fixel and stale). Used by Python's
+    /// `with_peaks_from_sh`.
+    pub fn with_replaced_peaks(
+        &self,
+        offsets: Vec<u32>,
+        directions: Vec<[f32; 3]>,
+        amplitudes: Vec<f32>,
+    ) -> Self {
+        let mut parts = self.clone_owned_parts();
+        parts.header.nb_voxels = (offsets.len().saturating_sub(1)) as u64;
+        parts.header.nb_peaks = directions.len() as u64;
+        parts.offsets_backing =
+            crate::mmap_backing::MmapBacking::Owned(crate::mmap_backing::vec_into_bytes(offsets));
+        parts.directions_backing = crate::mmap_backing::MmapBacking::Owned(
+            crate::mmap_backing::vec_into_bytes(directions),
+        );
+        parts.dpf.clear();
+        parts.dpf.insert(
+            "amplitude".into(),
+            DataArray::owned_bytes(
+                crate::mmap_backing::vec_into_bytes(amplitudes),
+                1,
+                DType::Float32,
+            ),
+        );
+        Self::from_parts(parts)
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         crate::io::load(path)
     }

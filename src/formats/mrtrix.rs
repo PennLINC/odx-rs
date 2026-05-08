@@ -433,6 +433,7 @@ fn build_sh_only_dataset(sh: LoadedF32Image) -> Result<OdxDataset> {
             sphere_id: None,
             odf_sample_domain: None,
             array_quantization: HashMap::new(),
+            pam_metadata: None,
             extra: HashMap::new(),
         },
         mask_backing: MmapBacking::Owned(mask),

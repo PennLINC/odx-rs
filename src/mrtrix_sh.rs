@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+//
 // Portions of this file (notably `sh_derivatives` and its helpers `index_mpos`,
 // `nfor_l_mpos`, and `pack_al`) are derivative works ported from MRtrix3
 // (https://www.mrtrix.org/), specifically `Math::SH::derivatives` in
@@ -293,7 +295,7 @@ fn array2_from_row_major(rows: usize, cols: usize, data: Vec<f32>) -> Array2<f32
     Array2::from_shape_vec((rows, cols), data).expect("shape mismatch while building Array2")
 }
 
-fn to_dmatrix(a: &Array2<f32>) -> DMatrix<f64> {
+pub(crate) fn to_dmatrix(a: &Array2<f32>) -> DMatrix<f64> {
     let (rows, cols) = a.dim();
     let mut data = Vec::with_capacity(rows * cols);
     for r in 0..rows {
@@ -304,7 +306,7 @@ fn to_dmatrix(a: &Array2<f32>) -> DMatrix<f64> {
     DMatrix::from_row_slice(rows, cols, &data)
 }
 
-fn from_dmatrix(m: &DMatrix<f64>) -> Array2<f32> {
+pub(crate) fn from_dmatrix(m: &DMatrix<f64>) -> Array2<f32> {
     let mut data = Vec::with_capacity(m.nrows() * m.ncols());
     for r in 0..m.nrows() {
         for c in 0..m.ncols() {
@@ -314,7 +316,7 @@ fn from_dmatrix(m: &DMatrix<f64>) -> Array2<f32> {
     array2_from_row_major(m.nrows(), m.ncols(), data)
 }
 
-fn pseudoinverse(m: &DMatrix<f64>) -> Result<DMatrix<f64>> {
+pub(crate) fn pseudoinverse(m: &DMatrix<f64>) -> Result<DMatrix<f64>> {
     if m.nrows() >= m.ncols() {
         let lhs = m.transpose() * m;
         let rhs = m.transpose();

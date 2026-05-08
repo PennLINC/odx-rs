@@ -1,12 +1,18 @@
 use std::collections::HashMap;
 
+use bytemuck::cast_slice;
+
 use crate::data_array::DataArray;
 use crate::descoteaux_sh;
 use crate::dtype::DType;
 use crate::error::{OdxError, Result};
-use crate::header::{CanonicalDenseRepresentation, Header};
+use crate::header::{CanonicalDenseRepresentation, Header, PamMetadata};
 use crate::mmap_backing::{vec_into_bytes, MmapBacking};
 use crate::odx_file::{OdxDataset, OdxParts};
+use crate::peak_finder::{
+    peaks_from_sh_rows_with_basis, PeakFinderConfig, SpherePeakFinder,
+};
+use crate::sh_basis_evaluator::basis_kind_from_dipy_name;
 use serde_json::Value;
 
 pub struct OdxBuilder {
@@ -28,6 +34,7 @@ pub struct OdxBuilder {
     canonical_dense_representation: Option<CanonicalDenseRepresentation>,
     sphere_id: Option<String>,
     odf_sample_domain: Option<String>,
+    pam_metadata: Option<PamMetadata>,
     extra: HashMap<String, Value>,
 }
 
@@ -58,13 +65,135 @@ impl OdxBuilder {
             canonical_dense_representation: None,
             sphere_id: None,
             odf_sample_domain: None,
+            pam_metadata: None,
             extra: HashMap::new(),
         }
+    }
+
+    /// Attach dipy-PAM round-trip metadata (total_weight, ang_thr, basis_assumed).
+    pub fn set_pam_metadata(&mut self, metadata: PamMetadata) {
+        self.pam_metadata = if metadata.is_empty() {
+            None
+        } else {
+            Some(metadata)
+        };
+    }
+
+    /// Volume dimensions `(X, Y, Z)`.
+    pub fn dimensions(&self) -> [u64; 3] {
+        self.dimensions
+    }
+
+    /// Read-only mask (full-volume, C-order).
+    pub fn mask(&self) -> &[u8] {
+        &self.mask
     }
 
     pub fn push_voxel_peaks(&mut self, peaks: &[[f32; 3]]) {
         self.directions.extend_from_slice(peaks);
         self.offsets.push(self.directions.len() as u32);
+    }
+
+    /// Initialize the peak state to "no peaks anywhere": one offset of 0 per
+    /// in-mask voxel plus the trailing sentinel. Use this when building an
+    /// SH-only dataset (peaks deferred to `compute_peaks` or never written).
+    /// Resets any previously pushed peaks.
+    pub fn skip_all_peaks(&mut self) {
+        let nb_voxels = self.mask.iter().filter(|&&v| v != 0).count();
+        self.offsets = vec![0u32; nb_voxels + 1];
+        self.directions.clear();
+    }
+
+    /// Run the Rust peak finder against the SH coefficients already attached
+    /// to this builder, replacing any pushed peaks with the result and
+    /// attaching `dpf/amplitude` automatically.
+    ///
+    /// Sphere resolution: caller-supplied `sphere` wins; else the builder's
+    /// `set_sphere` value; else the built-in DSI Studio ODF8 hemisphere.
+    /// Errors if no SH `coefficients` array is attached or if `set_sh_info`
+    /// hasn't been called.
+    pub fn compute_peaks(
+        &mut self,
+        sphere: Option<(Vec<[f32; 3]>, Vec<[u32; 3]>)>,
+        config: PeakFinderConfig,
+    ) -> Result<()> {
+        let nb_voxels = self.mask.iter().filter(|&&v| v != 0).count();
+        let basis_name = self
+            .sh_basis
+            .as_deref()
+            .ok_or_else(|| {
+                OdxError::Argument(
+                    "compute_peaks: SH basis not set; call set_sh_info first".into(),
+                )
+            })?
+            .to_string();
+        let sh_order = self
+            .sh_order
+            .ok_or_else(|| OdxError::Argument("compute_peaks: sh_order not set".into()))?;
+        let full_basis = self.sh_full_basis.unwrap_or(false);
+        let legacy = self.sh_legacy.unwrap_or(false);
+        // parse_dipy_basis collapses tournier aliases and recognizes the
+        // legacy suffix; use its (canonical, legacy) result so a basis name
+        // like "descoteaux07_legacy" doesn't lose the legacy bit when only
+        // sh_basis is set.
+        let kind = if basis_name.eq_ignore_ascii_case("descoteaux07_legacy") {
+            basis_kind_from_dipy_name("descoteaux07_legacy", sh_order as usize, full_basis)?
+        } else {
+            // Caller set sh_legacy explicitly via set_sh_legacy.
+            let with_legacy = if matches!(basis_name.to_ascii_lowercase().as_str(), "descoteaux07" | "dipy") && legacy {
+                "descoteaux07_legacy"
+            } else {
+                basis_name.as_str()
+            };
+            basis_kind_from_dipy_name(with_legacy, sh_order as usize, full_basis)?
+        };
+
+        let (vertices, faces) = match sphere {
+            Some((v, f)) => (v, f),
+            None => match (&self.sphere_vertices, &self.sphere_faces) {
+                (Some(v), Some(f)) => (v.clone(), f.clone()),
+                _ => (
+                    crate::formats::dsistudio_odf8::hemisphere_vertices_ras().to_vec(),
+                    crate::formats::dsistudio_odf8::faces().to_vec(),
+                ),
+            },
+        };
+
+        let (sh_bytes, sh_ncols, sh_dtype) = self.sh.get("coefficients").ok_or_else(|| {
+            OdxError::Argument("compute_peaks: no sh/coefficients array attached".into())
+        })?;
+        if *sh_dtype != DType::Float32 {
+            return Err(OdxError::Argument(format!(
+                "compute_peaks requires sh/coefficients in float32; got {sh_dtype}"
+            )));
+        }
+        let expected_ncoeffs = expected_sh_ncoeffs(sh_order as usize, full_basis)?;
+        if *sh_ncols != expected_ncoeffs {
+            return Err(OdxError::Argument(format!(
+                "compute_peaks: sh/coefficients has {} cols, expected {} for sh_order={} (full_basis={})",
+                sh_ncols, expected_ncoeffs, sh_order, full_basis
+            )));
+        }
+        let sh_rows: &[f32] = cast_slice(sh_bytes);
+        if sh_rows.len() != nb_voxels * sh_ncols {
+            return Err(OdxError::Format(format!(
+                "compute_peaks: sh/coefficients has {} f32 entries; expected {} (nb_voxels × ncoeffs)",
+                sh_rows.len(),
+                nb_voxels * sh_ncols
+            )));
+        }
+
+        let finder = SpherePeakFinder::new(&vertices, &faces, config);
+        let (offsets, directions, amplitudes) =
+            peaks_from_sh_rows_with_basis(sh_rows, nb_voxels, &finder, kind)?;
+
+        self.offsets = offsets;
+        self.directions = directions;
+        self.dpf.insert(
+            "amplitude".to_string(),
+            (vec_into_bytes(amplitudes), 1, DType::Float32),
+        );
+        Ok(())
     }
 
     pub fn set_sphere(&mut self, vertices: Vec<[f32; 3]>, faces: Vec<[u32; 3]>) {
@@ -213,6 +342,7 @@ impl OdxBuilder {
             sphere_id: self.sphere_id,
             odf_sample_domain: self.odf_sample_domain,
             array_quantization: HashMap::new(),
+            pam_metadata: self.pam_metadata,
             extra: self.extra,
         };
 
@@ -249,6 +379,14 @@ impl OdxBuilder {
             dpg: HashMap::new(),
             tempdir: None,
         }))
+    }
+}
+
+fn expected_sh_ncoeffs(lmax: usize, full_basis: bool) -> Result<usize> {
+    if full_basis {
+        Ok((lmax + 1) * (lmax + 1))
+    } else {
+        Ok((lmax + 1) * (lmax + 2) / 2)
     }
 }
 

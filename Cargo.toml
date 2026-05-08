@@ -1,7 +1,20 @@
+[workspace]
+members = [".", "python"]
+
 [package]
 name = "odx-rs"
 version = "0.1.0"
 edition = "2021"
+description = "ODX format — TRX-style mmap container for ODFs, peaks, and SH coefficients (diffusion MRI)"
+# Bulk of the crate is dual MIT OR Apache-2.0 (the typical Rust ecosystem
+# license). Two files (src/peak_finder.rs, src/mrtrix_sh.rs) port code from
+# MRtrix3 and remain MPL-2.0; see those files' headers and LICENSE-MRTRIX.
+license = "(MIT OR Apache-2.0) AND MPL-2.0"
+repository = "https://github.com/PennLINC/odx-rs"
+homepage = "https://github.com/PennLINC/odx-rs"
+keywords = ["diffusion-mri", "odf", "fixel", "spherical-harmonics", "neuroimaging"]
+categories = ["science", "data-structures"]
+readme = "README.md"
 
 [dependencies]
 memmap2 = "0.9"
@@ -21,6 +34,7 @@ tempfile = "3"
 hdf5-metno = { version = "0.12.4", default-features = false, features = ["static", "zlib"] }
 itk-transforms-rs = { version = "0.1.0", git = "https://github.com/PennLINC/itk-transforms-rs" }
 statrs = "0.18"
+kiddo = "5"
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -29,4 +43,8 @@ predicates = "3"
 
 [[bench]]
 name = "dsistudio_io"
+harness = false
+
+[[bench]]
+name = "sphere_lookup"
 harness = false

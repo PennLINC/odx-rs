@@ -174,6 +174,7 @@ fn header_round_trip() {
         sphere_id: None,
         odf_sample_domain: None,
         array_quantization: HashMap::new(),
+        pam_metadata: None,
         extra: HashMap::new(),
     };
 

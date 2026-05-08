@@ -348,6 +348,7 @@ fn load_dsistudio_mat(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxD
         // sphere, even when `odf_vertices` contains the entire tessellation.
         odf_sample_domain: (!odf.is_empty()).then_some("hemisphere".into()),
         array_quantization: HashMap::new(),
+        pam_metadata: None,
         extra,
     };
 

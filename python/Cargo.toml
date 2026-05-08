@@ -1,0 +1,18 @@
+[package]
+name = "odx-py"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Python bindings for odx-rs (built via maturin; not published as a Rust crate)"
+license = "(MIT OR Apache-2.0) AND MPL-2.0"
+
+[lib]
+name = "_odx"
+crate-type = ["cdylib"]
+
+[dependencies]
+odx-rs = { path = ".." }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+numpy = "0.22"
+ndarray = "0.16"
+bytemuck = "1"

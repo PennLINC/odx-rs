@@ -81,6 +81,32 @@ impl Default for MrtrixToDsistudioOptions {
     }
 }
 
+/// Apply a `(ndir × ncoeffs)` transform to a flat `(nrows × ncoeffs)` SH
+/// buffer, producing flat `(nrows × ndir)` amplitudes — without clamping
+/// negatives. Used by `convert_sh_basis` for tight SH↔SH round-trips.
+fn apply_transform_unclamped(
+    transform: &ndarray::Array2<f32>,
+    sh_rows: &[f32],
+    nrows: usize,
+    ncoeffs: usize,
+) -> Vec<f32> {
+    let (ndir, t_cols) = transform.dim();
+    debug_assert_eq!(t_cols, ncoeffs);
+    let mut out = vec![0.0_f32; nrows * ndir];
+    for row in 0..nrows {
+        let src = &sh_rows[row * ncoeffs..(row + 1) * ncoeffs];
+        let dst = &mut out[row * ndir..(row + 1) * ndir];
+        for d in 0..ndir {
+            let mut acc = 0.0_f32;
+            for c in 0..ncoeffs {
+                acc += transform[[d, c]] * src[c];
+            }
+            dst[d] = acc;
+        }
+    }
+    out
+}
+
 pub fn dsistudio_to_mrtrix(
     input_ds_path: &Path,
     out_fixels_dir: &Path,
@@ -132,6 +158,180 @@ pub fn fit_mrtrix_sh_from_odf(
     requested_lmax: Option<u32>,
 ) -> Result<Option<OdxDataset>> {
     add_sh_from_dsistudio_odf(odx, requested_lmax)
+}
+
+/// Target SH basis for [`convert_sh_basis`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShBasisTarget {
+    /// MRtrix `tournier07`, even ℓ only. Required for `save_to_mrtrix`.
+    Tournier07,
+    /// dipy `descoteaux07`. `legacy=true` matches dipy ≤ 1.x behavior;
+    /// `false` matches modern dipy ≥ 1.x.
+    Descoteaux07 { legacy: bool },
+}
+
+impl ShBasisTarget {
+    fn dipy_name(self) -> &'static str {
+        match self {
+            Self::Tournier07 => "tournier07",
+            Self::Descoteaux07 { legacy: true } => "descoteaux07_legacy",
+            Self::Descoteaux07 { legacy: false } => "descoteaux07",
+        }
+    }
+}
+
+/// Convert the `sh/coefficients` array of an ODX dataset to a different SH
+/// basis (e.g. dipy `descoteaux07_legacy` → MRtrix `tournier07` for MRtrix
+/// fixel export). The conversion is *indirect*: the source SH is evaluated
+/// on a sampling sphere, then refit in the target basis.
+///
+/// Sampling sphere precedence: caller's `sampling` arg → `odx.sphere_vertices()`
+/// → built-in DSI Studio ODF8 hemisphere. The sphere should support the
+/// fit (typically `ndir >= 2 * ncoeffs`); the function errors if the matrix
+/// is too rank-deficient to invert.
+///
+/// Errors:
+/// - source basis is descoteaux full-basis (asymmetric ODFs cannot
+///   round-trip through tournier07's even-only basis).
+/// - no `sh/coefficients` array attached.
+/// - `sh_order` not set on the source header.
+pub fn convert_sh_basis(
+    odx: &OdxDataset,
+    target: ShBasisTarget,
+    sampling: Option<&[[f32; 3]]>,
+) -> Result<OdxDataset> {
+    use crate::descoteaux_sh;
+    use crate::sh_basis_evaluator::{parse_dipy_basis, ShBasisKind};
+
+    let header = odx.header();
+    let source_basis_name = header.dipy_basis_name().ok_or_else(|| {
+        OdxError::Argument(
+            "convert_sh_basis: source SH basis not set (sh_basis/sh_legacy)".into(),
+        )
+    })?;
+    if source_basis_name == target.dipy_name() {
+        // Trivial no-op: source already matches target. Cheaper than
+        // round-tripping through amplitudes.
+        return Ok(OdxDataset::from_parts(odx.clone_owned_parts()));
+    }
+
+    let sh_order = header
+        .sh_order
+        .ok_or_else(|| OdxError::Argument("convert_sh_basis: sh_order not set".into()))?
+        as usize;
+    let full_basis = header.sh_full_basis.unwrap_or(false);
+    let (source_canonical, source_legacy) = parse_dipy_basis(source_basis_name)?;
+    if source_canonical == "descoteaux07" && full_basis {
+        return Err(OdxError::Argument(
+            "convert_sh_basis: descoteaux full-basis (asymmetric SH) cannot be converted; \
+             tournier07 is symmetric only and round-trip through amplitudes would lose the antipodal asymmetry"
+                .into(),
+        ));
+    }
+
+    let sh_arr = odx
+        .sh_arrays()
+        .get("coefficients")
+        .ok_or_else(|| OdxError::Argument("convert_sh_basis: no sh/coefficients".into()))?;
+    let nb_voxels = odx.nb_voxels();
+    let coeffs_f32 = sh_arr.to_f32_vec()?;
+    let source_ncoeffs = sh_arr.ncols();
+
+    let sphere: Vec<[f32; 3]> = match sampling {
+        Some(s) => s.to_vec(),
+        None => match odx.sphere_vertices() {
+            Some(v) => v.to_vec(),
+            None => crate::formats::dsistudio_odf8::hemisphere_vertices_ras().to_vec(),
+        },
+    };
+
+    // Step 1: source basis SH → sphere amplitudes (UNCLAMPED — clamping
+    // negative amplitudes is correct for ODF rendering but destroys the
+    // SH↔SH round-trip we need here, since negative coefficients carry
+    // signal in the symmetric basis space).
+    let amplitudes = match source_canonical {
+        "tournier07" => {
+            let lmax = crate::mrtrix_sh::lmax_for_ncoeffs(source_ncoeffs)?;
+            let transform = crate::mrtrix_sh::sh2amp_cart(&sphere, lmax);
+            apply_transform_unclamped(
+                &transform,
+                &coeffs_f32,
+                nb_voxels,
+                source_ncoeffs,
+            )
+        }
+        "descoteaux07" => {
+            let lmax = descoteaux_sh::lmax_for_ncoeffs(source_ncoeffs, full_basis)?;
+            let transform =
+                descoteaux_sh::sh2amp_cart(&sphere, lmax, full_basis, source_legacy);
+            apply_transform_unclamped(
+                &transform,
+                &coeffs_f32,
+                nb_voxels,
+                source_ncoeffs,
+            )
+        }
+        _ => unreachable!("parse_dipy_basis returns canonical names"),
+    };
+
+    // Step 2: amplitudes → target basis SH.
+    let target_kind = match target {
+        ShBasisTarget::Tournier07 => ShBasisKind::MrtrixTournier { lmax: sh_order },
+        ShBasisTarget::Descoteaux07 { legacy } => ShBasisKind::Descoteaux {
+            lmax: sh_order,
+            full_basis: false,
+            legacy,
+        },
+    };
+    let (target_coeffs, target_ncoeffs) = match target_kind {
+        ShBasisKind::MrtrixTournier { lmax } => {
+            let coeffs = crate::mrtrix_sh::fit_rows_from_amplitudes(
+                &amplitudes,
+                nb_voxels,
+                &sphere,
+                lmax,
+            )?;
+            (coeffs, crate::mrtrix_sh::ncoeffs_for_lmax(lmax))
+        }
+        ShBasisKind::Descoteaux {
+            lmax,
+            full_basis: target_full,
+            legacy,
+        } => {
+            let coeffs = descoteaux_sh::fit_rows_from_amplitudes(
+                &amplitudes,
+                nb_voxels,
+                &sphere,
+                lmax,
+                target_full,
+                legacy,
+            )?;
+            (coeffs, descoteaux_sh::ncoeffs_for(lmax, target_full))
+        }
+    };
+
+    let mut parts = odx.clone_owned_parts();
+    parts.header.sh_basis = Some(
+        match target {
+            ShBasisTarget::Tournier07 => "tournier07",
+            ShBasisTarget::Descoteaux07 { .. } => "descoteaux07",
+        }
+        .to_string(),
+    );
+    parts.header.sh_legacy = Some(matches!(
+        target,
+        ShBasisTarget::Descoteaux07 { legacy: true }
+    ));
+    parts.header.sh_full_basis = Some(false);
+    parts.sh.insert(
+        "coefficients".into(),
+        DataArray::owned_bytes(
+            vec_to_bytes(target_coeffs),
+            target_ncoeffs,
+            DType::Float32,
+        ),
+    );
+    Ok(OdxDataset::from_parts(parts))
 }
 
 pub fn save_dsistudio_from_odx(

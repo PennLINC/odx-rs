@@ -16,7 +16,9 @@ pub mod odx_file;
 pub mod peak_finder;
 pub mod qc;
 pub mod reference_affine;
+pub mod densify;
 pub mod sh_basis_evaluator;
+pub mod sphere_lookup;
 pub mod stream;
 pub mod transform;
 pub mod typed_view;
@@ -33,8 +35,8 @@ pub use formats::pam;
 pub use formats::tortoise_mapmri;
 pub use header::{CanonicalDenseRepresentation, Header, QuantizationSpec};
 pub use interop::{
-    dsistudio_to_mrtrix, mrtrix_to_dsistudio, DenseOdfMode, DsistudioFormat,
-    DsistudioToMrtrixOptions, MrtrixToDsistudioOptions, PeakSource, Z0Policy,
+    convert_sh_basis, dsistudio_to_mrtrix, mrtrix_to_dsistudio, DenseOdfMode, DsistudioFormat,
+    DsistudioToMrtrixOptions, MrtrixToDsistudioOptions, PeakSource, ShBasisTarget, Z0Policy,
 };
 pub use mmap_backing::MmapBacking;
 pub use nifti_canon::CanonTransform;

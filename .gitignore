@@ -1,6 +1,7 @@
 # Cargo build output (binaries, deps, incremental, criterion output, etc.)
 /debug/
 /target/
+**/target/
 
 # rustfmt
 **/*.rs.bk
@@ -13,6 +14,36 @@
 *.profdata
 lcov.info
 cobertura.xml
+
+# Python: maturin-built extension modules (placed inside the package by
+# `maturin develop`)
+python/odx/_odx*.so
+python/odx/_odx*.pyd
+python/odx/_odx*.dylib
+
+# Python: build / packaging artifacts
+python/dist/
+python/build/
+python/wheelhouse/
+python/*.egg-info/
+**/*.egg-info/
+
+# Python: bytecode + caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+
+# Python: virtualenvs occasionally left behind
+.venv/
+venv/
 
 # Local env / secrets
 .env

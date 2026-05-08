@@ -403,6 +403,45 @@ impl RowSamplePlan {
     }
 }
 
+/// Fit descoteaux07 SH coefficients from sphere amplitudes via the
+/// pseudoinverse of `sh2amp_cart`. Mirrors [`crate::mrtrix_sh::fit_rows_from_amplitudes`]
+/// for descoteaux SH (symmetric or full-basis, legacy or modern).
+///
+/// `amplitudes` is a flat `(nrows, ndir)` row-major array; output is
+/// `(nrows, ncoeffs)` row-major.
+pub fn fit_rows_from_amplitudes(
+    amplitudes: &[f32],
+    nrows: usize,
+    dirs_ras: &[[f32; 3]],
+    lmax: usize,
+    full_basis: bool,
+    legacy: bool,
+) -> Result<Vec<f32>> {
+    let sh2amp = sh2amp_cart(dirs_ras, lmax, full_basis, legacy);
+    let pinv = crate::mrtrix_sh::pseudoinverse(&crate::mrtrix_sh::to_dmatrix(&sh2amp))?;
+    let amp2sh = crate::mrtrix_sh::from_dmatrix(&pinv);
+    let (ncoeffs, ndir) = amp2sh.dim();
+    if ndir != dirs_ras.len() {
+        return Err(crate::error::OdxError::Format(format!(
+            "fit_rows_from_amplitudes: pseudoinverse shape mismatch (expected ndir={}, got {ndir})",
+            dirs_ras.len()
+        )));
+    }
+    let mut out = vec![0.0_f32; nrows * ncoeffs];
+    for row in 0..nrows {
+        let src = &amplitudes[row * ndir..(row + 1) * ndir];
+        let dst = &mut out[row * ncoeffs..(row + 1) * ncoeffs];
+        for r in 0..ncoeffs {
+            let mut acc = 0.0_f32;
+            for c in 0..ndir {
+                acc += amp2sh[[r, c]] * src[c];
+            }
+            dst[r] = acc;
+        }
+    }
+    Ok(out)
+}
+
 /// First and second partial derivatives of a descoteaux07 SH series at
 /// `(theta, azimuth)`, returning
 /// `(amplitude, ∂/∂θ, ∂/∂φ, ∂²/∂θ², ∂²/∂θ∂φ, ∂²/∂φ²)`.

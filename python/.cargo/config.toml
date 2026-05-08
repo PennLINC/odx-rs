@@ -1,0 +1,14 @@
+# macOS extension-module cdylib needs dynamic_lookup so Python symbols
+# resolve at load time. maturin sets these automatically; this lets plain
+# `cargo build -p odx-py` work too.
+[target.aarch64-apple-darwin]
+rustflags = [
+  "-C", "link-arg=-undefined",
+  "-C", "link-arg=dynamic_lookup",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+  "-C", "link-arg=-undefined",
+  "-C", "link-arg=dynamic_lookup",
+]

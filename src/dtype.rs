@@ -65,6 +65,31 @@ impl DType {
     pub fn is_float(self) -> bool {
         matches!(self, DType::Float16 | DType::Float32 | DType::Float64)
     }
+
+    /// Map a numpy-style dtype descriptor (e.g. `"float32"`, `"<f4"`, `"uint8"`,
+    /// `"|u1"`) to a `DType`. Used by the Python wrapper when accepting numpy
+    /// arrays via the builder.
+    pub fn from_numpy_str(s: &str) -> Result<Self> {
+        if let Ok(d) = Self::parse(s) {
+            return Ok(d);
+        }
+        let trimmed = s.trim_start_matches(|c| c == '<' || c == '>' || c == '=' || c == '|');
+        let mapped = match trimmed {
+            "f2" => "float16",
+            "f4" => "float32",
+            "f8" => "float64",
+            "i1" => "int8",
+            "i2" => "int16",
+            "i4" => "int32",
+            "i8" => "int64",
+            "u1" => "uint8",
+            "u2" => "uint16",
+            "u4" => "uint32",
+            "u8" => "uint64",
+            other => other,
+        };
+        Self::parse(mapped)
+    }
 }
 
 impl fmt::Display for DType {

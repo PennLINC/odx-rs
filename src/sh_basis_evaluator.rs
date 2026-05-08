@@ -29,6 +29,92 @@ pub enum ShBasisKind {
     },
 }
 
+/// Parse a dipy-style basis name into its canonical name and `legacy` flag.
+///
+/// - `"tournier07"`, `"mrtrix"`, `"mrtrix3"` → `("tournier07", false)`
+/// - `"descoteaux07"`, `"dipy"` → `("descoteaux07", false)`
+/// - `"descoteaux07_legacy"` → `("descoteaux07", true)`
+///
+/// Tournier doesn't have a meaningful legacy variant (its convention is fixed),
+/// so any tournier alias maps to `legacy=false`.
+pub fn parse_dipy_basis(name: &str) -> Result<(&'static str, bool)> {
+    match name.to_ascii_lowercase().as_str() {
+        "tournier07" | "mrtrix" | "mrtrix3" => Ok(("tournier07", false)),
+        "descoteaux07" | "dipy" => Ok(("descoteaux07", false)),
+        "descoteaux07_legacy" => Ok(("descoteaux07", true)),
+        other => Err(OdxError::Format(format!(
+            "unknown SH basis '{other}': expected 'tournier07' or 'descoteaux07[_legacy]'"
+        ))),
+    }
+}
+
+/// Build a flat row-major `(ndir, ncoeffs)` SH→SF transform matrix for the
+/// requested basis. Equivalent to dipy's `sh_to_sf_matrix(...)[0]` and lets
+/// the Python wrapper (or any non-dipy consumer) compute the PAM5 `B` field
+/// without needing dipy installed.
+///
+/// `basis` accepts dipy-style names: `"tournier07"`, `"descoteaux07"`,
+/// `"descoteaux07_legacy"`. `full_basis` is descoteaux-only (asymmetric SH).
+pub fn compute_b_matrix(
+    sphere_vertices: &[[f32; 3]],
+    sh_order: usize,
+    basis: &str,
+    full_basis: bool,
+) -> Result<Vec<f32>> {
+    let kind = basis_kind_from_dipy_name(basis, sh_order, full_basis)?;
+    let (ndir, ncoeffs) = (sphere_vertices.len(), kind.ncoeffs());
+    let mut out = vec![0.0_f32; ndir * ncoeffs];
+    match kind {
+        ShBasisKind::MrtrixTournier { lmax } => {
+            let m = crate::mrtrix_sh::sh2amp_cart(sphere_vertices, lmax);
+            // m has shape (ndir, ncoeffs) row-major in ndarray; flatten.
+            let s = m
+                .as_slice()
+                .ok_or_else(|| OdxError::Format("compute_b_matrix: non-contiguous transform".into()))?;
+            out.copy_from_slice(s);
+        }
+        ShBasisKind::Descoteaux {
+            lmax,
+            full_basis,
+            legacy,
+        } => {
+            let m = crate::descoteaux_sh::sh2amp_cart(sphere_vertices, lmax, full_basis, legacy);
+            let s = m
+                .as_slice()
+                .ok_or_else(|| OdxError::Format("compute_b_matrix: non-contiguous transform".into()))?;
+            out.copy_from_slice(s);
+        }
+    }
+    Ok(out)
+}
+
+/// Construct an `ShBasisKind` from a dipy-style basis name plus the lmax and
+/// `full_basis` flag the caller already has. Used by the Python wrapper so
+/// callers don't have to pattern-match the Rust enum from Python.
+pub fn basis_kind_from_dipy_name(
+    name: &str,
+    lmax: usize,
+    full_basis: bool,
+) -> Result<ShBasisKind> {
+    let (canonical, legacy) = parse_dipy_basis(name)?;
+    match canonical {
+        "tournier07" => {
+            if full_basis {
+                return Err(OdxError::Format(
+                    "tournier07 is symmetric only; full_basis=true is not supported".into(),
+                ));
+            }
+            Ok(ShBasisKind::MrtrixTournier { lmax })
+        }
+        "descoteaux07" => Ok(ShBasisKind::Descoteaux {
+            lmax,
+            full_basis,
+            legacy,
+        }),
+        _ => unreachable!("parse_dipy_basis returns one of the two canonical names"),
+    }
+}
+
 impl ShBasisKind {
     /// Highest ℓ band represented by this basis.
     pub fn lmax(&self) -> usize {
@@ -218,6 +304,7 @@ mod tests {
             sphere_id: None,
             odf_sample_domain: None,
             array_quantization: HashMap::new(),
+            pam_metadata: None,
             extra: HashMap::new(),
         }
     }
