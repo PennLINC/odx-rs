@@ -90,11 +90,12 @@ jobs:
           manylinux: ${{ matrix.libc == 'manylinux' && 'auto' || 'musllinux_1_2' }}
           before-script-linux: |
             # hdf5-metno-src builds HDF5 from source via cmake; it requires
-            # CMake >= 3.26. Both manylinux_2_17 (AlmaLinux yum cmake = 3.20)
-            # and musllinux_1_2 (Alpine apk cmake = 3.22) ship versions that
-            # are too old. Install a recent cmake from PyPI and pin its
-            # path via CMAKE=... (set on the step's env above) so the
-            # cmake-rs crate uses it deterministically.
+            # CMake >= 3.26. Both manylinux_2_17 (AlmaLinux yum cmake 3.20)
+            # and musllinux_1_2 (Alpine apk cmake 3.22) ship too-old
+            # versions, and cross-compile images from messense (used for
+            # aarch64) don't have /opt/python/ at all. Install a recent
+            # cmake via pip from whatever Python we can find, and pin its
+            # path via the CMAKE env var.
             #
             # `set -ex` prints every command so failures are diagnosable
             # from the workflow log without re-running.
@@ -102,55 +103,92 @@ jobs:
 
             uname -a
             cat /etc/os-release || true
+            ls -d /opt/python 2>&1 || echo "(no /opt/python — likely a cross-compile image)"
 
-            # Detect package manager and install minimal build tools for
-            # the HDF5 source compile.
+            # Install minimal build tools + a system Python if needed.
+            # The cross-compile images have package managers but often no
+            # Python preinstalled, so add it here.
             if command -v apk >/dev/null 2>&1; then
-              # Alpine / musllinux. apk update so package metadata is fresh.
               apk update
-              apk add --no-cache make gcc g++ musl-dev linux-headers perl bash
+              apk add --no-cache make gcc g++ musl-dev linux-headers perl bash python3 py3-pip
             elif command -v dnf >/dev/null 2>&1; then
-              # AlmaLinux 9 / manylinux_2_28
-              dnf install -y make gcc gcc-c++ perl
+              dnf install -y make gcc gcc-c++ perl python3 python3-pip
             elif command -v yum >/dev/null 2>&1; then
-              # AlmaLinux 8 / manylinux_2_17
-              yum install -y make gcc gcc-c++ perl
+              yum install -y make gcc gcc-c++ perl python3 python3-pip
+            elif command -v apt-get >/dev/null 2>&1; then
+              apt-get update
+              apt-get install -y make gcc g++ perl python3 python3-pip
             fi
 
-            # Find a CPython 3.x in the standard PyPA layout. Prefer 3.10
-            # since that's the abi3 minimum we promise; any cp3* works.
+            # Resolve a pip we can use. Prefer the PyPA-style /opt/python
+            # bundled CPython (manylinux_2_17 / musllinux_1_2 native images);
+            # fall back to system python3 (typical of cross-compile images).
+            PIP_CMD=""
             PYBIN=""
-            for d in /opt/python/cp310-cp310/bin /opt/python/cp311-cp311/bin \
-                     /opt/python/cp312-cp312/bin /opt/python/cp39-cp39/bin \
-                     /opt/python/cp313-cp313/bin; do
-              if [ -d "$d" ]; then PYBIN="$d"; break; fi
+            for cand in /opt/python/cp310-cp310/bin /opt/python/cp311-cp311/bin \
+                        /opt/python/cp312-cp312/bin /opt/python/cp39-cp39/bin \
+                        /opt/python/cp313-cp313/bin; do
+              if [ -d "$cand" ]; then
+                PYBIN="$cand"
+                PIP_CMD="$cand/pip"
+                break
+              fi
             done
-            if [ -z "$PYBIN" ]; then
-              echo "::error::No /opt/python/cp3*/bin found"
-              ls -la /opt/python/ 2>&1 || true
+            if [ -z "$PIP_CMD" ]; then
+              if command -v pip3 >/dev/null 2>&1; then
+                PIP_CMD="pip3"
+              elif command -v python3 >/dev/null 2>&1; then
+                python3 -m ensurepip --default-pip 2>/dev/null || true
+                PIP_CMD="python3 -m pip"
+              else
+                echo "::error::No Python/pip found in build container"
+                exit 1
+              fi
+            fi
+            echo "Using PIP_CMD='$PIP_CMD' (PYBIN='${PYBIN:-system}')"
+
+            # Install cmake>=3.26 from PyPI. `--break-system-packages` is
+            # for PEP 668-marked Pythons (some distros); harmless on others.
+            $PIP_CMD install --no-cache-dir --upgrade --break-system-packages "cmake>=3.26" 2>/dev/null \
+              || $PIP_CMD install --no-cache-dir --upgrade "cmake>=3.26"
+
+            # Find where the pip-installed cmake landed. With /opt/python
+            # it's in $PYBIN/cmake; with system pip it's wherever pip puts
+            # console scripts — discoverable via `command -v cmake` after
+            # install (PATH is updated by the install).
+            INSTALLED_CMAKE=""
+            if [ -n "$PYBIN" ] && [ -x "$PYBIN/cmake" ]; then
+              INSTALLED_CMAKE="$PYBIN/cmake"
+            elif command -v cmake >/dev/null 2>&1; then
+              INSTALLED_CMAKE=$(command -v cmake)
+            else
+              # Last-ditch: ask pip where it put the script.
+              INSTALLED_CMAKE=$($PIP_CMD show -f cmake 2>/dev/null | awk '/Location:/ {loc=$2} /bin\/cmake/ {print loc"/"$1}' | head -1)
+              # That gives a path relative to site-packages; resolve to abs.
+              if [ -n "$INSTALLED_CMAKE" ]; then
+                INSTALLED_CMAKE=$(realpath "$INSTALLED_CMAKE" 2>/dev/null || echo "$INSTALLED_CMAKE")
+              fi
+            fi
+            if [ -z "$INSTALLED_CMAKE" ] || [ ! -x "$INSTALLED_CMAKE" ]; then
+              echo "::error::Could not locate pip-installed cmake binary"
+              $PIP_CMD show -f cmake || true
               exit 1
             fi
-            echo "Selected PYBIN=$PYBIN"
-            "$PYBIN/python" --version
+            echo "Pip-installed cmake at: $INSTALLED_CMAKE"
 
-            # Install a recent cmake from PyPI. Use --no-cache-dir so we
-            # don't blow up the build cache.
-            "$PYBIN/pip" install --no-cache-dir --upgrade "cmake>=3.26"
-
-            # Pin the cmake path to match the CMAKE env var set above.
+            # Pin the path to match the CMAKE env var set on the step.
             mkdir -p /opt/_pipcmake/bin
-            ln -sf "$PYBIN/cmake" /opt/_pipcmake/bin/cmake
+            ln -sf "$INSTALLED_CMAKE" /opt/_pipcmake/bin/cmake
 
-            # Shadow common system locations as a fallback for any tool
-            # that ignores CMAKE and just resolves `cmake` via PATH.
+            # Shadow common system locations as a PATH fallback.
             for target in /usr/local/bin/cmake /usr/bin/cmake; do
               parent=$(dirname "$target")
-              [ -d "$parent" ] && ln -sf "$PYBIN/cmake" "$target" || true
+              [ -d "$parent" ] && ln -sf "$INSTALLED_CMAKE" "$target" || true
             done
 
-            # Diagnostic: show what's where so future failures are obvious.
-            command -v cmake || true
-            "$PYBIN/cmake" --version
+            # Diagnostic: confirm the right cmake is found via every route.
+            echo "--- cmake versions:"
+            "$INSTALLED_CMAKE" --version
             /opt/_pipcmake/bin/cmake --version
             cmake --version
       - uses: actions/upload-artifact@v4
@@ -159,9 +197,22 @@ jobs:
           path: python/dist
 
   # ─── macOS wheels (x86_64 + Apple Silicon) ─────────────────────────────────
+  #
+  # Runner mapping:
+  #   - aarch64  → macos-14    (Apple Silicon, free, ample capacity)
+  #   - x86_64   → macos-13-large (Intel, paid 6-core, much better queue
+  #                                priority than the free macos-13).
+  #
+  # macos-13 is the newest Intel macOS image GitHub offers (Apple stopped
+  # making Intel Macs), and the free macos-13 runner pool is usually
+  # under-provisioned. macos-13-large costs billing minutes but reliably
+  # picks up jobs in seconds rather than tens of minutes. If you'd rather
+  # not consume the budget, the cleanest alternative is to drop the
+  # x86_64 wheel altogether — the sdist + arm64 wheel cover ~all current
+  # macOS Python users.
   macos:
     name: macOS ${{ matrix.target }}
-    runs-on: ${{ matrix.target == 'aarch64' && 'macos-14' || 'macos-13' }}
+    runs-on: ${{ matrix.target == 'aarch64' && 'macos-14' || 'macos-13-large' }}
     needs: [verify-version]
     strategy:
       fail-fast: false
