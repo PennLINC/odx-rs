@@ -1,17 +1,33 @@
 [workspace]
 members = [".", "python"]
 
-[package]
-name = "odx-rs"
+# Single source of truth for the version (and other shared metadata).
+# Bumping this propagates to:
+#   - the parent crate's [package] below (via `version.workspace = true`)
+#   - python/Cargo.toml (same)
+#   - python/pyproject.toml (via `dynamic = ["version"]` — maturin reads the
+#     workspace package version at build time)
+# After bumping, tag the release as `vX.Y.Z` matching this version. The
+# release workflow has a verify-version step that fails if the tag and
+# this value disagree.
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "ODX format — TRX-style mmap container for ODFs, peaks, and SH coefficients (diffusion MRI)"
 # Bulk of the crate is dual MIT OR Apache-2.0 (the typical Rust ecosystem
 # license). Two files (src/peak_finder.rs, src/mrtrix_sh.rs) port code from
 # MRtrix3 and remain MPL-2.0; see those files' headers and LICENSE-MRTRIX.
 license = "(MIT OR Apache-2.0) AND MPL-2.0"
 repository = "https://github.com/PennLINC/odx-rs"
 homepage = "https://github.com/PennLINC/odx-rs"
+
+[package]
+name = "odx-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "ODX format — TRX-style mmap container for ODFs, peaks, and SH coefficients (diffusion MRI)"
 keywords = ["diffusion-mri", "odf", "fixel", "spherical-harmonics", "neuroimaging"]
 categories = ["science", "data-structures"]
 readme = "README.md"

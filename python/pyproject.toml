@@ -4,7 +4,10 @@ build-backend = "maturin"
 
 [project]
 name = "odx"
-version = "0.1.0"
+# Version comes from [workspace.package].version in ../Cargo.toml — maturin
+# pulls it at build time so we have a single source of truth across
+# Cargo.toml, the wheel filename, and PyPI metadata. Bump there.
+dynamic = ["version"]
 description = "Python bindings for the ODX format — TRX-style mmap container for ODFs, peaks, and SH coefficients"
 readme = "README.md"
 requires-python = ">=3.9"

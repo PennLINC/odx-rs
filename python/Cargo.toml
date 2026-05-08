@@ -1,10 +1,12 @@
 [package]
 name = "odx-py"
-version = "0.1.0"
-edition = "2021"
+# Inherits version, edition, license from [workspace.package] in ../Cargo.toml
+# so a single bump there flows through to the wheel's filename + metadata.
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 publish = false
 description = "Python bindings for odx-rs (built via maturin; not published as a Rust crate)"
-license = "(MIT OR Apache-2.0) AND MPL-2.0"
 
 [lib]
 name = "_odx"
