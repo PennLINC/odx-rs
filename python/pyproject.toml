@@ -52,7 +52,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dipy = ["dipy>=1.10"]
-test = ["pytest"]
+nibabel = ["nibabel>=5"]
+test = ["pytest", "nibabel>=5"]
 
 [project.urls]
 Homepage = "https://github.com/PennLINC/odx-rs"

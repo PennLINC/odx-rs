@@ -228,6 +228,33 @@ impl PyOdx {
             .into_pyarray_bound(py)
     }
 
+    /// `(nb_voxels, 3) uint32` — the `(i, j, k)` index of each compact voxel
+    /// in C-order (i-slowest, k-fastest). Matches the row ordering of DPV
+    /// arrays returned by [`PyOdx.dpv`] / [`PyOdx.densify_dpv`], so you can
+    /// scatter a custom compact array onto the full grid with
+    ///
+    /// ```python
+    /// ijk = odx.compact_to_ijk
+    /// vol = np.zeros(odx.dimensions, dtype=arr.dtype)
+    /// vol[ijk[:, 0], ijk[:, 1], ijk[:, 2]] = arr
+    /// ```
+    ///
+    /// or gather a custom full-grid volume into compact order via the
+    /// inverse. Useful when you want to bypass [`densify_dpv`]'s f32
+    /// promotion or when working with non-DPV-style scalars.
+    #[getter]
+    fn compact_to_ijk<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<u32>> {
+        let ijk = self.inner.compact_to_ijk();
+        let n = ijk.len();
+        let mut data = Vec::with_capacity(n * 3);
+        for v in &ijk {
+            data.extend_from_slice(v);
+        }
+        ndarray::Array2::from_shape_vec((n, 3), data)
+            .unwrap()
+            .into_pyarray_bound(py)
+    }
+
     /// Per-voxel peak offsets, length `nb_voxels + 1` uint32. Owned copy.
     #[getter]
     fn offsets<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u32>> {
@@ -986,6 +1013,150 @@ fn save(path: PathBuf, odx: &PyOdx) -> PyResult<()> {
     odx.inner.save(&path).map_err(map_io)
 }
 
+// ─── attach_dpv ────────────────────────────────────────────────────────────
+//
+// Two entry points for adding a DPV scalar to an existing ODX on disk:
+//
+// * [`attach_dpv_from_volume`] — full-grid (X, Y, Z) input + affine, with
+//   strict shape/affine validation against the ODX. The natural surface
+//   for nibabel-style workflows (a `Nifti1Image` already carries both).
+//
+// * [`attach_dpv`] — compact-order 1-D input. Use this when you already
+//   produced a `(nb_voxels,)` array, e.g. straight out of a Rust helper
+//   or a previous `odx.dpv(...)` call. No grid validation possible (and
+//   none needed — caller already knows the ODX shape).
+//
+// Both dispatch to the underlying `append_dpv_to_directory` /
+// `append_dpv_to_zip` writers and overwrite any existing DPV of the same
+// name. The on-disk dtype is chosen by `dtype="auto"|"u8"|"u16"|...`;
+// `"auto"` picks the narrowest unsigned int that fits, falling back to
+// `float32` for fractional or negative values.
+
+fn parse_dpv_dtype(dtype: Option<&str>) -> PyResult<odx_rs::DpvDtype> {
+    match dtype.unwrap_or("auto") {
+        "auto" => Ok(odx_rs::DpvDtype::Auto),
+        "u8" | "uint8" => Ok(odx_rs::DpvDtype::UInt8),
+        "u16" | "uint16" => Ok(odx_rs::DpvDtype::UInt16),
+        "u32" | "uint32" => Ok(odx_rs::DpvDtype::UInt32),
+        "i16" | "int16" => Ok(odx_rs::DpvDtype::Int16),
+        "i32" | "int32" => Ok(odx_rs::DpvDtype::Int32),
+        "f32" | "float32" => Ok(odx_rs::DpvDtype::Float32),
+        "f64" | "float64" => Ok(odx_rs::DpvDtype::Float64),
+        other => Err(PyValueError::new_err(format!(
+            "unknown DPV dtype '{other}'; expected one of: \
+             auto, u8/uint8, u16/uint16, u32/uint32, i16/int16, i32/int32, \
+             f32/float32, f64/float64"
+        ))),
+    }
+}
+
+fn report_to_pydict<'py>(
+    py: Python<'py>,
+    report: &odx_rs::DpvAttachReport,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("name", &report.name)?;
+    d.set_item("dtype", report.dtype.name())?;
+    d.set_item("nb_voxels", report.nb_voxels)?;
+    d.set_item("masked_in_count", report.masked_in_count)?;
+    d.set_item("clamped", report.clamped)?;
+    Ok(d)
+}
+
+/// Append a DPV from a full-grid `(X, Y, Z)` `float64` volume.
+///
+/// Validates that `volume.shape == odx.dimensions` and that `affine`
+/// matches the ODX's `voxel_to_rasmm` within
+/// `odx_rs::ATTACH_AFFINE_TOLERANCE_MM` (1e-3 mm). Mismatch raises
+/// `ValueError` — resample the input onto the ODX grid first.
+///
+/// `dtype` chooses the on-disk DPV datatype; `"auto"` (default) picks the
+/// narrowest unsigned int that fits non-negative integer data, else
+/// `float32`. Returns a dict describing the appended array.
+#[pyfunction]
+#[pyo3(signature = (odx_path, name, volume, affine, *, dtype=None))]
+fn attach_dpv_from_volume<'py>(
+    py: Python<'py>,
+    odx_path: PathBuf,
+    name: String,
+    volume: PyReadonlyArray3<'py, f64>,
+    affine: PyReadonlyArray2<'py, f64>,
+    dtype: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let aff_arr = affine.as_array();
+    if aff_arr.shape() != [4, 4] {
+        return Err(PyValueError::new_err(format!(
+            "affine must be (4, 4); got {:?}",
+            aff_arr.shape()
+        )));
+    }
+    let mut aff = [[0.0f64; 4]; 4];
+    for r in 0..4 {
+        for c in 0..4 {
+            aff[r][c] = aff_arr[[r, c]];
+        }
+    }
+
+    let vol = volume.as_array();
+    let parsed_dtype = parse_dpv_dtype(dtype)?;
+    let report = odx_rs::attach_dpv_from_volume(&odx_path, &name, vol, aff, parsed_dtype)
+        .map_err(map_io)?;
+    report_to_pydict(py, &report)
+}
+
+/// Append a DPV from a compact-order 1-D array.
+///
+/// `compact` length must equal `odx.nb_voxels`. No grid validation is
+/// performed (and none is possible without a reference volume); the
+/// caller is responsible for producing values in the same ordering as
+/// `odx.compact_to_ijk`.
+///
+/// `dtype` works as in [`attach_dpv_from_volume`]. Returns a dict
+/// describing the appended array.
+#[pyfunction]
+#[pyo3(signature = (odx_path, name, compact, *, dtype=None))]
+fn attach_dpv<'py>(
+    py: Python<'py>,
+    odx_path: PathBuf,
+    name: String,
+    compact: PyReadonlyArray1<'py, f64>,
+    dtype: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    // Reuse the full-grid path by scattering compact → dummy 3-D view, then
+    // gathering inside attach_dpv_from_volume. Cheaper alternative: a
+    // dedicated compact entry point in odx_rs. For clarity right now we
+    // route through the validated path with the ODX's own affine.
+    use odx_rs::OdxDataset;
+    let dataset = OdxDataset::open(&odx_path).map_err(map_io)?;
+    let nb_voxels = dataset.nb_voxels();
+    let arr = compact.as_array();
+    if arr.len() != nb_voxels {
+        return Err(PyValueError::new_err(format!(
+            "compact length {} does not match ODX nb_voxels {}",
+            arr.len(),
+            nb_voxels
+        )));
+    }
+    let dims = dataset.header().dimensions;
+    let dims_us = [dims[0] as usize, dims[1] as usize, dims[2] as usize];
+    let ijk = dataset.compact_to_ijk();
+    let mut vol = ndarray::Array3::<f64>::zeros((dims_us[0], dims_us[1], dims_us[2]));
+    let slice = arr
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("compact array must be C-contiguous"))?;
+    for (idx, [i, j, k]) in ijk.iter().enumerate().map(|(i, v)| (i, *v)) {
+        vol[[i as usize, j as usize, k as usize]] = slice[idx];
+    }
+    let aff = dataset.header().voxel_to_rasmm;
+    drop(dataset); // release the file handle before the append writes back
+
+    let parsed_dtype = parse_dpv_dtype(dtype)?;
+    let report =
+        odx_rs::attach_dpv_from_volume(&odx_path, &name, vol.view(), aff, parsed_dtype)
+            .map_err(map_io)?;
+    report_to_pydict(py, &report)
+}
+
 /// Run the Rust peak finder on a flat `(N, K)` SH-coefficient array using
 /// the supplied sphere. Returns `(offsets, directions, amplitudes)`.
 #[pyfunction]
@@ -1397,6 +1568,8 @@ fn _odx(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyOdxBuilder>()?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(save, m)?)?;
+    m.add_function(wrap_pyfunction!(attach_dpv, m)?)?;
+    m.add_function(wrap_pyfunction!(attach_dpv_from_volume, m)?)?;
     m.add_function(wrap_pyfunction!(peaks_from_sh, m)?)?;
     m.add_function(wrap_pyfunction!(from_sh_coefficients, m)?)?;
     m.add_function(wrap_pyfunction!(convert_sh_basis, m)?)?;

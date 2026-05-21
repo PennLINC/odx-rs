@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use ndarray::{Array, IxDyn};
-use nifti::{NiftiHeader, NiftiType};
+use nifti::NiftiType;
 
 use crate::data_array::DataArray;
 use crate::dtype::DType;
@@ -1418,7 +1418,7 @@ fn write_nifti1_f32_raw(
 ) -> Result<()> {
     let array = Array::from_shape_vec(IxDyn(dims), data.to_vec())
         .map_err(|err| OdxError::Format(format!("failed to shape NIfTI-1 data: {err}")))?;
-    let header = nifti1_header(affine);
+    let header = crate::nifti_export::nifti_header_for_grid(*affine);
     nifti::writer::WriterOptions::new(path)
         .reference_header(&header)
         .write_nifti(&array)
@@ -1559,36 +1559,6 @@ fn write_nifti2_bytes(
     writer.write_all(&[0u8; 4])?;
     writer.write_all(data)?;
     Ok(())
-}
-
-fn nifti1_header(affine: &[[f64; 4]; 4]) -> NiftiHeader {
-    let voxel_sizes = voxel_sizes_from_affine(affine);
-    let mut header = NiftiHeader::default();
-    header.sform_code = 1;
-    header.qform_code = 0;
-    header.pixdim[1] = voxel_sizes[0] as f32;
-    header.pixdim[2] = voxel_sizes[1] as f32;
-    header.pixdim[3] = voxel_sizes[2] as f32;
-    header.xyzt_units = 2;
-    header.srow_x = [
-        affine[0][0] as f32,
-        affine[0][1] as f32,
-        affine[0][2] as f32,
-        affine[0][3] as f32,
-    ];
-    header.srow_y = [
-        affine[1][0] as f32,
-        affine[1][1] as f32,
-        affine[1][2] as f32,
-        affine[1][3] as f32,
-    ];
-    header.srow_z = [
-        affine[2][0] as f32,
-        affine[2][1] as f32,
-        affine[2][2] as f32,
-        affine[2][3] as f32,
-    ];
-    header
 }
 
 fn voxel_sizes_from_affine(affine: &[[f64; 4]; 4]) -> [f64; 3] {

@@ -12,6 +12,7 @@ pub mod io;
 pub mod mmap_backing;
 pub mod mrtrix_sh;
 pub mod nifti_canon;
+pub mod nifti_export;
 pub mod odx_file;
 pub mod peak_finder;
 pub mod qc;
@@ -40,6 +41,11 @@ pub use interop::{
 };
 pub use mmap_backing::MmapBacking;
 pub use nifti_canon::CanonTransform;
+pub use nifti_export::{
+    attach_dpv_from_volume, dpv_to_volume, nifti_header_for_grid, volume_to_dpv,
+    write_voxel_scalar_nifti_f32, write_voxel_scalar_nifti_u16, write_voxel_scalar_nifti_u32,
+    write_voxel_scalar_nifti_u8, DpvAttachReport, DpvDtype, ATTACH_AFFINE_TOLERANCE_MM,
+};
 pub use odx_file::{OdxDataset, OdxFile, OdxWritePolicy};
 pub use qc::{
     compute_fixel_qc, write_qc_class_dpf, FixelQcClass, FixelQcComputation, FixelQcOptions,

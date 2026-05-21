@@ -91,11 +91,62 @@ enum Command {
     ///   --transform         sub-01_from-ACPC_to-MNI152NLin2009cAsym_xfm.h5
     ///   --transform-inverse sub-01_from-MNI152NLin2009cAsym_to-ACPC_xfm.h5
     Transform(TransformArgs),
+    /// Attach a NIfTI volume to an ODX as a DPV (per-voxel scalar), in
+    /// place. The NIfTI grid must match the ODX (dimensions + affine
+    /// within 1e-3 mm); voxels outside the ODX mask are silently dropped.
+    ///
+    /// Examples:
+    ///
+    ///   odx attach-dpv subject.odx fa.nii.gz --name fa
+    ///
+    ///   odx attach-dpv subject.odx counts.nii.gz --name counts --dtype u16
+    ///
+    /// The on-disk DPV dtype defaults to `auto`: narrowest unsigned int
+    /// that fits non-negative integer data, else float32. Force a dtype
+    /// with `--dtype u8|u16|u32|i16|i32|f32|f64`.
+    AttachDpv(AttachDpvArgs),
     /// Generate shell completions.
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+}
+
+#[derive(Args, Debug)]
+struct AttachDpvArgs {
+    /// Existing ODX (directory or `.odx` archive). Edited in place.
+    odx: PathBuf,
+    /// NIfTI volume to import (`.nii` or `.nii.gz`).
+    nifti: PathBuf,
+    /// DPV name to register under (e.g. `fa`). Overwrites if it already
+    /// exists.
+    #[arg(long = "name")]
+    name: String,
+    /// On-disk DPV datatype. `auto` (default) picks the narrowest
+    /// unsigned int that fits non-negative integer data, else `float32`.
+    #[arg(long = "dtype", default_value = "auto", value_parser = parse_dpv_dtype_arg)]
+    dtype: odx_rs::DpvDtype,
+    /// Suppress the per-attach summary line.
+    #[arg(long = "quiet")]
+    quiet: bool,
+}
+
+fn parse_dpv_dtype_arg(s: &str) -> std::result::Result<odx_rs::DpvDtype, String> {
+    match s {
+        "auto" => Ok(odx_rs::DpvDtype::Auto),
+        "u8" | "uint8" => Ok(odx_rs::DpvDtype::UInt8),
+        "u16" | "uint16" => Ok(odx_rs::DpvDtype::UInt16),
+        "u32" | "uint32" => Ok(odx_rs::DpvDtype::UInt32),
+        "i16" | "int16" => Ok(odx_rs::DpvDtype::Int16),
+        "i32" | "int32" => Ok(odx_rs::DpvDtype::Int32),
+        "f32" | "float32" => Ok(odx_rs::DpvDtype::Float32),
+        "f64" | "float64" => Ok(odx_rs::DpvDtype::Float64),
+        other => Err(format!(
+            "unknown DPV dtype '{other}'; expected one of: \
+             auto, u8/uint8, u16/uint16, u32/uint32, i16/int16, i32/int32, \
+             f32/float32, f64/float64"
+        )),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -500,6 +551,7 @@ fn run(cli: Cli) -> odx_rs::Result<()> {
         Command::Compare(args) => run_compare(args),
         Command::ImportAodf(args) => run_import_aodf(args),
         Command::Transform(args) => run_transform(args),
+        Command::AttachDpv(args) => run_attach_dpv(args),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "odx", &mut io::stdout());
@@ -880,6 +932,113 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn run_attach_dpv(args: AttachDpvArgs) -> odx_rs::Result<()> {
+    use ndarray::Array3;
+    use nifti::{IntoNdArray, NiftiObject, NiftiVolume, ReaderOptions};
+
+    if !args.odx.exists() {
+        return Err(OdxError::Format(format!(
+            "ODX '{}' does not exist",
+            args.odx.display()
+        )));
+    }
+    if !args.nifti.exists() {
+        return Err(OdxError::Format(format!(
+            "NIfTI '{}' does not exist",
+            args.nifti.display()
+        )));
+    }
+
+    let obj = ReaderOptions::new()
+        .read_file(&args.nifti)
+        .map_err(|e| OdxError::Format(format!("read NIfTI '{}': {e}", args.nifti.display())))?;
+    let header = obj.header().clone();
+    let volume = obj.into_volume();
+
+    // Read the affine that downstream tools resolve to (sform if active,
+    // else qform, else identity); we explicitly want the same priority
+    // here as nibabel / FSLeyes use.
+    let affine_mat = header.affine::<f64>();
+    let mut vol_affine = [[0.0f64; 4]; 4];
+    for r in 0..4 {
+        for c in 0..4 {
+            vol_affine[r][c] = affine_mat[(r, c)];
+        }
+    }
+
+    let dim = volume.dim();
+    if dim.len() < 3 {
+        return Err(OdxError::Format(format!(
+            "NIfTI '{}' has only {} dimensions; need at least 3",
+            args.nifti.display(),
+            dim.len()
+        )));
+    }
+    let nx = dim[0] as usize;
+    let ny = dim[1] as usize;
+    let nz = dim[2] as usize;
+
+    // Take the first 3-D volume (channel/time index 0 if present).
+    // Casts everything to f64 internally; nifti-rs handles scl_slope/inter.
+    let raw: Vec<f64> = volume
+        .into_ndarray::<f64>()
+        .map_err(|e| {
+            OdxError::Format(format!("decode NIfTI '{}' as f64: {e}", args.nifti.display()))
+        })?
+        .into_raw_vec_and_offset()
+        .0;
+    let expected_len = nx * ny * nz;
+    if raw.len() < expected_len {
+        return Err(OdxError::Format(format!(
+            "NIfTI volume '{}' has {} elements but the 3-D grid needs {}",
+            args.nifti.display(),
+            raw.len(),
+            expected_len
+        )));
+    }
+    // Slice off any trailing 4th+ dimensions (use volume[..., 0]). nifti-rs
+    // stores in Fortran order; into_ndarray returns it in F-order layout
+    // but with C-shape — slice index math respects the shape.
+    // Per nifti-rs docs the returned array uses the NIfTI's natural shape
+    // and ordering, so directly reshaping the first nx*ny*nz elements
+    // works for the 3-D case.
+    let mut vol3 = Array3::<f64>::zeros((nx, ny, nz));
+    // Fortran storage order (column-major): index linearises as
+    //   flat = i + j*nx + k*nx*ny
+    for k in 0..nz {
+        for j in 0..ny {
+            for i in 0..nx {
+                let flat = i + j * nx + k * nx * ny;
+                vol3[[i, j, k]] = raw[flat];
+            }
+        }
+    }
+
+    let report = odx_rs::attach_dpv_from_volume(
+        &args.odx,
+        &args.name,
+        vol3.view(),
+        vol_affine,
+        args.dtype,
+    )?;
+
+    if !args.quiet {
+        println!(
+            "attached dpv/{} ({}; {} voxels, {} nonzero{})",
+            report.name,
+            report.dtype.name(),
+            report.nb_voxels,
+            report.masked_in_count,
+            if report.clamped {
+                ", values clamped to dtype range"
+            } else {
+                ""
+            }
+        );
+    }
     Ok(())
 }
 

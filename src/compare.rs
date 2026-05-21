@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ndarray::{Array, IxDyn};
-use nifti::{writer::WriterOptions, NiftiHeader};
+use nifti::writer::WriterOptions;
 use serde::Serialize;
 
 use crate::dtype::DType;
@@ -680,7 +680,7 @@ fn write_voxel_scalar_nifti(
     let array = Array::from_shape_vec(IxDyn(dims), data.to_vec()).map_err(|err| {
         OdxError::Format(format!("failed to shape comparison NIfTI: {err}"))
     })?;
-    let header = make_nifti1_header(affine);
+    let header = crate::nifti_export::nifti_header_for_grid(*affine);
     WriterOptions::new(path)
         .reference_header(&header)
         .write_nifti(&array)
@@ -691,38 +691,4 @@ fn write_voxel_scalar_nifti(
             ))
         })?;
     Ok(())
-}
-
-fn make_nifti1_header(affine: &[[f64; 4]; 4]) -> NiftiHeader {
-    let voxel_sizes = [
-        (affine[0][0].powi(2) + affine[1][0].powi(2) + affine[2][0].powi(2)).sqrt(),
-        (affine[0][1].powi(2) + affine[1][1].powi(2) + affine[2][1].powi(2)).sqrt(),
-        (affine[0][2].powi(2) + affine[1][2].powi(2) + affine[2][2].powi(2)).sqrt(),
-    ];
-    let mut header = NiftiHeader::default();
-    header.sform_code = 1;
-    header.qform_code = 0;
-    header.pixdim[1] = voxel_sizes[0] as f32;
-    header.pixdim[2] = voxel_sizes[1] as f32;
-    header.pixdim[3] = voxel_sizes[2] as f32;
-    header.xyzt_units = 2;
-    header.srow_x = [
-        affine[0][0] as f32,
-        affine[0][1] as f32,
-        affine[0][2] as f32,
-        affine[0][3] as f32,
-    ];
-    header.srow_y = [
-        affine[1][0] as f32,
-        affine[1][1] as f32,
-        affine[1][2] as f32,
-        affine[1][3] as f32,
-    ];
-    header.srow_z = [
-        affine[2][0] as f32,
-        affine[2][1] as f32,
-        affine[2][2] as f32,
-        affine[2][3] as f32,
-    ];
-    header
 }
