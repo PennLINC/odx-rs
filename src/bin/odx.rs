@@ -17,8 +17,10 @@ use odx_rs::mrtrix::{
 };
 use odx_rs::pam::{self, PamWriteOptions};
 use odx_rs::{
-    compare_odx, compute_fixel_qc, write_qc_class_dpf, CompareOptions, CompareReport,
-    FixelQcOptions, FixelQcReport, OdxDataset, OdxError, OdxWritePolicy, ThresholdMode,
+    combine_odx, compare_odx, compute_fixel_qc, write_qc_class_dpf, CombineInput, CombineOptions,
+    CombineOutputs, CombineReport, CompareOptions, CompareReport, FixelQcOptions, FixelQcReport,
+    MaskCombine, NormalizeFod, OdxDataset, OdxError, OdxWritePolicy, PeakFinderConfig,
+    TemplateMethod, ThresholdMode,
 };
 
 #[derive(Parser, Debug)]
@@ -41,9 +43,29 @@ enum Command {
     Qc(QcArgs),
     /// Pairwise fixel comparison between two ODX files (matching, DPF diffs).
     Compare(CompareArgs),
+    /// Combine many template-space ODX into group fixels + per-subject angular
+    /// distance to each group fixel (the N-way generalization of `compare`).
+    ///
+    /// Builds a shared set of group fixels (`--method cluster` pools subject
+    /// directions; `--method mean-fod` peak-finds the mean FOD), matches every
+    /// subject onto them, and writes a group ODX whose `angle_deg` DPF is an
+    /// (n_fixels × n_subjects) matrix — ModelArray's per-scalar `values` shape —
+    /// plus a cohort CSV for ModelArrayIO/ModelArray.
+    Combine(CombineArgs),
     /// Convert a pyAFQ asymmetric ODF (`*_param-aodf_dwimap.nii.gz`) into ODX.
     /// Stores full-basis descoteaux07 SH and precomputes per-voxel asymmetric peaks.
     ImportAodf(ImportAodfArgs),
+    /// Spatially upsample an ODX onto a finer isotropic voxel grid.
+    ///
+    /// SH coefficients and DPV arrays are trilinearly interpolated (with
+    /// boundary renormalization so signal levels are preserved at mask edges).
+    /// Fixels are recomputed from the interpolated SH via peak finding.
+    /// DPF arrays other than `amplitude` are dropped — they cannot be remapped
+    /// to recomputed fixels. Dense ODF data is not supported.
+    ///
+    /// EXAMPLE — resample a 1.25 mm dataset to 1.0 mm:
+    ///   odx upsample subject_1p25mm.odx subject_1mm.odx --voxel-spacing 1.0
+    Upsample(UpsampleArgs),
     /// Apply an ANTs/ITK spatial transform to an ODX dataset (grid-resample
     /// SH/DPV, push or pull fixels).
     ///
@@ -219,6 +241,32 @@ struct TransformArgs {
 }
 
 #[derive(Args, Debug)]
+struct UpsampleArgs {
+    /// Source ODX (directory or `.odx` archive).
+    input: PathBuf,
+    /// Output ODX (directory or `.odx` archive).
+    output: PathBuf,
+    /// Target isotropic voxel spacing in mm.
+    #[arg(long = "voxel-spacing")]
+    voxel_spacing: f64,
+    /// Maximum peaks per voxel.
+    #[arg(long = "npeaks", default_value_t = 5)]
+    npeaks: usize,
+    /// Relative peak threshold (fraction of in-voxel maximum).
+    #[arg(long = "peak-threshold", default_value_t = 0.5)]
+    peak_threshold: f32,
+    /// Minimum angular separation between accepted peaks (degrees).
+    #[arg(long = "min-separation-angle", default_value_t = 25.0)]
+    min_separation_angle: f32,
+    #[arg(long = "odx-layout", value_enum, default_value = "directory")]
+    odx_layout: OdxLayoutArg,
+    #[arg(long)]
+    overwrite: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
 struct ImportAodfArgs {
     /// Path to the aodf NIfTI (e.g. `..._model-csd_param-aodf_dwimap.nii.gz`).
     input: PathBuf,
@@ -321,6 +369,12 @@ struct ConvertArgs {
     /// ingestion (e.g. cs-odf coeffs.odx).
     #[arg(long = "preserve-affine", hide = true)]
     preserve_affine: bool,
+    /// SH-image input only: also compute fixels (peaks) from the SH coefficients
+    /// and store them in the output ODX, so the archive carries the SH AND
+    /// fixels over the full nonzero-FOD mask (not just the supra-threshold
+    /// `fod2fixel` voxels). No-op if the dataset already has fixels.
+    #[arg(long = "peaks-from-sh")]
+    peaks_from_sh: bool,
 }
 
 #[derive(Args, Debug)]
@@ -404,6 +458,153 @@ struct CompareArgs {
     no_comparison_odx: bool,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args, Debug)]
+struct CombineArgs {
+    /// Input ODX files (all must share grid + affine). Repeatable positionally
+    /// or via `--input`.
+    #[arg(value_name = "ODX")]
+    inputs: Vec<PathBuf>,
+    /// Additional input ODX file (repeatable alternative to positionals).
+    #[arg(long = "input", action = clap::ArgAction::Append)]
+    input: Vec<PathBuf>,
+    /// How group fixels are built: `cluster` pools subject directions
+    /// (amplitude-agnostic); `mean-fod` peak-finds the mean FOD.
+    #[arg(long = "method", value_enum, default_value = "cluster")]
+    method: TemplateMethodArg,
+    /// Adopt this ODX's fixels/geometry as the template, skipping the build.
+    #[arg(long = "template")]
+    template: Option<PathBuf>,
+    /// Template voxel set: voxels covered by ≥1 input (`union`) or all (`intersection`).
+    #[arg(long = "mask-combine", value_enum, default_value = "union")]
+    mask_combine: MaskCombineArg,
+    /// Maximum angle (degrees) for matching a subject fixel to a group fixel.
+    #[arg(long = "match-angle-deg", default_value_t = 30.0)]
+    match_angle_deg: f32,
+    /// `mean-fod` only: per-subject FOD normalization applied before averaging.
+    #[arg(long = "normalize-fod", value_enum, default_value = "none")]
+    normalize_fod: NormalizeFodArg,
+    /// `mean-fod` peak finding: max peaks per voxel.
+    #[arg(long = "npeaks", default_value_t = 5)]
+    npeaks: usize,
+    /// `mean-fod` peak finding: relative peak threshold.
+    #[arg(long = "peak-threshold", default_value_t = 0.5)]
+    peak_threshold: f32,
+    /// `mean-fod` peak finding: minimum peak separation (degrees).
+    #[arg(long = "min-separation-angle", default_value_t = 25.0)]
+    min_separation_angle: f32,
+    /// `cluster` only: drop group fixels supported by fewer than N subjects.
+    #[arg(long = "min-subjects", default_value_t = 2)]
+    min_subjects: usize,
+    /// Restrict carried scalars to these DPF names (default: all shared scalars).
+    #[arg(long = "scalar", action = clap::ArgAction::Append)]
+    scalar: Vec<String>,
+    /// Design table (TSV/CSV) of categorical covariates, joined per input.
+    #[arg(long = "design")]
+    design: Option<PathBuf>,
+    /// Column in the design table identifying each input (default: tries
+    /// path/bids_name/source_file/key/id).
+    #[arg(long = "design-key-column")]
+    design_key_column: Option<String>,
+    /// How each input's subject key (DPF column / cohort row) is derived.
+    #[arg(long = "input-key", value_enum, default_value = "stem")]
+    input_key: InputKeyArg,
+    /// Method comparison: require a method-independent external scaffold
+    /// (`--template`), erroring if `cluster`/`mean-fod` would build the grid
+    /// from the contestants (circular).
+    #[arg(long = "require-external-template")]
+    require_external_template: bool,
+    /// Design column that labels each input's processing method (enables
+    /// `n_methods_detecting` and `--reference-method`).
+    #[arg(long = "method-column")]
+    method_column: Option<String>,
+    /// Mark scans whose `--method-column` value equals this as the reference
+    /// cohort (defines `scaffold_support`). E.g. `--method-column scheme
+    /// --reference-method abcd`.
+    #[arg(long = "reference-method")]
+    reference_method: Option<String>,
+    /// Text file of reference-cohort inputs (one key or path per line) marked
+    /// `is_reference`; combined with `--reference-method` if both are given.
+    #[arg(long = "reference-cohort")]
+    reference_cohort: Option<PathBuf>,
+    /// Extra match-angle thresholds (comma-separated degrees) for the
+    /// `matched_at_<deg>` detection-sweep planes, e.g. `15,20,25,30,35,45`.
+    #[arg(long = "match-angle-sweep")]
+    match_angle_sweep: Option<String>,
+    /// Group ODX output (multi-column per-subject DPF + summary DPF).
+    #[arg(long = "out-odx")]
+    out_odx: Option<PathBuf>,
+    /// ModelArrayIO/ModelArray cohort CSV (doubles as the phenotype table).
+    #[arg(long = "out-cohort")]
+    out_cohort: Option<PathBuf>,
+    /// Group mask NIfTI output.
+    #[arg(long = "out-mask")]
+    out_mask: Option<PathBuf>,
+    /// Also emit one template-space ODX per subject into this directory.
+    #[arg(long = "per-subject-odx")]
+    per_subject_odx: Option<PathBuf>,
+    /// Optional tidy long table (`.csv`/`.tsv`), one row per (group fixel × subject).
+    #[arg(long = "out-table")]
+    out_table: Option<PathBuf>,
+    /// Optional directory for per-voxel summary NIfTIs.
+    #[arg(long = "out-dir")]
+    out_dir: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum TemplateMethodArg {
+    Cluster,
+    MeanFod,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum NormalizeFodArg {
+    None,
+    L0,
+    Integral,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum MaskCombineArg {
+    Union,
+    Intersection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum InputKeyArg {
+    Stem,
+    Path,
+}
+
+impl From<TemplateMethodArg> for TemplateMethod {
+    fn from(v: TemplateMethodArg) -> Self {
+        match v {
+            TemplateMethodArg::Cluster => TemplateMethod::Cluster,
+            TemplateMethodArg::MeanFod => TemplateMethod::MeanFod,
+        }
+    }
+}
+
+impl From<NormalizeFodArg> for NormalizeFod {
+    fn from(v: NormalizeFodArg) -> Self {
+        match v {
+            NormalizeFodArg::None => NormalizeFod::None,
+            NormalizeFodArg::L0 => NormalizeFod::L0,
+            NormalizeFodArg::Integral => NormalizeFod::Integral,
+        }
+    }
+}
+
+impl From<MaskCombineArg> for MaskCombine {
+    fn from(v: MaskCombineArg) -> Self {
+        match v {
+            MaskCombineArg::Union => MaskCombine::Union,
+            MaskCombineArg::Intersection => MaskCombine::Intersection,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -549,7 +750,9 @@ fn run(cli: Cli) -> odx_rs::Result<()> {
         Command::Validate(args) => run_validate(args),
         Command::Qc(args) => run_qc(args),
         Command::Compare(args) => run_compare(args),
+        Command::Combine(args) => run_combine(args),
         Command::ImportAodf(args) => run_import_aodf(args),
+        Command::Upsample(args) => run_upsample(args),
         Command::Transform(args) => run_transform(args),
         Command::AttachDpv(args) => run_attach_dpv(args),
         Command::Completions { shell } => {
@@ -790,6 +993,341 @@ fn render_compare_report(report: &CompareReport) -> String {
     out
 }
 
+fn run_combine(args: CombineArgs) -> odx_rs::Result<()> {
+    let mut paths: Vec<PathBuf> = args.inputs.clone();
+    paths.extend(args.input.iter().cloned());
+    if paths.is_empty() {
+        return Err(OdxError::Argument(
+            "combine requires at least one input ODX (positional or --input)".into(),
+        ));
+    }
+    if let Some(t) = args.out_table.as_ref() {
+        if t.extension().and_then(|e| e.to_str()) == Some("parquet") {
+            return Err(OdxError::Argument(
+                "parquet --out-table is not supported yet; use a .csv or .tsv path".into(),
+            ));
+        }
+    }
+    if args.require_external_template && args.template.is_none() {
+        return Err(OdxError::Argument(
+            "--require-external-template needs --template <reference.odx>: for method \
+             comparison the scaffold must be method-independent; cluster/mean-fod would \
+             build it from the contestants (circular)."
+                .into(),
+        ));
+    }
+    if args.out_cohort.is_some() && args.per_subject_odx.is_none() {
+        return Err(OdxError::Argument(
+            "--out-cohort requires --per-subject-odx <DIR>: cohort rows must point at \
+             single-column per-subject ODX files; the group ODX stores per-scan scalars \
+             multi-column (carried scalars under a subj_ prefix), which the ModelArrayIO \
+             odx loader rejects."
+                .into(),
+        ));
+    }
+    if args.reference_method.is_some() && args.method_column.is_none() {
+        return Err(OdxError::Argument(
+            "--reference-method requires --method-column to identify each scan's method".into(),
+        ));
+    }
+    let match_angle_sweep: Vec<f32> = match args.match_angle_sweep.as_deref() {
+        Some(s) => s
+            .split(',')
+            .map(|x| x.trim())
+            .filter(|x| !x.is_empty())
+            .map(|x| {
+                x.parse::<f32>()
+                    .map_err(|e| OdxError::Argument(format!("bad --match-angle-sweep value '{x}': {e}")))
+            })
+            .collect::<odx_rs::Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    let reference_keys: std::collections::BTreeSet<String> = match args.reference_cohort.as_ref() {
+        Some(p) => std::fs::read_to_string(p)
+            .map_err(|e| OdxError::Format(format!("read --reference-cohort '{}': {e}", p.display())))?
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        None => std::collections::BTreeSet::new(),
+    };
+
+    let design = match args.design.as_ref() {
+        Some(p) => Some(parse_design_table(p, args.design_key_column.as_deref())?),
+        None => None,
+    };
+
+    let mut inputs = Vec::with_capacity(paths.len());
+    for p in &paths {
+        let key = derive_input_key(p, args.input_key);
+        let categorical = categorical_for(p, &key, design.as_ref())?;
+        let method = args.method_column.as_ref().and_then(|col| {
+            categorical.iter().find(|(k, _)| k == col).map(|(_, v)| v.clone())
+        });
+        let path_str = p.to_string_lossy().to_string();
+        let is_reference = reference_keys.contains(&key)
+            || reference_keys.contains(&path_str)
+            || (args.reference_method.is_some()
+                && method.as_deref() == args.reference_method.as_deref());
+        inputs.push(CombineInput {
+            path: p.clone(),
+            key,
+            categorical,
+            is_reference,
+            method,
+        });
+    }
+    // Subject keys are the DPF column / cohort-row identity and the per-subject
+    // ODX filename, so they must be unique (e.g. method encoded by directory
+    // collides under the default --input-key stem; use --input-key path).
+    {
+        let mut seen: std::collections::HashMap<&str, &Path> = std::collections::HashMap::new();
+        for inp in &inputs {
+            if let Some(prev) = seen.insert(inp.key.as_str(), inp.path.as_path()) {
+                return Err(OdxError::Argument(format!(
+                    "duplicate input key '{}' ('{}' and '{}'); keys must be unique — try --input-key path",
+                    inp.key,
+                    prev.display(),
+                    inp.path.display()
+                )));
+            }
+        }
+    }
+
+    let opts = CombineOptions {
+        method: args.method.into(),
+        template_override: args.template.clone(),
+        mask_combine: args.mask_combine.into(),
+        match_angle_deg: args.match_angle_deg,
+        peak_config: PeakFinderConfig {
+            npeaks: args.npeaks,
+            relative_peak_threshold: args.peak_threshold,
+            min_separation_angle_deg: args.min_separation_angle,
+        },
+        normalize_fod: args.normalize_fod.into(),
+        min_subjects_per_group_fixel: args.min_subjects,
+        matched_scalars: if args.scalar.is_empty() {
+            None
+        } else {
+            Some(args.scalar.clone())
+        },
+        match_angle_sweep,
+    };
+
+    let outputs = CombineOutputs {
+        out_odx: args.out_odx.clone(),
+        out_cohort: args.out_cohort.clone(),
+        out_mask: args.out_mask.clone(),
+        per_subject_odx_dir: args.per_subject_odx.clone(),
+        out_table: args.out_table.clone(),
+        out_dir: args.out_dir.clone(),
+    };
+
+    let report = combine_odx(&inputs, &opts, &outputs)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_combine_report(&report));
+    }
+    Ok(())
+}
+
+fn render_combine_report(r: &CombineReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("method: {}\n", r.method));
+    out.push_str(&format!("inputs: {}\n", r.n_inputs));
+    out.push_str(&format!("mask_combine: {}\n", r.mask_combine));
+    out.push_str(&format!("match_angle_deg: {:.3}\n", r.match_angle_deg));
+    if r.normalize_fod != "none" {
+        out.push_str(&format!("normalize_fod: {}\n", r.normalize_fod));
+    }
+    out.push_str(&format!("dims: {:?}\n", r.dims));
+    out.push_str(&format!(
+        "template: {} voxels, {} fixels\n",
+        r.n_template_voxels, r.n_template_fixels
+    ));
+    out.push_str(&format!(
+        "mean_subjects_per_fixel: {:.3}\n",
+        r.mean_subjects_per_fixel
+    ));
+    out.push_str(&format!(
+        "mean_angle_deg: {}\n",
+        render_optional_f64(r.mean_angle_deg)
+    ));
+    out.push_str(&format!(
+        "reference_scans: {}, mean_unmatched_per_scan: {:.2}\n",
+        r.n_reference_scans, r.mean_unmatched_per_scan
+    ));
+    out.push_str(&format!(
+        "matched_scalars: {}\n",
+        if r.matched_scalar_keys.is_empty() {
+            "none".to_string()
+        } else {
+            r.matched_scalar_keys.join(", ")
+        }
+    ));
+    out.push_str(&format!(
+        "design_columns: {}\n",
+        if r.design_columns.is_empty() {
+            "none".to_string()
+        } else {
+            r.design_columns.join(", ")
+        }
+    ));
+    out.push_str(&format!("written: {} files\n", r.written_paths.len()));
+    out
+}
+
+/// A parsed design/participants table (TSV/CSV): header columns, the key column
+/// used to match inputs, and the data rows.
+struct DesignTable {
+    columns: Vec<String>,
+    key_idx: usize,
+    rows: Vec<Vec<String>>,
+}
+
+fn parse_design_table(path: &Path, key_col: Option<&str>) -> odx_rs::Result<DesignTable> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| OdxError::Format(format!("read design table '{}': {e}", path.display())))?;
+    let sep = if path.extension().and_then(|e| e.to_str()) == Some("tsv") {
+        '\t'
+    } else {
+        ','
+    };
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| OdxError::Argument("design table is empty".into()))?;
+    let columns = split_delim(header, sep);
+    let key_idx = match key_col {
+        Some(name) => columns
+            .iter()
+            .position(|c| c == name)
+            .ok_or_else(|| OdxError::Argument(format!("design key column '{name}' not found")))?,
+        None => ["path", "bids_name", "source_file", "key", "id"]
+            .iter()
+            .find_map(|cand| columns.iter().position(|c| c == cand))
+            .ok_or_else(|| {
+                OdxError::Argument(
+                    "design table has no recognizable key column; pass --design-key-column".into(),
+                )
+            })?,
+    };
+    let rows = lines
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| split_delim(l, sep))
+        .collect();
+    Ok(DesignTable {
+        columns,
+        key_idx,
+        rows,
+    })
+}
+
+/// Categorical covariates for one input: joined design row (all non-key
+/// columns) if a design table is present, else BIDS entities from the filename.
+fn categorical_for(
+    path: &Path,
+    key: &str,
+    design: Option<&DesignTable>,
+) -> odx_rs::Result<Vec<(String, String)>> {
+    match design {
+        Some(table) => {
+            let row = design_row_for(table, path, key).ok_or_else(|| {
+                OdxError::Argument(format!(
+                    "no design row matches input '{}' (key '{}')",
+                    path.display(),
+                    key
+                ))
+            })?;
+            Ok(table
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != table.key_idx)
+                .map(|(i, c)| (c.clone(), row.get(i).cloned().unwrap_or_default()))
+                .collect())
+        }
+        None => Ok(bids_entities(path)),
+    }
+}
+
+fn design_row_for<'a>(
+    table: &'a DesignTable,
+    path: &Path,
+    key: &str,
+) -> Option<&'a Vec<String>> {
+    let full = path.to_string_lossy();
+    let fname = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    table.rows.iter().find(|row| {
+        let cell = row.get(table.key_idx).map(|s| s.as_str()).unwrap_or("");
+        cell == full
+            || cell == fname
+            || cell == key
+            || Path::new(cell)
+                .file_stem()
+                .map(|s| s.to_string_lossy() == key)
+                .unwrap_or(false)
+    })
+}
+
+fn derive_input_key(path: &Path, mode: InputKeyArg) -> String {
+    match mode {
+        InputKeyArg::Stem => path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string()),
+        InputKeyArg::Path => path.to_string_lossy().to_string(),
+    }
+}
+
+/// Parse `sub-01_ses-1_acq-abcd_...` style BIDS entities from a filename stem.
+fn bids_entities(path: &Path) -> Vec<(String, String)> {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    stem.split('_')
+        .filter_map(|tok| {
+            tok.find('-')
+                .map(|idx| (tok[..idx].to_string(), tok[idx + 1..].to_string()))
+        })
+        .collect()
+}
+
+/// Split one delimited line, honoring RFC4180-style double-quoted fields.
+fn split_delim(line: &str, sep: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    cur.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                cur.push(c);
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == sep {
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    out.push(cur);
+    out
+}
+
 fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
     let output_format = resolve_output_format(&args.output, args.output_format)?;
 
@@ -814,6 +1352,15 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
         args.input_format,
         args.preserve_affine,
     )?;
+
+    // --peaks-from-sh: derive fixels from the SH coefficients (broad FOD mask)
+    // so an SH-image conversion produces a self-contained, compare-able archive.
+    // No-op if the dataset already carries fixels.
+    let odx = if args.peaks_from_sh && odx.nb_peaks() == 0 {
+        odx_rs::mrtrix::dataset_with_peaks_from_sh(&odx, odx_rs::PeakFinderConfig::default())?
+    } else {
+        odx
+    };
 
     let quant_policy = OdxWritePolicy {
         quantize_dense: args.quantize_dense,
@@ -1152,6 +1699,55 @@ fn run_transform(args: TransformArgs) -> odx_rs::Result<()> {
             args.output.display(),
             out.header().nb_voxels,
             out.header().nb_peaks,
+        );
+    }
+    Ok(())
+}
+
+fn run_upsample(args: UpsampleArgs) -> odx_rs::Result<()> {
+    use odx_rs::{upsample, UpsampleOptions};
+    use odx_rs::PeakFinderConfig;
+
+    ensure_output_path(&args.output, args.overwrite)?;
+    let input = OdxDataset::load(&args.input)?;
+
+    let opts = UpsampleOptions {
+        peak_config: PeakFinderConfig {
+            npeaks: args.npeaks,
+            relative_peak_threshold: args.peak_threshold,
+            min_separation_angle_deg: args.min_separation_angle,
+        },
+    };
+
+    let out = upsample(&input, args.voxel_spacing, &opts)?;
+
+    let policy = OdxWritePolicy::default();
+    match args.odx_layout {
+        OdxLayoutArg::Directory => out.save_directory_with_policy(&args.output, policy)?,
+        OdxLayoutArg::Archive => out.save_archive_with_policy(&args.output, policy)?,
+    }
+
+    if args.json {
+        let summary = serde_json::json!({
+            "output": args.output.display().to_string(),
+            "voxel_spacing_mm": args.voxel_spacing,
+            "input_dims": input.header().dimensions,
+            "input_nb_voxels": input.header().nb_voxels,
+            "input_nb_peaks": input.header().nb_peaks,
+            "output_dims": out.header().dimensions,
+            "output_nb_voxels": out.header().nb_voxels,
+            "output_nb_peaks": out.header().nb_peaks,
+        });
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "wrote {} ({}→{} voxels, {} peaks; dims {:?}→{:?})",
+            args.output.display(),
+            input.header().nb_voxels,
+            out.header().nb_voxels,
+            out.header().nb_peaks,
+            input.header().dimensions,
+            out.header().dimensions,
         );
     }
     Ok(())

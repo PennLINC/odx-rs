@@ -18,6 +18,7 @@ use numpy::{
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use serde_json::Value;
 
 use odx_rs::densify::{
     densify_directions, densify_odf, densify_scalar_dpf, densify_scalar_dpv, densify_sh,
@@ -44,6 +45,74 @@ fn map_err<E: std::fmt::Display>(e: E) -> PyErr {
 
 fn map_io<E: std::fmt::Display>(e: E) -> PyErr {
     PyIOError::new_err(format!("{e}"))
+}
+
+/// Recursively convert a `serde_json::Value` to a native Python object.
+fn json_to_py(py: Python<'_>, v: &Value) -> PyObject {
+    match v {
+        Value::Null => py.None(),
+        Value::Bool(b) => b.into_py(py),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.into_py(py)
+            } else if let Some(u) = n.as_u64() {
+                u.into_py(py)
+            } else {
+                n.as_f64().unwrap_or(f64::NAN).into_py(py)
+            }
+        }
+        Value::String(s) => s.into_py(py),
+        Value::Array(a) => {
+            let list = PyList::empty_bound(py);
+            for item in a {
+                let _ = list.append(json_to_py(py, item));
+            }
+            list.into_py(py)
+        }
+        Value::Object(o) => {
+            let d = PyDict::new_bound(py);
+            for (k, val) in o {
+                let _ = d.set_item(k, json_to_py(py, val));
+            }
+            d.into_py(py)
+        }
+    }
+}
+
+/// Recursively convert a native Python object to a `serde_json::Value`.
+fn py_to_json(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if obj.is_none() {
+        return Ok(Value::Null);
+    }
+    if let Ok(b) = obj.extract::<bool>() {
+        return Ok(Value::Bool(b));
+    }
+    if let Ok(i) = obj.extract::<i64>() {
+        return Ok(Value::from(i));
+    }
+    if let Ok(f) = obj.extract::<f64>() {
+        return Ok(Value::from(f));
+    }
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(Value::String(s));
+    }
+    if let Ok(list) = obj.downcast::<PyList>() {
+        let mut arr = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            arr.push(py_to_json(&item)?);
+        }
+        return Ok(Value::Array(arr));
+    }
+    if let Ok(dict) = obj.downcast::<PyDict>() {
+        let mut map = serde_json::Map::new();
+        for (k, v) in dict.iter() {
+            map.insert(k.extract::<String>()?, py_to_json(&v)?);
+        }
+        return Ok(Value::Object(map));
+    }
+    Err(PyValueError::new_err(
+        "set_metadata: values must be JSON-compatible (None/bool/int/float/str/list/dict)",
+    ))
 }
 
 // ─── PeakFinderConfig ────────────────────────────────────────────────────────
@@ -326,6 +395,18 @@ impl PyOdx {
             d.set_item("basis_assumed", s.as_str()).ok()?;
         }
         Some(d)
+    }
+
+    /// Free-form header metadata (the ODX `extra` JSON map) as a Python dict.
+    /// `odx combine` stashes the ordered subject keys + joined design here under
+    /// the `"combine"` key, so a converter can map DPF columns → subjects.
+    #[getter]
+    fn metadata<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+        let d = PyDict::new_bound(py);
+        for (k, v) in &self.inner.header().extra {
+            let _ = d.set_item(k, json_to_py(py, v));
+        }
+        d
     }
 
     /// Return the canonical dipy basis name (`"tournier07" | "descoteaux07" |
@@ -853,6 +934,17 @@ impl PyOdxBuilder {
             ang_thr,
             basis_assumed,
         });
+        Ok(())
+    }
+
+    /// Merge a dict of free-form metadata into the header `extra` JSON map.
+    /// Values must be JSON-compatible (None/bool/int/float/str/list/dict).
+    fn set_metadata(&mut self, metadata: Bound<'_, PyDict>) -> PyResult<()> {
+        let builder = self.require()?;
+        for (k, v) in metadata.iter() {
+            let key: String = k.extract()?;
+            builder.set_extra_value(key, py_to_json(&v)?);
+        }
         Ok(())
     }
 

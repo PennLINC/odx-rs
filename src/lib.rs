@@ -1,10 +1,12 @@
 #[doc(hidden)]
 pub mod cli_support;
+pub mod combine;
 pub mod compare;
 pub mod data_array;
 pub mod descoteaux_sh;
 pub mod dtype;
 pub mod error;
+pub(crate) mod fixel_match;
 pub mod formats;
 pub mod header;
 pub mod interop;
@@ -28,6 +30,10 @@ pub mod validate;
 pub use data_array::{DataArray, DataArrayInfo};
 pub use dtype::{DType, OdxScalar};
 pub use error::{OdxError, Result};
+pub use combine::{
+    combine_odx, CombineInput, CombineOptions, CombineOutputs, CombineReport, MaskCombine,
+    NormalizeFod, TemplateMethod,
+};
 pub use compare::{compare_odx, CompareOptions, CompareReport};
 pub use formats::dsistudio;
 pub use formats::mif;
@@ -62,3 +68,4 @@ pub use validate::{
 pub use transform::{
     apply_transform, apply_transform_h5, TransformMode, TransformOptions,
 };
+pub use transform::upsample::{upsample, UpsampleOptions};

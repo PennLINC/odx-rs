@@ -14,6 +14,7 @@ use crate::formats::mif;
 use crate::header::{CanonicalDenseRepresentation, Header};
 use crate::mmap_backing::{vec_into_bytes, MmapBacking};
 use crate::odx_file::OdxParts;
+use crate::peak_finder::PeakFinderConfig;
 use crate::stream::OdxBuilder;
 use crate::OdxDataset;
 
@@ -452,6 +453,47 @@ fn build_sh_only_dataset(sh: LoadedF32Image) -> Result<OdxDataset> {
         dpg: HashMap::new(),
         tempdir: None,
     }))
+}
+
+/// Compute fixels (peaks) from an SH-only dataset and return a dataset carrying
+/// BOTH the SH coefficients and the derived fixels (directions/offsets +
+/// `dpf/amplitude`) over the same (broad, nonzero-FOD) SH mask. This wires the
+/// existing `OdxBuilder::compute_peaks` peak finder into the MRtrix-SH → ODX
+/// path, so `odx convert --input-format mrtrix-sh-image --peaks-from-sh` yields
+/// a self-contained, `compare`-able archive over the full FOD mask rather than
+/// only the supra-threshold `fod2fixel` voxels. Intended for a dataset that has
+/// `sh/coefficients` and no fixels (callers should guard on `nb_peaks() == 0`).
+pub fn dataset_with_peaks_from_sh(
+    odx: &OdxDataset,
+    config: PeakFinderConfig,
+) -> Result<OdxDataset> {
+    let header = odx.header();
+    let order = header
+        .sh_order
+        .ok_or_else(|| OdxError::Argument("peaks-from-sh: dataset has no sh_order".into()))?;
+    let basis = header
+        .sh_basis
+        .clone()
+        .ok_or_else(|| OdxError::Argument("peaks-from-sh: dataset has no sh_basis".into()))?;
+    // Flatten the stored SH rows (already in masked-voxel order) for the builder.
+    let sh_view = odx.sh::<f32>("coefficients")?;
+    let (nrows, ncoeffs) = (sh_view.nrows(), sh_view.ncols());
+    let mut sh_f32 = Vec::with_capacity(nrows * ncoeffs);
+    for r in 0..nrows {
+        sh_f32.extend_from_slice(sh_view.row(r));
+    }
+    let mut builder =
+        OdxBuilder::new(header.voxel_to_rasmm, header.dimensions, odx.mask().to_vec());
+    builder.set_sh_info(order, basis);
+    if let Some(full) = header.sh_full_basis {
+        builder.set_sh_full_basis(full);
+    }
+    if let Some(legacy) = header.sh_legacy {
+        builder.set_sh_legacy(legacy);
+    }
+    builder.set_sh_data("coefficients", vec_into_bytes(sh_f32), ncoeffs, DType::Float32);
+    builder.compute_peaks(None, config)?;
+    builder.finalize()
 }
 
 fn build_fixels_dataset(fixels: CanonicalFixels, sh: Option<LoadedF32Image>) -> Result<OdxDataset> {
@@ -1712,6 +1754,40 @@ mod tests {
         // Single ℓ=2 coefficient: AP = max(0, ln(1/5) − ln(1e-5)).
         let expected = (0.2_f64.ln() - 1e-5_f64.ln()) as f32;
         assert!((anisotropic_power.row(1)[0] - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn peaks_from_sh_adds_fixels_and_preserves_sh() {
+        // voxel 0: prolate FOD along z (c0 + positive ℓ=2,m=0) -> one clear peak;
+        // voxel 1: isotropic (ℓ=0 only) -> no anisotropic peak.
+        let dims = vec![2usize, 1, 1, 6];
+        let affine = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let sh = LoadedF32Image {
+            dims,
+            affine,
+            data: vec![
+                2.0, 0.0, 0.0, 1.0, 0.0, 0.0, // prolate along z
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, // isotropic
+            ],
+        };
+        let sh_only = build_sh_only_dataset(sh).unwrap();
+        assert_eq!(sh_only.nb_peaks(), 0);
+
+        let with_peaks =
+            dataset_with_peaks_from_sh(&sh_only, PeakFinderConfig::default()).unwrap();
+        // SH coefficients + mask preserved over the same (broad) FOD mask.
+        assert_eq!(with_peaks.mask(), sh_only.mask());
+        assert_eq!(with_peaks.nb_voxels(), 2);
+        let coeffs = with_peaks.sh::<f32>("coefficients").unwrap();
+        assert_eq!(coeffs.nrows(), 2);
+        assert_eq!(coeffs.row(0), &[2.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        // Fixels were derived from the SH (the prolate voxel yields >=1 peak).
+        assert!(with_peaks.nb_peaks() >= 1);
     }
 
     #[test]

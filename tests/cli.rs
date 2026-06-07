@@ -85,6 +85,114 @@ fn create_no_primary_metric_odx_dir(path: &Path) {
     builder.finalize().unwrap().save_directory(path).unwrap();
 }
 
+fn create_combine_input(path: &Path, dir: [f32; 3]) {
+    let dims = [1u64, 1, 1];
+    let mut builder = OdxBuilder::new(Header::identity_affine(), dims, vec![1u8]);
+    builder.push_voxel_peaks(&[dir]);
+    builder.set_dpf_data(
+        "amplitude",
+        bytemuck::cast_slice(&[1.0f32]).to_vec(),
+        1,
+        DType::Float32,
+    );
+    builder.finalize().unwrap().save_directory(path).unwrap();
+}
+
+#[test]
+fn combine_help_lists_methods_and_flags() {
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args(["combine", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("--method")
+                .and(predicate::str::contains("cluster"))
+                .and(predicate::str::contains("mean-fod"))
+                .and(predicate::str::contains("--out-cohort")),
+        );
+}
+
+#[test]
+fn combine_runs_and_writes_group_odx_and_cohort() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = tmp.path().join("a.odx");
+    let b = tmp.path().join("b.odx");
+    let c = tmp.path().join("c.odx");
+    create_combine_input(&a, [0.0, 0.0, 1.0]);
+    create_combine_input(&b, [0.0, 0.0, 1.0]);
+    create_combine_input(&c, [0.0, 0.087_16, 0.996_19]); // ~5° off +z
+    let out_odx = tmp.path().join("group.odx");
+    let cohort = tmp.path().join("cohort.csv");
+    let persubj = tmp.path().join("persubj");
+
+    // --out-cohort requires --per-subject-odx (cohort rows point at single-column
+    // per-subject ODX files, which the ModelArrayIO odx loader consumes).
+    Command::cargo_bin("odx")
+        .unwrap()
+        .arg("combine")
+        .arg(&a)
+        .arg(&b)
+        .arg(&c)
+        .args(["--method", "cluster", "--min-subjects", "2", "--out-odx"])
+        .arg(&out_odx)
+        .arg("--out-cohort")
+        .arg(&cohort)
+        .arg("--per-subject-odx")
+        .arg(&persubj)
+        .assert()
+        .success();
+
+    assert!(out_odx.exists());
+    let ds = OdxDataset::open(&out_odx).unwrap();
+    assert_eq!(ds.nb_peaks(), 1);
+    // angle_deg is an (n_fixels × n_subjects) matrix — ModelArray's `values` shape
+    assert_eq!(ds.get_dpf("angle_deg").unwrap().ncols(), 3);
+
+    let text = fs::read_to_string(&cohort).unwrap();
+    assert!(text
+        .lines()
+        .next()
+        .unwrap()
+        .starts_with("scalar_name,source_file"));
+    assert!(text.contains("angle_deg"));
+}
+
+#[test]
+fn combine_method_comparison_guards() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = tmp.path().join("a.odx");
+    let b = tmp.path().join("b.odx");
+    create_combine_input(&a, [0.0, 0.0, 1.0]);
+    create_combine_input(&b, [0.0, 0.0, 1.0]);
+
+    // --out-cohort without --per-subject-odx is rejected
+    Command::cargo_bin("odx")
+        .unwrap()
+        .arg("combine")
+        .arg(&a)
+        .arg(&b)
+        .arg("--out-cohort")
+        .arg(tmp.path().join("c.csv"))
+        .arg("--out-odx")
+        .arg(tmp.path().join("g.odx"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("per-subject-odx"));
+
+    // --reference-method without --method-column is rejected
+    Command::cargo_bin("odx")
+        .unwrap()
+        .arg("combine")
+        .arg(&a)
+        .arg(&b)
+        .args(["--reference-method", "abcd", "--out-odx"])
+        .arg(tmp.path().join("g2.odx"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("method-column"));
+}
+
 #[test]
 fn cli_help_prints_top_level_usage() {
     Command::cargo_bin("odx")

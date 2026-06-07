@@ -190,7 +190,12 @@ impl SpherePeakFinder {
             let d2_dt2 = daz_dir * daz_dir * d2_daz2
                 + 2.0 * daz_dir * del_dir * d2_deldaz
                 + del_dir * del_dir * d2_del2;
-            let mut dt = if d2_dt2 != 0.0 { -dsh_dt / d2_dt2 } else { 0.0 };
+            // Degenerate Hessian (d²/dt² == 0): step the full MAX_DIR_CHANGE to
+            // walk off the inflection point. A zero step here trips the
+            // ANGLE_TOLERANCE early-return below and would falsely report
+            // convergence at a non-maximum. Matches MRtrix `Math::SH::get_peak`
+            // (MRtrix3 PR #3299).
+            let mut dt = if d2_dt2 != 0.0 { -dsh_dt / d2_dt2 } else { MAX_DIR_CHANGE };
 
             if dt < 0.0 {
                 dt = -dt;

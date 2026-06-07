@@ -20,6 +20,7 @@ use serde::Serialize;
 
 use crate::dtype::DType;
 use crate::error::{OdxError, Result};
+use crate::fixel_match::{abs_dot, affine_close, build_voxel_lookup};
 use crate::mmap_backing::vec_into_bytes;
 use crate::odx_file::OdxDataset;
 use crate::qc::{compute_fixel_qc, FixelQcClass, FixelQcOptions, ThresholdMode, QC_CLASS_DPF_NAME};
@@ -607,44 +608,6 @@ pub fn compare_odx(
     })
 }
 
-struct VoxelLookup {
-    flat_to_compact: Vec<usize>,
-}
-
-fn build_voxel_lookup(mask: &[u8], dims: [u64; 3], offsets: &[u32]) -> Result<VoxelLookup> {
-    let total = (dims[0] as usize) * (dims[1] as usize) * (dims[2] as usize);
-    if mask.len() != total {
-        return Err(OdxError::Format(format!(
-            "mask len {} != product of dims {}",
-            mask.len(),
-            total
-        )));
-    }
-    let mut flat_to_compact = vec![usize::MAX; total];
-    let yz = (dims[1] as usize) * (dims[2] as usize);
-    let z = dims[2] as usize;
-    let mut compact = 0usize;
-    for i in 0..dims[0] as usize {
-        for j in 0..dims[1] as usize {
-            for k in 0..dims[2] as usize {
-                let flat = i * yz + j * z + k;
-                if mask[flat] != 0 {
-                    flat_to_compact[flat] = compact;
-                    compact += 1;
-                }
-            }
-        }
-    }
-    if compact + 1 != offsets.len() {
-        return Err(OdxError::Format(format!(
-            "mask voxel count {} differs from offsets-1 {}",
-            compact,
-            offsets.len() - 1
-        )));
-    }
-    Ok(VoxelLookup { flat_to_compact })
-}
-
 fn compact_volume_to_dpv(vol: &[f32], mask: &[u8]) -> Vec<f32> {
     let n = mask.iter().filter(|&&v| v != 0).count();
     let mut out = Vec::with_capacity(n);
@@ -654,21 +617,6 @@ fn compact_volume_to_dpv(vol: &[f32], mask: &[u8]) -> Vec<f32> {
         }
     }
     out
-}
-
-fn affine_close(a: &[[f64; 4]; 4], b: &[[f64; 4]; 4], tol: f64) -> bool {
-    for r in 0..4 {
-        for c in 0..4 {
-            if (a[r][c] - b[r][c]).abs() > tol {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn abs_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).abs()
 }
 
 fn write_voxel_scalar_nifti(

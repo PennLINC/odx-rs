@@ -18,6 +18,7 @@
 mod resample;
 mod sh_apsf;
 mod source_volume;
+pub mod upsample;
 
 pub use resample::TransformOptions;
 
