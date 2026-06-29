@@ -11,7 +11,7 @@ members = [".", "python"]
 # release workflow has a verify-version step that fails if the tag and
 # this value disagree.
 [workspace.package]
-version = "0.1.1"
+version = "0.1.3"
 edition = "2021"
 # Bulk of the crate is dual MIT OR Apache-2.0 (the typical Rust ecosystem
 # license). Two files (src/peak_finder.rs, src/mrtrix_sh.rs) port code from
