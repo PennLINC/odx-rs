@@ -73,6 +73,7 @@ Useful options:
 
 - `--sh <path>`
 - `--fixel-dir <path>`
+- `--mapmri-tensor <path>` / `--mapmri-uvec <path>` (TORTOISE MAP-MRI input)
 - `--reference-affine <path>`
 - `--json`
 - `--verbose`
@@ -96,7 +97,9 @@ Shared input options:
 
 - `--sh <path>`
 - `--fixel-dir <path>`
+- `--mapmri-tensor <path>` / `--mapmri-uvec <path>` (TORTOISE MAP-MRI input)
 - `--reference-affine <path>`
+- `--input-format odx-directory|odx-archive|dsistudio-fibgz|dsistudio-fz|dipy-pam5|tortoise-mapmri-nifti|mrtrix-sh-image|mrtrix-fixel-dir`
 
 General output options:
 
@@ -148,6 +151,7 @@ Useful options:
 
 - `--sh <path>`
 - `--fixel-dir <path>`
+- `--mapmri-tensor <path>` / `--mapmri-uvec <path>` (TORTOISE MAP-MRI input)
 - `--reference-affine <path>`
 - `--json`
 - `--strict`
@@ -174,6 +178,10 @@ In brief:
 
 Useful options:
 
+- `--sh <path>`
+- `--fixel-dir <path>`
+- `--mapmri-tensor <path>` / `--mapmri-uvec <path>` (TORTOISE MAP-MRI input)
+- `--reference-affine <path>`
 - `--primary-dpf <name>`
 - `--threshold otsu|positive|all|value`
 - `--threshold-value <f32>`
@@ -194,6 +202,96 @@ with the fixed encoding:
 
 `--write-qc-class` is only valid for existing ODX directory or `.odx` archive
 inputs.
+
+### `odx compare`
+
+```bash
+odx compare --a <a.odx> --b <b.odx> --out-dir <dir> [options]
+```
+
+Pairwise fixel comparison between two ODX files: mutually matches fixels across
+A and B, diffs the primary DPF metric, and writes per-voxel NIfTIs plus a
+`comparison.odx` archive into `--out-dir`.
+
+Useful options:
+
+- `--a <a.odx>`, `--b <b.odx>` (both required)
+- `--out-dir <dir>` (required)
+- `--primary-dpf <name>` (default: `amplitude` → `afd` → `qa`)
+- `--threshold otsu|positive|all|value`
+- `--threshold-value <f32>`
+- `--coherence-angle-deg <f32>` (default `15.0`)
+- `--match-angle-deg <f32>` (default `30.0`)
+- `--no-comparison-odx` (write NIfTIs only)
+- `--json`
+
+### `odx combine`
+
+```bash
+odx combine <odx>... [--input <odx>] [options]
+```
+
+The N-way generalization of `compare`: builds a shared set of group fixels,
+matches every subject onto them, and writes a group ODX whose `angle_deg` DPF
+is an (n_fixels × n_subjects) matrix, plus a cohort CSV. All inputs must share
+grid and affine.
+
+Useful options:
+
+- `--method cluster|mean-fod` (default `cluster`): `cluster` pools subject
+  directions; `mean-fod` peak-finds the mean FOD
+- `--template <odx>` (adopt this ODX's fixels/geometry as the template)
+- `--mask-combine union|intersection` (default `union`)
+- `--match-angle-deg <f32>` (default `30.0`)
+- `--normalize-fod none|l0|integral` (default `none`, `mean-fod` only)
+- `--npeaks`, `--peak-threshold`, `--min-separation-angle` (`mean-fod` peak finding)
+- `--min-subjects <N>` (default `2`, `cluster` only)
+- `--scalar <name>` (repeatable; restrict carried DPF scalars)
+- `--design <tsv|csv>`, `--design-key-column <col>`, `--input-key stem|path`
+- `--out-odx <path>`, `--out-cohort <csv>`, `--out-mask <nifti>`,
+  `--per-subject-odx <dir>`, `--out-table <csv|tsv>`, `--out-dir <dir>`
+- `--json`
+
+### `odx import-aodf`
+
+```bash
+odx import-aodf <input.nii.gz> <output.odx> [options]
+```
+
+Converts a pyAFQ asymmetric ODF (`*_param-aodf_dwimap.nii.gz`) into ODX. Stores
+full-basis descoteaux07 SH and precomputes per-voxel asymmetric peaks.
+
+Useful options:
+
+- `--sidecar <json>` (defaults to a JSON beside the NIfTI)
+- `--legacy-basis` (use legacy descoteaux SH; default is non-legacy)
+- `--relative-peak-threshold <f32>` (default `0.5`)
+- `--min-separation-deg <f32>` (default `25.0`)
+- `--max-peaks <N>` (default `5`)
+- `--odx-layout directory|archive` (default `directory`)
+- `--overwrite`
+- `--json`
+
+### `odx upsample`
+
+```bash
+odx upsample <input.odx> <output.odx> --voxel-spacing <mm> [options]
+```
+
+Spatially upsamples an ODX onto a finer isotropic voxel grid. SH and DPV arrays
+are trilinearly interpolated; fixels are recomputed from the interpolated SH by
+peak finding. DPF arrays other than `amplitude` are dropped, and dense ODF data
+is not supported.
+
+Useful options:
+
+- `--voxel-spacing <mm>` (required; target isotropic spacing)
+- `--npeaks <N>` (default `5`)
+- `--peak-threshold <f32>` (default `0.5`)
+- `--min-separation-angle <f32>` (default `25.0`)
+- `--odx-layout directory|archive` (default `directory`)
+- `--overwrite`
+- `--json`
 
 ### `odx transform`
 
@@ -273,6 +371,24 @@ odx transform \
 - `--apsf-dirs <N>`: number of fibonacci-spiral reference directions for
   aPSF SH reorientation. Default 80 (covers lmax 8 reliably); use 300 for
   lmax 12.
+
+### `odx attach-dpv`
+
+```bash
+odx attach-dpv <odx> <nifti> --name <name> [options]
+```
+
+Attaches a NIfTI volume to an existing ODX as a per-voxel scalar (DPV), in
+place. The NIfTI grid must match the ODX (dimensions and affine within 1e-3 mm);
+voxels outside the ODX mask are silently dropped. Overwrites the DPV if a field
+of the same name already exists.
+
+Useful options:
+
+- `--name <name>` (required; DPV name to register under, e.g. `fa`)
+- `--dtype auto|u8|u16|u32|i16|i32|f32|f64` (default `auto`: narrowest unsigned
+  int that fits non-negative integer data, else `float32`)
+- `--quiet`
 
 ## Input Model
 

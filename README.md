@@ -16,11 +16,31 @@ odx convert fixels_mif output.fz --sh fod.mif.gz
 odx validate output.odx
 ```
 
+Subcommands:
+
+- `info` — print a concise summary of a dataset or supported foreign input
+- `convert` — convert between ODX, DSI Studio, and MRtrix representations
+- `validate` — check internal consistency after normalizing into an ODX dataset
+- `qc` — compute fixel coherence QC metrics
+- `compare` — pairwise fixel comparison between two ODX files
+  (`--a <odx> --b <odx> --out-dir <dir>`)
+- `combine` — build group fixels from many template-space ODX and write per-subject
+  angular distance (the N-way generalization of `compare`)
+- `import-aodf` — import a pyAFQ asymmetric ODF (`*_param-aodf_dwimap.nii.gz`) into ODX
+- `upsample` — resample an ODX onto a finer isotropic grid (`--voxel-spacing <mm>`)
+- `transform` — apply an ANTs/ITK spatial transform to an ODX (`--transform <h5>`)
+- `attach-dpv` — attach a NIfTI volume to an ODX as a per-voxel DPV
+  (`--name <name>`, `--dtype <...>`)
+- `completions <shell>` — generate shell completions
+
 Some formats are composite:
 
 - MRtrix fixel directories may be paired with `--sh <path>`
 - MRtrix SH images may be paired with `--fixel-dir <path>`
 - DSI Studio `fib.gz` files may use `--reference-affine <mif-or-nifti>`
+- TORTOISE MAP-MRI input (`--input-format tortoise-mapmri-nifti`) pairs a
+  coefficient NIfTI given as `<input>` with `--mapmri-tensor <nifti>` and
+  `--mapmri-uvec <nifti>`
 
 ## Applying ANTs transforms to ODX
 

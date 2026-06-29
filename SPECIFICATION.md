@@ -1,6 +1,6 @@
 # ODX File Format Specification
 
-Version 0.1.0
+Version 0.1.1
 
 ## Overview
 
@@ -111,7 +111,9 @@ data.odx/
 | `SH_LEGACY` | optional | `bool` | Affects the descoteaux07 basis only. `false` (modern, dipy ≥ 1.7) and `true` (legacy, dipy ≤ 1.x default) differ in the sign convention for negative-`m` coefficients. Defaults to `false` when absent. |
 | `CANONICAL_DENSE_REPRESENTATION` | optional | `string` | Preferred dense representation: `"sh"` or `"odf"`. |
 | `SPHERE_ID` | optional | `string` | Canonical sphere identifier when `odf/` uses a standard sphere and explicit `sphere/` payloads can be omitted. |
+| `ODF_SAMPLE_DOMAIN` | optional | `string` | Angular domain over which `odf/` amplitudes are sampled (e.g. `"hemisphere"`). |
 | `ARRAY_QUANTIZATION` | optional | `object` | Per-array linear quantization metadata for ODX-native `uint8 + slope/intercept` storage. |
+| `PAM_METADATA` | optional | `object` | Dipy PAM-derived metadata carried through PAM ↔ ODX round-trips. May hold `total_weight` and `ang_thr` (`EuDXDirectionGetter` thresholds) and `basis_assumed` (the dipy SH basis name recorded at PAM write time). |
 
 Additional fields are preserved through round-trips via a catch-all map.
 
