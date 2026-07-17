@@ -81,11 +81,37 @@ pub fn compare_odx(
             header_a.dimensions, header_b.dimensions
         )));
     }
-    if !affine_close(&header_a.voxel_to_rasmm, &header_b.voxel_to_rasmm, 1e-4) {
-        return Err(OdxError::Argument(
-            "ODX affines differ; both files must share the same grid".into(),
-        ));
-    }
+    // Two ODX may occupy the same physical lattice but store voxels in a
+    // different orientation (e.g. a native LAS grid vs a RAS+-canonicalized one,
+    // x/y flipped). When the affines aren't identical but are related by a signed
+    // axis permutation, reindex B onto A's voxel order so the per-voxel
+    // comparison lines up. Fixel directions are stored in world (RAS) space, so
+    // they need no reorientation — only the voxel indexing changes.
+    let voxel_remap: Option<Vec<usize>> =
+        if affine_close(&header_a.voxel_to_rasmm, &header_b.voxel_to_rasmm, 1e-4) {
+            None
+        } else {
+            match same_lattice_voxel_remap(
+                header_a.dimensions,
+                &header_a.voxel_to_rasmm,
+                &header_b.voxel_to_rasmm,
+            ) {
+                Some(r) => Some(r),
+                None => {
+                    return Err(OdxError::Argument(
+                        "ODX grids differ: same dimensions but the affines are not related by a \
+                         signed axis permutation, so the voxel lattices do not coincide".into(),
+                    ));
+                }
+            }
+        };
+    // Map an A voxel flat index to the physically-corresponding B flat index.
+    let bflat = |flat: usize| -> usize {
+        match &voxel_remap {
+            Some(r) => r[flat],
+            None => flat,
+        }
+    };
     if !opts.match_angle_deg.is_finite()
         || opts.match_angle_deg <= 0.0
         || opts.match_angle_deg >= 90.0
@@ -158,12 +184,12 @@ pub fn compare_odx(
         let count = (offsets_a[compact + 1] - offsets_a[compact]) as f32;
         n_fixels_a_vol[vox_idx] = count;
     }
-    for (vox_idx, &compact) in lookup_b.flat_to_compact.iter().enumerate() {
+    for flat in 0..total_voxels {
+        let compact = lookup_b.flat_to_compact[bflat(flat)];
         if compact == usize::MAX {
             continue;
         }
-        let count = (offsets_b[compact + 1] - offsets_b[compact]) as f32;
-        n_fixels_b_vol[vox_idx] = count;
+        n_fixels_b_vol[flat] = (offsets_b[compact + 1] - offsets_b[compact]) as f32;
     }
 
     // Per-fixel comparison arrays sized to A's nb_peaks (the comparison ODX
@@ -240,7 +266,7 @@ pub fn compare_odx(
 
     for flat in 0..total_voxels {
         let ca = lookup_a.flat_to_compact[flat];
-        let cb = lookup_b.flat_to_compact[flat];
+        let cb = lookup_b.flat_to_compact[bflat(flat)];
         if ca == usize::MAX || cb == usize::MAX {
             continue;
         }
@@ -639,4 +665,144 @@ fn write_voxel_scalar_nifti(
             ))
         })?;
     Ok(())
+}
+
+/// Apply a 4x4 affine (last row `[0,0,0,1]`) to a point.
+fn apply_affine_pt(a: &[[f64; 4]; 4], p: [f64; 3]) -> [f64; 3] {
+    [
+        a[0][0] * p[0] + a[0][1] * p[1] + a[0][2] * p[2] + a[0][3],
+        a[1][0] * p[0] + a[1][1] * p[1] + a[1][2] * p[2] + a[1][3],
+        a[2][0] * p[0] + a[2][1] * p[1] + a[2][2] * p[2] + a[2][3],
+    ]
+}
+
+/// Invert a voxel→world affine (last row `[0,0,0,1]`): inverts the 3×3 linear
+/// block by cofactors and adjusts the translation. Returns `None` if singular.
+fn invert_affine4(a: &[[f64; 4]; 4]) -> Option<[[f64; 4]; 4]> {
+    let m = [
+        [a[0][0], a[0][1], a[0][2]],
+        [a[1][0], a[1][1], a[1][2]],
+        [a[2][0], a[2][1], a[2][2]],
+    ];
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let id = 1.0 / det;
+    let inv = [
+        [
+            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * id,
+            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * id,
+            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * id,
+        ],
+        [
+            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * id,
+            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * id,
+            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * id,
+        ],
+        [
+            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * id,
+            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * id,
+            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * id,
+        ],
+    ];
+    let t = [a[0][3], a[1][3], a[2][3]];
+    let it = [
+        -(inv[0][0] * t[0] + inv[0][1] * t[1] + inv[0][2] * t[2]),
+        -(inv[1][0] * t[0] + inv[1][1] * t[1] + inv[1][2] * t[2]),
+        -(inv[2][0] * t[0] + inv[2][1] * t[1] + inv[2][2] * t[2]),
+    ];
+    Some([
+        [inv[0][0], inv[0][1], inv[0][2], it[0]],
+        [inv[1][0], inv[1][1], inv[1][2], it[1]],
+        [inv[2][0], inv[2][1], inv[2][2], it[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+}
+
+/// If two grids of equal `dims` occupy the same physical voxel lattice — i.e.
+/// each A voxel maps, through `A`→world→`B⁻¹`, to an integer in-range B voxel —
+/// return the flat-index remap `remap[a_flat] = b_flat` (C order,
+/// `i*ny*nz + j*nz + k`). Otherwise return `None` (genuinely different grids).
+/// This is exactly the LAS↔RAS / axis-permutation case: same scanner space,
+/// different voxel ordering.
+fn same_lattice_voxel_remap(
+    dims: [u64; 3],
+    a: &[[f64; 4]; 4],
+    b: &[[f64; 4]; 4],
+) -> Option<Vec<usize>> {
+    let inv_b = invert_affine4(b)?;
+    let (nx, ny, nz) = (dims[0] as usize, dims[1] as usize, dims[2] as usize);
+    let mut remap = vec![0usize; nx * ny * nz];
+    for i in 0..nx {
+        for j in 0..ny {
+            for k in 0..nz {
+                let world = apply_affine_pt(a, [i as f64, j as f64, k as f64]);
+                let vb = apply_affine_pt(&inv_b, world);
+                let (ri, rj, rk) = (vb[0].round(), vb[1].round(), vb[2].round());
+                if (vb[0] - ri).abs() > 1e-3
+                    || (vb[1] - rj).abs() > 1e-3
+                    || (vb[2] - rk).abs() > 1e-3
+                {
+                    return None;
+                }
+                if ri < 0.0
+                    || rj < 0.0
+                    || rk < 0.0
+                    || ri as usize >= nx
+                    || rj as usize >= ny
+                    || rk as usize >= nz
+                {
+                    return None;
+                }
+                remap[i * ny * nz + j * nz + k] =
+                    (ri as usize) * ny * nz + (rj as usize) * nz + (rk as usize);
+            }
+        }
+    }
+    Some(remap)
+}
+
+#[cfg(test)]
+mod remap_tests {
+    use super::*;
+
+    #[test]
+    fn identity_affine_not_needed_but_lattice_remap_is_identity() {
+        // Same affine → remap is identity.
+        let a = [[2.0, 0.0, 0.0, -10.0], [0.0, 2.0, 0.0, -20.0], [0.0, 0.0, 2.0, -5.0], [0.0, 0.0, 0.0, 1.0]];
+        let r = same_lattice_voxel_remap([3, 4, 5], &a, &a).unwrap();
+        assert!(r.iter().enumerate().all(|(i, &v)| i == v));
+    }
+
+    #[test]
+    fn las_vs_ras_xy_flip_maps_correctly() {
+        // A: native LAS-ish (−x,−y). B: RAS+ (+x,+y). Same physical lattice,
+        // dims (3,4,5), 2 mm iso. A voxel (i,j,k) ↔ B voxel (nx-1-i, ny-1-j, k).
+        let (nx, ny, nz) = (3usize, 4usize, 5usize);
+        // A: world_x = 10 - 2 i ; world_y = 12 - 2 j ; world_z = -4 + 2 k
+        let a = [[-2.0, 0.0, 0.0, 10.0], [0.0, -2.0, 0.0, 12.0], [0.0, 0.0, 2.0, -4.0], [0.0, 0.0, 0.0, 1.0]];
+        // B RAS+: to hit the same world extent, world_x = 10 - 2*(nx-1) + 2 i' = 6 + 2 i'
+        //         world_y = 12 - 2*(ny-1) + 2 j' = 6 + 2 j' ; world_z = -4 + 2 k'
+        let b = [[2.0, 0.0, 0.0, 6.0], [0.0, 2.0, 0.0, 6.0], [0.0, 0.0, 2.0, -4.0], [0.0, 0.0, 0.0, 1.0]];
+        let r = same_lattice_voxel_remap([nx as u64, ny as u64, nz as u64], &a, &b).unwrap();
+        for i in 0..nx {
+            for j in 0..ny {
+                for k in 0..nz {
+                    let a_flat = i * ny * nz + j * nz + k;
+                    let expect = (nx - 1 - i) * ny * nz + (ny - 1 - j) * nz + k;
+                    assert_eq!(r[a_flat], expect, "voxel ({i},{j},{k})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn different_resolution_is_rejected() {
+        let a = [[2.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0], [0.0, 0.0, 2.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+        let b = [[2.5, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0], [0.0, 0.0, 2.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+        assert!(same_lattice_voxel_remap([3, 4, 5], &a, &b).is_none());
+    }
 }
