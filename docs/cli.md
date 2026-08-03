@@ -233,17 +233,29 @@ odx combine <odx>... [--input <odx>] [options]
 
 The N-way generalization of `compare`: builds a shared set of group fixels,
 matches every subject onto them, and writes a group ODX whose `angle_deg` DPF
-is an (n_fixels × n_subjects) matrix, plus a cohort CSV. All inputs must share
-grid and affine.
+is an (n_fixels × n_subjects) matrix, plus a cohort CSV. Inputs must share the
+grid; a same-lattice input in a different voxel ordering (LAS vs RAS+) is
+reindexed rather than rejected.
+
+With `--method mean-fod` it also builds a group **ODF template** — the average
+FOD, plus coverage, ℓ=0 spread, and angular-correlation reproducibility maps.
+See [template.md](template.md) for that half of the command.
 
 Useful options:
 
 - `--method cluster|mean-fod` (default `cluster`): `cluster` pools subject
-  directions; `mean-fod` peak-finds the mean FOD
+  directions; `mean-fod` averages the SH and peak-finds the mean FOD
 - `--template <odx>` (adopt this ODX's fixels/geometry as the template)
 - `--mask-combine union|intersection` (default `union`)
+- `--min-coverage <frac>` (generalizes `--mask-combine`; `0` = union,
+  `1` = intersection, `0.5` recommended for templates)
 - `--match-angle-deg <f32>` (default `30.0`)
-- `--normalize-fod none|l0|integral` (default `none`, `mean-fod` only)
+- `--normalize-fod none|l0|integral` (default `none`, `mean-fod` only) —
+  `none` is right for quantitative FODs; `l0`/`integral` destroy AFD contrast
+- `--lmax min|max|<N>` (default `min`), `--reference <odx>`
+- `--fod-qc` / `--no-fod-qc`, `--loo auto|on|off`, `--acc-lmin <N>` (default `2`)
+- `--average-dpv <name>` (repeatable), `--no-average-dpv`, `--dpv-sd`
+- `--out-report <json>`, `--fail-on-outlier`
 - `--npeaks`, `--peak-threshold`, `--min-separation-angle` (`mean-fod` peak finding)
 - `--min-subjects <N>` (default `2`, `cluster` only)
 - `--scalar <name>` (repeatable; restrict carried DPF scalars)
