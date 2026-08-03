@@ -677,6 +677,20 @@ pub fn combine_odx(
         b.set_dpf_data("is_primary", template.is_primary.clone(), 1, DType::UInt8);
         b.set_dpf_data("n_subjects_matched", vec_into_bytes(n_sub_matched.clone()), 1, DType::UInt32);
         b.set_dpf_data("strength", vec_into_bytes(template.strength.clone()), 1, DType::Float32);
+        // Under `mean-fod` the fixel strength IS the aggregate's peak amplitude,
+        // so also publish it under the canonical name. That makes the template a
+        // first-class ODX: `odx compare` and `odx qc` resolve their primary
+        // metric as amplitude → afd → qa and would otherwise refuse it. Not
+        // emitted for `cluster`, whose strength is a dyadic eigenvalue rather
+        // than an amplitude.
+        if aggregate.is_some() && matches!(opts.method, TemplateMethod::MeanFod) {
+            b.set_dpf_data(
+                "amplitude",
+                vec_into_bytes(template.strength.clone()),
+                1,
+                DType::Float32,
+            );
+        }
         for (k, key) in scalar_keys.iter().enumerate() {
             b.set_dpf_data(
                 &format!("mean_{key}"),

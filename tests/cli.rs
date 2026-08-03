@@ -274,6 +274,12 @@ fn combine_mean_fod_writes_the_reproducibility_block() {
     assert_eq!(h.sh_full_basis, Some(false));
     assert_eq!(h.sh_legacy, Some(false));
 
+    // the template is a first-class ODX: `odx compare`/`odx qc` resolve their
+    // primary metric as amplitude -> afd -> qa, so mean-fod must publish one
+    assert!(
+        ds.get_dpf("amplitude").is_some(),
+        "mean-fod template must carry dpf/amplitude"
+    );
     assert!(maps.join("acc_mean.nii.gz").exists());
     assert!(maps.join("coverage_frac.nii.gz").exists());
     assert!(maps.join("l0_cv.nii.gz").exists());

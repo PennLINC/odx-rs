@@ -224,6 +224,45 @@ by the bias field while the AFD contrast survives. The pooled response makes
 
 Then average with `--normalize-fod none`.
 
+## Reference numbers
+
+Baselines from 8 test–retest sessions of one subject (`sub-0001a`, QSIPrep
+intramodal-template aligned, 2 mm ACPC, 279 directions, bmax ~4985), each
+reconstructed with `consh --quantitative --read-responses-from <pooled>`:
+
+| check | value | note |
+|---|---|---|
+| template | 207 243 voxels, 376 091 fixels | 9 s wall clock for all 8 subjects |
+| peaks/voxel vs sessions | **0.934×** | matched peak finder; averaging suppresses noise lobes |
+| ACC median, WM | **0.982** | WM = top tercile of anisotropic power |
+| ACC median, whole brain | 0.845 | drops in GM/CSF, as expected |
+| leave-one-out self-bias | **0.098** | `acc_mean − acc_loo_mean` at n=8 |
+| coverage | 2.2% of voxels below full | consistent with mask Dice 0.98–0.995 |
+| `l0_cv` median in WM | **7.5%** | the test–retest AFD reproducibility number |
+| pooled response spread | ≤0.7% (r₀), ≤2.8% (r₂) | across the 8 sessions, before pooling |
+
+Two cross-checks worth repeating on new data:
+
+- **`odx compare` agreement.** Ranking the sessions by
+  `mean_match_angle_deg` against the template agreed with ranking them by
+  `mean_acc_loo` (rank correlation 0.69, same best session by both). If those
+  two disagree, one of the metrics is measuring the wrong thing.
+- **Is the cohort really on a common scale?** Rebuilding with
+  `--normalize-fod l0` changed mean ACC by 0.004 (0.688 → 0.692) and the fixel
+  count by 2.4%. Per-voxel ℓ=0 normalization barely moving the template is the
+  direct evidence that `--quantitative` plus a pooled response did put the
+  sessions on one scale. Had the two templates diverged, the quantitative
+  normalization would not be holding — worth knowing independently of the
+  template.
+
+**Watch the peaks-per-voxel ratio.** It is the single most informative check
+here: if the template has *more* fixels per voxel than its inputs, the inputs
+are not aligned and the average is smearing distinct orientations into spurious
+crossings. Compare against a *matched* peak finder — a session ODX peak-found
+with `--peak-min-amplitude-frac` is not comparable to a template peak-found
+without one. A one-input `odx combine --method mean-fod --no-fod-qc` run
+re-peaks a session through the identical path.
+
 ## Division of labour with the rest of `odx combine`
 
 The template block is one half of the command. The other half — per-subject
