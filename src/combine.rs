@@ -26,8 +26,8 @@ use serde_json::json;
 use crate::dtype::DType;
 use crate::error::{OdxError, Result};
 use crate::fixel_match::{
-    abs_dot, affine_close, align_to_reference_grid, compact_index_map, mask_compact_ijk,
-    shared_scalar_keys, ArrayKind,
+    abs_dot, affine_close, align_to_reference_grid, compact_index_map, flat_index,
+    mask_compact_ijk, shared_scalar_keys, ArrayKind,
 };
 use crate::mmap_backing::vec_into_bytes;
 use crate::mrtrix_sh::lmax_for_ncoeffs;
@@ -948,10 +948,22 @@ pub fn combine_odx(
     let n_reference_scans = inputs.iter().filter(|i| i.is_reference).count();
 
     // ── Per-subject QC rows + outlier flagging ────────────────────────────
-    let subject_voxels: Vec<u64> = qc
-        .as_ref()
-        .map(|q| q.subject_voxels.clone())
-        .unwrap_or_else(|| vec![0; n_inputs]);
+    // The QC pass already counted these; without it, count directly off the
+    // lookups so coverage stays meaningful under every method.
+    let subject_voxels: Vec<u64> = qc.as_ref().map(|q| q.subject_voxels.clone()).unwrap_or_else(
+        || {
+            input_lookup
+                .iter()
+                .map(|lk| {
+                    template
+                        .ijk
+                        .iter()
+                        .filter(|v| lk[flat_index(**v, dims)] != usize::MAX)
+                        .count() as u64
+                })
+                .collect()
+        },
+    );
     let coverage: Vec<f64> = subject_voxels
         .iter()
         .map(|&v| if n_vox > 0 { v as f64 / n_vox as f64 } else { 0.0 })
@@ -977,7 +989,7 @@ pub fn combine_odx(
             path: inputs[s].path.display().to_string(),
             n_voxels: subject_voxels[s],
             coverage_frac: coverage[s],
-            n_fixels: (input_offsets[s].len().saturating_sub(1)) as u64,
+            n_fixels: input_offsets[s].last().copied().unwrap_or(0) as u64,
             mean_acc: subj_acc[s],
             mean_acc_loo: subj_acc_loo[s],
             basis_converted: fod_prepared

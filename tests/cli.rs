@@ -171,8 +171,20 @@ fn combine_runs_and_writes_group_odx_and_cohort() {
         .arg(&cohort)
         .arg("--per-subject-odx")
         .arg(&persubj)
+        .arg("--out-report")
+        .arg(tmp.path().join("report.json"))
         .assert()
         .success();
+
+    // Subject rows are populated even with no FOD block (cluster, peak-only
+    // inputs): one fixel each, full coverage of the single template voxel.
+    let rep: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(tmp.path().join("report.json")).unwrap())
+            .unwrap();
+    assert_eq!(rep["subjects"].as_array().unwrap().len(), 3);
+    assert_eq!(rep["subjects"][0]["n_fixels"], 1);
+    assert_eq!(rep["subjects"][0]["coverage_frac"], 1.0);
+    assert_eq!(rep["loo"], "unavailable");
 
     assert!(out_odx.exists());
     let ds = OdxDataset::open(&out_odx).unwrap();
