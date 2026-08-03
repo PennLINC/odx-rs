@@ -25,13 +25,15 @@ use serde_json::json;
 
 use crate::dtype::DType;
 use crate::error::{OdxError, Result};
-use crate::fixel_match::{abs_dot, affine_close, compact_index_map};
+use crate::fixel_match::{
+    abs_dot, affine_close, align_to_reference_grid, compact_index_map, mask_compact_ijk,
+    shared_scalar_keys, ArrayKind,
+};
 use crate::mmap_backing::vec_into_bytes;
 use crate::mrtrix_sh::lmax_for_ncoeffs;
 use crate::nifti_export::{write_voxel_scalar_nifti_f32, write_voxel_scalar_nifti_u8};
 use crate::odx_file::OdxDataset;
 use crate::peak_finder::{peaks_from_sh_rows_with_basis, PeakFinderConfig, SpherePeakFinder};
-use crate::qc::QC_CLASS_DPF_NAME;
 use crate::sh_basis_evaluator::ShBasisKind;
 use crate::stream::OdxBuilder;
 
@@ -210,34 +212,29 @@ pub fn combine_odx(
 
     let dims = datasets[0].header().dimensions;
     let affine = datasets[0].header().voxel_to_rasmm;
-    for (i, ds) in datasets.iter().enumerate().skip(1) {
-        let h = ds.header();
-        if h.dimensions != dims {
-            return Err(OdxError::Argument(format!(
-                "input '{}' dimensions {:?} differ from '{}' {:?}",
-                inputs[i].path.display(),
-                h.dimensions,
-                inputs[0].path.display(),
-                dims
-            )));
-        }
-        if !affine_close(&h.voxel_to_rasmm, &affine, 1e-4) {
-            return Err(OdxError::Argument(format!(
-                "input '{}' affine differs from '{}'; all inputs must share one grid",
-                inputs[i].path.display(),
-                inputs[0].path.display()
-            )));
-        }
-    }
 
     let total_voxels = (dims[0] * dims[1] * dims[2]) as usize;
     let (ny, nz) = (dims[1] as usize, dims[2] as usize);
 
-    // Per-input full-volume → compact-row maps (align everything by ijk).
+    // Per-input **reference-grid** flat → that input's compact row. Inputs whose
+    // voxels are ordered differently (LAS vs RAS+, any signed axis permutation)
+    // but sit on the same physical lattice are reindexed here, so every
+    // downstream `lookup[ref_flat]` is directly comparable across inputs.
     let input_lookup: Vec<Vec<usize>> = datasets
         .iter()
-        .map(|ds| compact_index_map(ds.mask(), dims))
-        .collect();
+        .zip(inputs)
+        .map(|(ds, inp)| {
+            let h = ds.header();
+            align_to_reference_grid(
+                dims,
+                &affine,
+                h.dimensions,
+                &h.voxel_to_rasmm,
+                ds.mask(),
+                &inp.path.display().to_string(),
+            )
+        })
+        .collect::<Result<_>>()?;
     let input_offsets: Vec<&[u32]> = datasets.iter().map(|ds| ds.offsets()).collect();
 
     let cos_thresh = opts.match_angle_deg.to_radians().cos();
@@ -299,7 +296,7 @@ pub fn combine_odx(
         template.dirs.iter().map(|&r| tangent_basis(r)).collect();
 
     // ── Discover carried scalar DPF keys (shared, scalar float) ───────────
-    let scalar_keys = discover_scalar_keys(&datasets, opts.matched_scalars.as_deref());
+    let scalar_keys = shared_scalar_keys(&datasets, ArrayKind::Dpf, opts.matched_scalars.as_deref());
     // [key][input] -> per-fixel scalar values
     let scalar_vals: Vec<Vec<Vec<f32>>> = scalar_keys
         .iter()
@@ -1185,52 +1182,11 @@ fn ranks_from_offsets(offsets: &[u32]) -> (Vec<u32>, Vec<u8>) {
     (rank, is_primary)
 }
 
-fn mask_compact_ijk(mask: &[u8], dims: [u64; 3]) -> Vec<[u32; 3]> {
-    let (ny, nz) = (dims[1] as usize, dims[2] as usize);
-    let mut out = Vec::new();
-    for i in 0..dims[0] as u32 {
-        for j in 0..dims[1] as u32 {
-            for k in 0..dims[2] as u32 {
-                let flat = i as usize * ny * nz + j as usize * nz + k as usize;
-                if mask[flat] != 0 {
-                    out.push([i, j, k]);
-                }
-            }
-        }
-    }
-    out
-}
-
 fn method_str(m: TemplateMethod) -> &'static str {
     match m {
         TemplateMethod::Cluster => "cluster",
         TemplateMethod::MeanFod => "mean-fod",
     }
-}
-
-/// Shared scalar (ncols==1) float DPF keys present in every input, excluding the
-/// QC class array. Optionally restricted to `want`.
-fn discover_scalar_keys(datasets: &[OdxDataset], want: Option<&[String]>) -> Vec<String> {
-    let mut common: Option<BTreeSet<String>> = None;
-    for ds in datasets {
-        let here: BTreeSet<String> = ds
-            .iter_dpf()
-            .filter(|(name, info)| {
-                *name != QC_CLASS_DPF_NAME && info.ncols == 1 && info.dtype.is_float()
-            })
-            .map(|(name, _)| name.to_string())
-            .collect();
-        common = Some(match common {
-            None => here,
-            Some(prev) => prev.intersection(&here).cloned().collect(),
-        });
-    }
-    let mut keys: Vec<String> = common.unwrap_or_default().into_iter().collect();
-    if let Some(want) = want {
-        let wset: BTreeSet<&String> = want.iter().collect();
-        keys.retain(|k| wset.contains(k));
-    }
-    keys
 }
 
 fn collect_design_columns(inputs: &[CombineInput]) -> Vec<String> {
@@ -1454,7 +1410,18 @@ mod tests {
         mask: Vec<u8>,
         peaks: Vec<Vec<[f32; 3]>>,
     ) -> PathBuf {
-        let mut b = OdxBuilder::new(identity_affine(), dims, mask);
+        build_input_affine(dir, name, identity_affine(), dims, mask, peaks)
+    }
+
+    fn build_input_affine(
+        dir: &Path,
+        name: &str,
+        affine: [[f64; 4]; 4],
+        dims: [u64; 3],
+        mask: Vec<u8>,
+        peaks: Vec<Vec<[f32; 3]>>,
+    ) -> PathBuf {
+        let mut b = OdxBuilder::new(affine, dims, mask);
         let mut amps: Vec<f32> = Vec::new();
         for vox in &peaks {
             b.push_voxel_peaks(vox);
@@ -1510,6 +1477,52 @@ mod tests {
         let combine = ds.header().extra.get("combine").unwrap();
         let subs: Vec<&str> = combine["subjects"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(subs, ["a", "b", "c"]);
+    }
+
+    /// An input stored on the same physical lattice but with a flipped voxel
+    /// axis (LAS vs RAS+) must be reindexed onto the reference ordering, not
+    /// rejected. Fixel directions live in world space, so only the voxel
+    /// indexing changes — the recovered template must match the unflipped case.
+    #[test]
+    fn same_lattice_flipped_input_is_reindexed_not_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let dims = [1u64, 1, 2];
+        // Reference: +z voxel spacing 2 mm, k = 0 at world z = 0.
+        // b: same lattice, z axis reversed, so b's k=0 is the reference's k=1.
+        let flipped = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, -2.0, 2.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let reference = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 2.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        // Physical truth: world z=0 has a +z fixel, world z=2 has a +x fixel.
+        let a = build_input_affine(
+            tmp.path(), "a", reference, dims, vec![1, 1],
+            vec![vec![[0.0, 0.0, 1.0]], vec![[1.0, 0.0, 0.0]]],
+        );
+        // b lists the same two physical voxels in reversed order.
+        let b = build_input_affine(
+            tmp.path(), "b", flipped, dims, vec![1, 1],
+            vec![vec![[1.0, 0.0, 0.0]], vec![[0.0, 0.0, 1.0]]],
+        );
+        let inputs = vec![ci(&a, "a"), ci(&b, "b")];
+        let out = tmp.path().join("out.odx");
+        combine_odx(&inputs, &CombineOptions::default(), &out_only_odx(out.clone())).unwrap();
+
+        let ds = OdxDataset::open(&out).unwrap();
+        // Both subjects agree at every voxel once reindexed → all angles ~0.
+        let angle = ds.get_dpf("angle_deg").unwrap().to_f32_vec().unwrap();
+        assert!(
+            angle.iter().all(|&x| x < 1.0),
+            "flipped input must align to the reference voxel order, got angles {angle:?}"
+        );
+        assert_eq!(ds.nb_peaks(), 2, "one group fixel per voxel");
     }
 
     #[test]
