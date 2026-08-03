@@ -172,16 +172,12 @@ impl Default for AggregateOptions {
 /// DSI Studio's `odf_average` *documents* a ">half the population" rule but its
 /// code keeps any voxel with at least one contributor; this implements the
 /// documented rule.
-pub(crate) fn coverage_mask(
-    prepared: &[PreparedInput],
-    dims: [u64; 3],
-    min_coverage: f32,
-) -> Vec<u8> {
+pub(crate) fn coverage_mask(lookups: &[Vec<usize>], dims: [u64; 3], min_coverage: f32) -> Vec<u8> {
     let total = (dims[0] * dims[1] * dims[2]) as usize;
-    let n = prepared.len();
+    let n = lookups.len();
     let mut present = vec![0u32; total];
-    for prep in prepared {
-        for (flat, &c) in prep.lookup.iter().enumerate() {
+    for lk in lookups {
+        for (flat, &c) in lk.iter().enumerate() {
             if c != usize::MAX {
                 present[flat] += 1;
             }
@@ -887,6 +883,7 @@ fn median(v: &[f32]) -> f32 {
 }
 
 /// Open a set of ODX paths, erroring with the offending path.
+#[cfg(test)]
 pub(crate) fn open_all(paths: &[std::path::PathBuf]) -> Result<Vec<OdxDataset>> {
     paths
         .iter()
@@ -989,6 +986,10 @@ mod tests {
         prepare_inputs(datasets, labels, dims, affine, &ref_t, policy).unwrap()
     }
 
+    fn lookups_of(prepared: &[PreparedInput]) -> Vec<Vec<usize>> {
+        prepared.iter().map(|p| p.lookup.clone()).collect()
+    }
+
     fn labels(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
     }
@@ -1010,7 +1011,7 @@ mod tests {
         let l = labels(&["a", "b", "c"]);
         let (prepared, target) = prep(&ds, &l, [1, 1, 1], &identity_affine(), LmaxPolicy::Min);
         let opts = AggregateOptions { loo: LooMode::On, ..Default::default() };
-        let agg = aggregate_fod(&ds, &prepared, [1, 1, 1], &coverage_mask(&prepared, [1, 1, 1], 0.0), &target, &opts).unwrap();
+        let agg = aggregate_fod(&ds, &prepared, [1, 1, 1], &coverage_mask(&lookups_of(&prepared), [1, 1, 1], 0.0), &target, &opts).unwrap();
 
         for (got, want) in agg.sh.iter().zip(&row) {
             assert!((got - want).abs() < 1e-6, "mean of identical rows must be the row");
@@ -1038,7 +1039,7 @@ mod tests {
         let l = labels(&["a", "b"]);
         let (prepared, target) = prep(&ds, &l, [1, 1, 1], &identity_affine(), LmaxPolicy::Min);
         let agg =
-            aggregate_fod(&ds, &prepared, [1, 1, 1], &coverage_mask(&prepared, [1, 1, 1], 0.0), &target, &AggregateOptions::default()).unwrap();
+            aggregate_fod(&ds, &prepared, [1, 1, 1], &coverage_mask(&lookups_of(&prepared), [1, 1, 1], 0.0), &target, &AggregateOptions::default()).unwrap();
         assert!((agg.sh[0] - 2.0).abs() < 1e-6, "got {}", agg.sh[0]);
     }
 
@@ -1060,7 +1061,7 @@ mod tests {
         let ds = open_all(&[a, b]).unwrap();
         let l = labels(&["a", "b"]);
         let (prepared, target) = prep(&ds, &l, dims, &identity_affine(), LmaxPolicy::Min);
-        let agg = aggregate_fod(&ds, &prepared, dims, &coverage_mask(&prepared, dims, 0.0), &target, &AggregateOptions::default()).unwrap();
+        let agg = aggregate_fod(&ds, &prepared, dims, &coverage_mask(&lookups_of(&prepared), dims, 0.0), &target, &AggregateOptions::default()).unwrap();
         assert_eq!(agg.n_voxels(), 2);
         assert_eq!(agg.counts, vec![1, 2]);
         assert!((agg.sh[0] - 4.0).abs() < 1e-6, "single-contributor voxel must not be halved");
@@ -1086,7 +1087,7 @@ mod tests {
         let (prepared, target) = prep(&ds, &l, dims, &identity_affine(), LmaxPolicy::Min);
         let n_at = |frac: f32| {
             let o = AggregateOptions { min_coverage: frac, ..Default::default() };
-            let m = coverage_mask(&prepared, dims, frac);
+            let m = coverage_mask(&lookups_of(&prepared), dims, frac);
             aggregate_fod(&ds, &prepared, dims, &m, &target, &o).unwrap().n_voxels()
         };
         assert_eq!(n_at(0.0), 2, "union");
@@ -1145,7 +1146,7 @@ mod tests {
         assert_eq!(prepared[1].lmax_truncated_from, None);
 
         let agg =
-            aggregate_fod(&ds, &prepared, [1, 1, 1], &coverage_mask(&prepared, [1, 1, 1], 0.0), &target, &AggregateOptions::default()).unwrap();
+            aggregate_fod(&ds, &prepared, [1, 1, 1], &coverage_mask(&lookups_of(&prepared), [1, 1, 1], 0.0), &target, &AggregateOptions::default()).unwrap();
         assert_eq!(agg.sh.len(), 15);
         // a truncated == b, so the mean is that row exactly.
         for (got, want) in agg.sh.iter().zip(&lo) {
@@ -1174,7 +1175,7 @@ mod tests {
             let (prepared, target) = prep(&ds, &l, [1, 1, 1], &identity_affine(), LmaxPolicy::Min);
             assert_eq!(target.basis_name, "descoteaux07");
             assert_eq!(target.legacy, legacy);
-            let agg = aggregate_fod(&ds, &prepared, [1, 1, 1], &coverage_mask(&prepared, [1, 1, 1], 0.0), &target, &AggregateOptions::default())
+            let agg = aggregate_fod(&ds, &prepared, [1, 1, 1], &coverage_mask(&lookups_of(&prepared), [1, 1, 1], 0.0), &target, &AggregateOptions::default())
             .unwrap();
             let (_, peak_dirs, _) =
                 peaks_from_aggregate(&agg, &PeakFinderConfig::default(), None).unwrap();
@@ -1208,7 +1209,7 @@ mod tests {
         let l = labels(&["a", "b"]);
         let (prepared, target) = prep(&ds, &l, [1, 1, 1], &identity_affine(), LmaxPolicy::Min);
         let opts = AggregateOptions::default();
-        let agg = aggregate_fod(&ds, &prepared, [1, 1, 1], &coverage_mask(&prepared, [1, 1, 1], 0.0), &target, &opts).unwrap();
+        let agg = aggregate_fod(&ds, &prepared, [1, 1, 1], &coverage_mask(&lookups_of(&prepared), [1, 1, 1], 0.0), &target, &opts).unwrap();
         let qc = fod_qc(&ds, &prepared, [1, 1, 1], &agg, &opts).unwrap();
         assert!((qc.acc_mean[0] - 1.0).abs() < 1e-5, "acc {}", qc.acc_mean[0]);
         assert!(qc.l0_sd[0] > 1.0, "l0 SD must still see the DC difference");
@@ -1239,7 +1240,7 @@ mod tests {
         let l = labels(&["s0", "s1", "s2", "s3"]);
         let (prepared, target) = prep(&ds, &l, [1, 1, 1], &identity_affine(), LmaxPolicy::Min);
         let opts = AggregateOptions { loo: LooMode::On, ..Default::default() };
-        let agg = aggregate_fod(&ds, &prepared, [1, 1, 1], &coverage_mask(&prepared, [1, 1, 1], 0.0), &target, &opts).unwrap();
+        let agg = aggregate_fod(&ds, &prepared, [1, 1, 1], &coverage_mask(&lookups_of(&prepared), [1, 1, 1], 0.0), &target, &opts).unwrap();
         let qc = fod_qc(&ds, &prepared, [1, 1, 1], &agg, &opts).unwrap();
 
         // Brute force: rebuild the template from the other three, per subject.
@@ -1281,7 +1282,7 @@ mod tests {
         let l = labels(&["a", "b", "c"]);
         let (prepared, target) = prep(&ds, &l, [1, 1, 1], &identity_affine(), LmaxPolicy::Min);
         let opts = AggregateOptions { loo: LooMode::Off, ..Default::default() };
-        let agg = aggregate_fod(&ds, &prepared, [1, 1, 1], &coverage_mask(&prepared, [1, 1, 1], 0.0), &target, &opts).unwrap();
+        let agg = aggregate_fod(&ds, &prepared, [1, 1, 1], &coverage_mask(&lookups_of(&prepared), [1, 1, 1], 0.0), &target, &opts).unwrap();
         let qc = fod_qc(&ds, &prepared, [1, 1, 1], &agg, &opts).unwrap();
         assert!(!qc.loo_enabled);
         assert!(qc.acc_loo_mean.is_empty());
@@ -1314,7 +1315,7 @@ mod tests {
         let l = labels(&["a", "b"]);
         let (prepared, target) = prep(&ds, &l, dims, &reference, LmaxPolicy::Min);
         let opts = AggregateOptions::default();
-        let agg = aggregate_fod(&ds, &prepared, dims, &coverage_mask(&prepared, dims, 0.0), &target, &opts).unwrap();
+        let agg = aggregate_fod(&ds, &prepared, dims, &coverage_mask(&lookups_of(&prepared), dims, 0.0), &target, &opts).unwrap();
         // Perfect agreement once reindexed → the mean equals each input.
         for (got, want) in agg.sh[..target.ncoeffs].iter().zip(&z) {
             assert!((got - want).abs() < 1e-5, "reference voxel 0 must be the z-lobe");

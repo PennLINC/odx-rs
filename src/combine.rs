@@ -26,15 +26,13 @@ use serde_json::json;
 use crate::dtype::DType;
 use crate::error::{OdxError, Result};
 use crate::fixel_match::{
-    abs_dot, affine_close, align_to_reference_grid, compact_index_map, flat_index,
-    mask_compact_ijk, shared_scalar_keys, ArrayKind,
+    abs_dot, affine_close, align_to_reference_grid, flat_index, mask_compact_ijk,
+    shared_scalar_keys, ArrayKind,
 };
 use crate::mmap_backing::vec_into_bytes;
-use crate::mrtrix_sh::lmax_for_ncoeffs;
 use crate::nifti_export::{write_voxel_scalar_nifti_f32, write_voxel_scalar_nifti_u8};
 use crate::odx_file::OdxDataset;
-use crate::peak_finder::{peaks_from_sh_rows_with_basis, PeakFinderConfig, SpherePeakFinder};
-use crate::sh_basis_evaluator::ShBasisKind;
+use crate::peak_finder::PeakFinderConfig;
 use crate::stream::OdxBuilder;
 use crate::template::{
     aggregate_fod, average_dpvs, aggregate_anisotropic_power, coverage_mask, flag_outliers, fod_qc,
@@ -280,7 +278,6 @@ pub fn combine_odx(
     let dims = datasets[0].header().dimensions;
     let affine = datasets[0].header().voxel_to_rasmm;
 
-    let total_voxels = (dims[0] * dims[1] * dims[2]) as usize;
     let (ny, nz) = (dims[1] as usize, dims[2] as usize);
 
     // Per-input **reference-grid** flat → that input's compact row. Inputs whose
@@ -351,22 +348,7 @@ pub fn combine_odx(
     } else {
         // Coverage counts → template mask. `--min-coverage` generalizes
         // `--mask-combine`: 0 is a union, 1 an intersection.
-        let mut present = vec![0u32; total_voxels];
-        for lk in &input_lookup {
-            for (flat, &c) in lk.iter().enumerate() {
-                if c != usize::MAX {
-                    present[flat] += 1;
-                }
-            }
-        }
-        let frac = agg_opts.min_coverage.clamp(0.0, 1.0) as f64;
-        let mut mask = vec![0u8; total_voxels];
-        for (flat, m) in mask.iter_mut().enumerate() {
-            let c = present[flat];
-            if c > 0 && (c as f64) / (n_inputs as f64) >= frac - 1e-9 {
-                *m = 1;
-            }
-        }
+        let mask = coverage_mask(&input_lookup, dims, agg_opts.min_coverage);
         match opts.method {
             TemplateMethod::Cluster => build_template_cluster(
                 &datasets,
@@ -1639,16 +1621,6 @@ mod tests {
     use crate::mmap_backing::vec_into_bytes;
     use crate::odx_file::OdxDataset;
     use crate::stream::OdxBuilder;
-use crate::template::{
-    aggregate_fod, average_dpvs, aggregate_anisotropic_power, coverage_mask, flag_outliers, fod_qc,
-    peaks_from_aggregate, prepare_inputs, reference_header, AggregateOptions, AggregatedFod,
-    LmaxPolicy, LooMode, PreparedInput, ScaleMode, ShTarget,
-};
-
-/// Per-subject FOD rescaling for `mean-fod`, applied *before* averaging.
-/// Re-exported from [`crate::template`] so the existing `--normalize-fod`
-/// spelling keeps working.
-pub use crate::template::ScaleMode as NormalizeFod;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
