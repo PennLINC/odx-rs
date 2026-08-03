@@ -85,6 +85,37 @@ fn create_no_primary_metric_odx_dir(path: &Path) {
     builder.finalize().unwrap().save_directory(path).unwrap();
 }
 
+/// An SH-carrying input: a narrow lobe along `dir`, lmax 8 tournier07, so the
+/// mean-fod path and the FOD reproducibility block have something to chew on.
+fn create_sh_input(path: &Path, dir: [f32; 3], dc: f32) {
+    let dims = [1u64, 1, 1];
+    let sphere = odx_rs::formats::dsistudio_odf8::hemisphere_vertices_ras();
+    let amps: Vec<f32> = sphere
+        .iter()
+        .map(|v| (v[0] * dir[0] + v[1] * dir[1] + v[2] * dir[2]).abs().powi(8))
+        .collect();
+    let mut row = odx_rs::mrtrix_sh::fit_from_amplitudes(&amps, &sphere, 8).unwrap();
+    row[0] += dc;
+    let mut builder = OdxBuilder::new(Header::identity_affine(), dims, vec![1u8]);
+    builder.set_sh_info(8, "tournier07".to_string());
+    builder.set_sh_full_basis(false);
+    builder.set_sh_legacy(false);
+    builder.set_sh_data(
+        "coefficients",
+        bytemuck::cast_slice(&row).to_vec(),
+        45,
+        DType::Float32,
+    );
+    builder.set_dpv_data(
+        "csf",
+        bytemuck::cast_slice(&[dc]).to_vec(),
+        1,
+        DType::Float32,
+    );
+    builder.skip_all_peaks();
+    builder.finalize().unwrap().save_directory(path).unwrap();
+}
+
 fn create_combine_input(path: &Path, dir: [f32; 3]) {
     let dims = [1u64, 1, 1];
     let mut builder = OdxBuilder::new(Header::identity_affine(), dims, vec![1u8]);
@@ -156,6 +187,149 @@ fn combine_runs_and_writes_group_odx_and_cohort() {
         .unwrap()
         .starts_with("scalar_name,source_file"));
     assert!(text.contains("angle_deg"));
+}
+
+#[test]
+fn combine_help_lists_the_template_flags() {
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args(["combine", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("--min-coverage")
+                .and(predicate::str::contains("--loo"))
+                .and(predicate::str::contains("--average-dpv"))
+                .and(predicate::str::contains("--lmax"))
+                .and(predicate::str::contains("--acc-lmin")),
+        );
+}
+
+#[test]
+fn combine_mean_fod_writes_the_reproducibility_block() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths: Vec<_> = [
+        ([0.0f32, 0.0, 1.0], 0.5f32),
+        ([0.0, 0.05, 0.998], 0.6),
+        ([0.03, 0.0, 0.999], 0.55),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, (d, dc))| {
+        let p = tmp.path().join(format!("s{i}.odx"));
+        create_sh_input(&p, *d, *dc);
+        p
+    })
+    .collect();
+    let out_odx = tmp.path().join("group.odx");
+    let maps = tmp.path().join("maps");
+    let report = tmp.path().join("report.json");
+
+    let out = Command::cargo_bin("odx")
+        .unwrap()
+        .arg("combine")
+        .args(&paths)
+        .args(["--method", "mean-fod", "--loo", "on", "--dpv-sd"])
+        .arg("--out-odx")
+        .arg(&out_odx)
+        .arg("--out-dir")
+        .arg(&maps)
+        .arg("--out-report")
+        .arg(&report)
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let ds = OdxDataset::open(&out_odx).unwrap();
+    // coverage: every input covers the single voxel
+    assert_eq!(ds.scalar_dpv_f32("n_subjects").unwrap(), vec![3.0]);
+    assert_eq!(ds.scalar_dpv_f32("coverage_frac").unwrap(), vec![1.0]);
+    // the three near-identical lobes must correlate almost perfectly
+    let acc = ds.scalar_dpv_f32("acc_mean").unwrap()[0];
+    assert!(acc > 0.99, "acc_mean {acc}");
+    assert!(ds.get_dpv("acc_loo_mean").is_some(), "leave-one-out map missing");
+    // csf is the one shared scalar DPV, so it is auto-averaged with its SD
+    let csf = ds.scalar_dpv_f32("csf").unwrap()[0];
+    assert!((csf - 0.55).abs() < 1e-5, "averaged csf {csf}");
+    assert!(ds.get_dpv("csf_sd").is_some(), "--dpv-sd must emit csf_sd");
+    // the SH block carries the cohort's real basis metadata
+    let h = ds.header();
+    assert_eq!(h.sh_basis.as_deref(), Some("tournier07"));
+    assert_eq!(h.sh_order, Some(8));
+    assert_eq!(h.sh_full_basis, Some(false));
+    assert_eq!(h.sh_legacy, Some(false));
+
+    assert!(maps.join("acc_mean.nii.gz").exists());
+    assert!(maps.join("coverage_frac.nii.gz").exists());
+    assert!(maps.join("l0_cv.nii.gz").exists());
+
+    let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(json["subjects"].as_array().unwrap().len(), 3);
+    assert_eq!(json["loo"], "on");
+    assert!(json["outliers"].as_array().unwrap().is_empty());
+    assert!(json["subjects"][0]["mean_acc"].as_f64().unwrap().is_finite());
+    assert!(report.exists(), "--out-report must write the same report to disk");
+}
+
+#[test]
+fn combine_min_coverage_one_is_an_intersection() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // Two voxels; b masks only the second.
+    let mk = |name: &str, mask: Vec<u8>, n: usize| {
+        let p = tmp.path().join(name);
+        let mut builder = OdxBuilder::new(Header::identity_affine(), [1, 1, 2], mask);
+        let mut row = vec![0.0f32; 45 * n];
+        for v in 0..n {
+            row[v * 45] = 1.0;
+        }
+        builder.set_sh_info(8, "tournier07".to_string());
+        builder.set_sh_full_basis(false);
+        builder.set_sh_legacy(false);
+        builder.set_sh_data(
+            "coefficients",
+            bytemuck::cast_slice(&row).to_vec(),
+            45,
+            DType::Float32,
+        );
+        builder.skip_all_peaks();
+        builder.finalize().unwrap().save_directory(&p).unwrap();
+        p
+    };
+    let a = mk("a.odx", vec![1, 1], 2);
+    let b = mk("b.odx", vec![0, 1], 1);
+    let out_odx = tmp.path().join("group.odx");
+
+    Command::cargo_bin("odx")
+        .unwrap()
+        .arg("combine")
+        .arg(&a)
+        .arg(&b)
+        .args(["--method", "mean-fod", "--min-coverage", "1"])
+        .arg("--out-odx")
+        .arg(&out_odx)
+        .assert()
+        .success();
+
+    let ds = OdxDataset::open(&out_odx).unwrap();
+    assert_eq!(ds.nb_voxels(), 1, "--min-coverage 1 keeps only the shared voxel");
+}
+
+#[test]
+fn combine_rejects_out_of_range_min_coverage() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = tmp.path().join("a.odx");
+    create_combine_input(&a, [0.0, 0.0, 1.0]);
+    Command::cargo_bin("odx")
+        .unwrap()
+        .arg("combine")
+        .arg(&a)
+        .args(["--min-coverage", "1.5"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--min-coverage must be in [0, 1]"));
 }
 
 #[test]

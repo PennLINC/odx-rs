@@ -36,6 +36,16 @@ use crate::odx_file::OdxDataset;
 use crate::peak_finder::{peaks_from_sh_rows_with_basis, PeakFinderConfig, SpherePeakFinder};
 use crate::sh_basis_evaluator::ShBasisKind;
 use crate::stream::OdxBuilder;
+use crate::template::{
+    aggregate_fod, average_dpvs, aggregate_anisotropic_power, coverage_mask, flag_outliers, fod_qc,
+    peaks_from_aggregate, prepare_inputs, reference_header, AggregateOptions, AggregatedFod,
+    LmaxPolicy, LooMode, PreparedInput, ScaleMode, ShTarget,
+};
+
+/// Per-subject FOD rescaling for `mean-fod`, applied *before* averaging.
+/// Re-exported from [`crate::template`] so the existing `--normalize-fod`
+/// spelling keeps working.
+pub use crate::template::ScaleMode as NormalizeFod;
 
 /// How the group/template fixels are established.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,18 +55,6 @@ pub enum TemplateMethod {
     Cluster,
     /// Average `sh/coefficients` across inputs and peak-find the mean FOD.
     MeanFod,
-}
-
-/// Per-subject FOD normalization for the `mean-fod` method, applied *before*
-/// averaging (post-mean normalization is a no-op on peak directions).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NormalizeFod {
-    None,
-    /// Divide each row by its ℓ=0 (DC) coefficient.
-    L0,
-    /// Scale so the FOD integrates to 1 (differs from `L0` only by a constant —
-    /// identical peak *directions*, rescaled amplitudes).
-    Integral,
 }
 
 /// How to combine the per-subject masks into the template voxel set.
@@ -91,7 +89,27 @@ pub struct CombineOptions {
     pub mask_combine: MaskCombine,
     pub match_angle_deg: f32,
     pub peak_config: PeakFinderConfig,
-    pub normalize_fod: NormalizeFod,
+    pub normalize_fod: ScaleMode,
+    /// Keep a voxel when at least this fraction of inputs cover it. Overrides
+    /// `mask_combine` when set (`0` ≡ union, `1` ≡ intersection).
+    pub min_coverage: Option<f32>,
+    /// How the cohort's SH order is reconciled when inputs disagree.
+    pub lmax: LmaxPolicy,
+    /// Header/grid/basis reference; defaults to the first input.
+    pub reference: Option<PathBuf>,
+    /// Compute the FOD reproducibility block under methods other than
+    /// `mean-fod` (it is always on for `mean-fod` unless `no_fod_qc`).
+    pub fod_qc: bool,
+    /// Suppress the FOD reproducibility block entirely.
+    pub no_fod_qc: bool,
+    pub loo: LooMode,
+    /// Lowest SH band included in the angular correlation coefficient.
+    pub acc_lmin: usize,
+    /// Scalar DPVs to average onto the template. `None` averages every shared
+    /// scalar float DPV; `Some(vec![])` disables DPV averaging.
+    pub average_dpv: Option<Vec<String>>,
+    /// Also emit `<name>_sd` beside each averaged DPV.
+    pub dpv_sd: bool,
     /// `cluster`: minimum distinct subjects supporting a group fixel.
     pub min_subjects_per_group_fixel: usize,
     /// Restrict carried scalars; `None` carries every shared scalar float DPF.
@@ -109,7 +127,16 @@ impl Default for CombineOptions {
             mask_combine: MaskCombine::Union,
             match_angle_deg: 30.0,
             peak_config: PeakFinderConfig::default(),
-            normalize_fod: NormalizeFod::None,
+            normalize_fod: ScaleMode::None,
+            min_coverage: None,
+            lmax: LmaxPolicy::Min,
+            reference: None,
+            fod_qc: false,
+            no_fod_qc: false,
+            loo: LooMode::Auto,
+            acc_lmin: 2,
+            average_dpv: None,
+            dpv_sd: false,
             min_subjects_per_group_fixel: 2,
             matched_scalars: None,
             match_angle_sweep: Vec::new(),
@@ -144,7 +171,46 @@ pub struct CombineReport {
     pub n_reference_scans: usize,
     pub matched_scalar_keys: Vec<String>,
     pub design_columns: Vec<String>,
+    /// Voxel-inclusion threshold actually applied (`--min-coverage`, or the
+    /// `--mask-combine` equivalent).
+    pub min_coverage: f32,
+    pub lmax_policy: String,
+    /// Resolved SH metadata of the aggregate; `None` when no FOD was averaged.
+    pub sh_order: Option<u64>,
+    pub sh_basis: Option<String>,
+    /// `"on"`, `"off"`, or `"unavailable"` when no FOD block ran.
+    pub loo: String,
+    pub acc_lmin: usize,
+    pub mean_acc: Option<f64>,
+    pub mean_acc_loo: Option<f64>,
+    pub averaged_dpv: Vec<String>,
+    pub subjects: Vec<CombineSubjectRow>,
+    /// Keys of the subjects flagged by the outlier rule.
+    pub outliers: Vec<String>,
     pub written_paths: Vec<String>,
+}
+
+/// Per-subject QC, so a scan that does not belong in the template is visible
+/// rather than silently averaged in.
+#[derive(Debug, Clone, Serialize)]
+pub struct CombineSubjectRow {
+    pub key: String,
+    pub path: String,
+    /// Template voxels this input covers.
+    pub n_voxels: u64,
+    pub coverage_frac: f64,
+    pub n_fixels: u64,
+    /// Mean angular correlation against the template, over covered voxels.
+    /// `NaN` when the FOD block did not run.
+    pub mean_acc: f32,
+    /// Mean leave-one-out angular correlation. `NaN` when LOO is off.
+    pub mean_acc_loo: f32,
+    /// This input's SH had to be rewritten into the reference basis.
+    pub basis_converted: bool,
+    /// Set when the input's own lmax exceeded the resolved cohort lmax.
+    pub lmax_truncated_from: Option<u64>,
+    pub is_outlier: bool,
+    pub outlier_reasons: Vec<String>,
 }
 
 /// Group fixels in template compact-voxel order, plus per-fixel metadata.
@@ -156,8 +222,9 @@ struct Template {
     rank: Vec<u32>,
     is_primary: Vec<u8>,
     strength: Vec<f32>,
-    /// (mean SH row-major, ncoeffs, sh_order, basis) for `mean-fod`.
-    mean_sh: Option<(Vec<f32>, usize, u64, String)>,
+    /// The aggregated FOD field for `mean-fod`, carrying the resolved SH
+    /// metadata the writer needs.
+    mean_sh: Option<AggregatedFod>,
 }
 
 /// Combine many template-space ODX files into a group ODX with per-subject
@@ -239,11 +306,51 @@ pub fn combine_odx(
 
     let cos_thresh = opts.match_angle_deg.to_radians().cos();
 
+    // ── Prepare inputs for FOD aggregation ────────────────────────────────
+    // Needed by `mean-fod`, and by the QC block under any method. Skipped when
+    // no SH is available, so `--method cluster` still works on peak-only files.
+    let labels: Vec<String> = inputs.iter().map(|i| i.path.display().to_string()).collect();
+    let want_fod = matches!(opts.method, TemplateMethod::MeanFod) || opts.fod_qc;
+    let has_sh = datasets.iter().all(|d| d.get_sh("coefficients").is_some());
+    let agg_opts = AggregateOptions {
+        scale: opts.normalize_fod,
+        min_coverage: opts.min_coverage.unwrap_or(match opts.mask_combine {
+            MaskCombine::Union => 0.0,
+            MaskCombine::Intersection => 1.0,
+        }),
+        lmax: opts.lmax,
+        loo: opts.loo,
+        acc_lmin: opts.acc_lmin,
+    };
+    let fod_prepared: Option<(Vec<PreparedInput>, ShTarget)> = if want_fod {
+        if !has_sh && !matches!(opts.method, TemplateMethod::MeanFod) {
+            eprintln!(
+                "odx combine: warning: --fod-qc needs sh/coefficients on every input; \
+                 skipping the FOD QC block"
+            );
+            None
+        } else {
+            let (ref_target, _, _) =
+                reference_header(&datasets, &labels, opts.reference.as_deref())?;
+            Some(prepare_inputs(
+                &datasets,
+                &labels,
+                dims,
+                &affine,
+                &ref_target,
+                opts.lmax,
+            )?)
+        }
+    } else {
+        None
+    };
+
     // ── Build the template ────────────────────────────────────────────────
     let mut template = if let Some(tpath) = opts.template_override.as_ref() {
         build_template_override(tpath, dims, &affine)?
     } else {
-        // Coverage counts → template mask.
+        // Coverage counts → template mask. `--min-coverage` generalizes
+        // `--mask-combine`: 0 is a union, 1 an intersection.
         let mut present = vec![0u32; total_voxels];
         for lk in &input_lookup {
             for (flat, &c) in lk.iter().enumerate() {
@@ -252,13 +359,11 @@ pub fn combine_odx(
                 }
             }
         }
+        let frac = agg_opts.min_coverage.clamp(0.0, 1.0) as f64;
         let mut mask = vec![0u8; total_voxels];
         for (flat, m) in mask.iter_mut().enumerate() {
-            let keep = match opts.mask_combine {
-                MaskCombine::Union => present[flat] >= 1,
-                MaskCombine::Intersection => present[flat] as usize == n_inputs,
-            };
-            if keep {
+            let c = present[flat];
+            if c > 0 && (c as f64) / (n_inputs as f64) >= frac - 1e-9 {
                 *m = 1;
             }
         }
@@ -272,15 +377,63 @@ pub fn combine_odx(
                 cos_thresh,
                 opts.min_subjects_per_group_fixel,
             )?,
-            TemplateMethod::MeanFod => build_template_mean_fod(
-                &datasets,
-                &mask,
-                dims,
-                opts.normalize_fod,
-                &opts.peak_config,
-            )?,
+            TemplateMethod::MeanFod => {
+                let (prepared, target) = fod_prepared
+                    .as_ref()
+                    .expect("mean-fod always prepares inputs");
+                build_template_mean_fod(
+                    &datasets,
+                    prepared,
+                    &mask,
+                    dims,
+                    target,
+                    &agg_opts,
+                    &opts.peak_config,
+                )?
+            }
         }
     };
+
+    // ── Aggregate the FOD onto the template voxel set ─────────────────────
+    // `mean-fod` already did this (its fixels *are* the aggregate's peaks); the
+    // other methods aggregate onto the template they just built, so the QC maps
+    // line up with the template's voxels either way.
+    let aggregate: Option<AggregatedFod> = if opts.no_fod_qc {
+        template.mean_sh.take()
+    } else if let Some(agg) = template.mean_sh.take() {
+        Some(agg)
+    } else if let Some((prepared, target)) = fod_prepared.as_ref() {
+        Some(aggregate_fod(
+            &datasets,
+            prepared,
+            dims,
+            &template.mask,
+            target,
+            &agg_opts,
+        )?)
+    } else {
+        None
+    };
+    let qc = match (opts.no_fod_qc, aggregate.as_ref(), fod_prepared.as_ref()) {
+        (false, Some(agg), Some((prepared, _))) => {
+            Some(fod_qc(&datasets, prepared, dims, agg, &agg_opts)?)
+        }
+        _ => None,
+    };
+    // Scalar DPVs shared by every input, averaged with the same per-voxel
+    // contributor divisor as the FOD.
+    let dpv_means: Vec<(String, Vec<f32>, Vec<f32>)> =
+        match (aggregate.as_ref(), fod_prepared.as_ref()) {
+            (Some(agg), Some((prepared, _))) if opts.average_dpv != Some(Vec::new()) => {
+                let keys = shared_scalar_keys(
+                    &datasets,
+                    ArrayKind::Dpv,
+                    opts.average_dpv.as_deref(),
+                );
+                average_dpvs(&datasets, prepared, dims, agg, &keys)?
+            }
+            _ => Vec::new(),
+        };
 
     // Sign-canonicalize reference directions so the tangent frame + signed
     // residual are deterministic (fixels are undirected). For 'cluster' these
@@ -600,11 +753,33 @@ pub fn combine_odx(
         let e2_flat: Vec<f32> = frames.iter().flat_map(|f| f.1).collect();
         b.set_dpf_data("tangent_e1", vec_into_bytes(e1_flat), 3, DType::Float32);
         b.set_dpf_data("tangent_e2", vec_into_bytes(e2_flat), 3, DType::Float32);
-        // mean-fod SH for inspectability / re-peaking
-        if let Some((sh, ncoeffs, order, basis)) = template.mean_sh.as_ref() {
-            b.set_sh_info(*order, basis.clone());
-            b.set_sh_full_basis(false);
-            b.set_sh_data("coefficients", vec_into_bytes(sh.clone()), *ncoeffs, DType::Float32);
+        // ── FOD reproducibility block (per-voxel) ─────────────────────────
+        for (name, data) in voxel_qc_arrays(&aggregate, &qc, &dpv_means, opts.dpv_sd) {
+            b.set_dpv_data(&name, vec_into_bytes(data), 1, DType::Float32);
+        }
+        if let Some(agg) = aggregate.as_ref() {
+            b.set_dpv_data(
+                "n_subjects",
+                vec_into_bytes(agg.counts.clone()),
+                1,
+                DType::UInt32,
+            );
+        }
+        // the aggregated FOD, for inspectability / re-peaking
+        if let Some(agg) = aggregate.as_ref() {
+            // All four fields together define the basis: `compute_peaks` and every
+            // downstream reader resolve it from sh_basis + sh_order +
+            // sh_full_basis + sh_legacy, so dropping any one of them silently
+            // re-evaluates the template in the wrong basis.
+            b.set_sh_info(agg.target.order, agg.target.basis_name.clone());
+            b.set_sh_full_basis(agg.target.full_basis);
+            b.set_sh_legacy(agg.target.legacy);
+            b.set_sh_data(
+                "coefficients",
+                vec_into_bytes(agg.sh.clone()),
+                agg.target.ncoeffs,
+                DType::Float32,
+            );
         }
         // metadata: subject order + design + provenance
         b.set_extra_value(
@@ -621,6 +796,16 @@ pub fn combine_odx(
                 "reference_scans": inputs.iter().filter(|i| i.is_reference).map(|i| i.key.clone()).collect::<Vec<_>>(),
                 "n_unmatched_per_subject": n_unmatched,
                 "has_tangent_frame": true,
+                "min_coverage": agg_opts.min_coverage,
+                "divisor": "per-voxel-contributors",
+                "lmax_policy": opts.lmax.label(),
+                "sh_order": aggregate.as_ref().map(|a| a.target.order),
+                "sh_basis": aggregate.as_ref().map(|a| a.target.basis_name.clone()),
+                "sh_full_basis": aggregate.as_ref().map(|a| a.target.full_basis),
+                "sh_legacy": aggregate.as_ref().map(|a| a.target.legacy),
+                "loo": qc.as_ref().map(|q| q.loo_enabled),
+                "acc_lmin": opts.acc_lmin,
+                "averaged_dpv": dpv_means.iter().map(|(k, _, _)| k.clone()).collect::<Vec<_>>(),
             }),
         );
         let dataset = b.finalize()?;
@@ -731,6 +916,18 @@ pub fn combine_odx(
             write_voxel_scalar_nifti_f32(&path, data, &template.ijk, dims_us, affine)?;
             written.push(path.display().to_string());
         }
+        // the FOD reproducibility block, same maps as the group ODX carries
+        for (name, data) in voxel_qc_arrays(&aggregate, &qc, &dpv_means, opts.dpv_sd) {
+            let path = dir.join(format!("{name}.nii.gz"));
+            write_voxel_scalar_nifti_f32(&path, &data, &template.ijk, dims_us, affine)?;
+            written.push(path.display().to_string());
+        }
+        if let Some(agg) = aggregate.as_ref() {
+            let counts: Vec<f32> = agg.counts.iter().map(|&c| c as f32).collect();
+            let path = dir.join("n_subjects.nii.gz");
+            write_voxel_scalar_nifti_f32(&path, &counts, &template.ijk, dims_us, affine)?;
+            written.push(path.display().to_string());
+        }
     }
 
     let mean_angle_deg = if total_matched > 0 {
@@ -750,6 +947,67 @@ pub fn combine_odx(
     };
     let n_reference_scans = inputs.iter().filter(|i| i.is_reference).count();
 
+    // ── Per-subject QC rows + outlier flagging ────────────────────────────
+    let subject_voxels: Vec<u64> = qc
+        .as_ref()
+        .map(|q| q.subject_voxels.clone())
+        .unwrap_or_else(|| vec![0; n_inputs]);
+    let coverage: Vec<f64> = subject_voxels
+        .iter()
+        .map(|&v| if n_vox > 0 { v as f64 / n_vox as f64 } else { 0.0 })
+        .collect();
+    let subj_acc: Vec<f32> = qc
+        .as_ref()
+        .map(|q| q.subject_acc.clone())
+        .unwrap_or_else(|| vec![f32::NAN; n_inputs]);
+    let subj_acc_loo: Vec<f32> = qc
+        .as_ref()
+        .map(|q| q.subject_acc_loo.clone())
+        .unwrap_or_else(|| vec![f32::NAN; n_inputs]);
+    // With no FOD block there is nothing to flag on but coverage, which is
+    // itself derived from the FOD pass — so skip flagging entirely.
+    let reasons = if qc.is_some() {
+        flag_outliers(&subj_acc_loo, &coverage)
+    } else {
+        vec![Vec::new(); n_inputs]
+    };
+    let subject_rows: Vec<CombineSubjectRow> = (0..n_inputs)
+        .map(|s| CombineSubjectRow {
+            key: subjects[s].clone(),
+            path: inputs[s].path.display().to_string(),
+            n_voxels: subject_voxels[s],
+            coverage_frac: coverage[s],
+            n_fixels: (input_offsets[s].len().saturating_sub(1)) as u64,
+            mean_acc: subj_acc[s],
+            mean_acc_loo: subj_acc_loo[s],
+            basis_converted: fod_prepared
+                .as_ref()
+                .map(|(p, _)| p[s].basis_converted)
+                .unwrap_or(false),
+            lmax_truncated_from: fod_prepared
+                .as_ref()
+                .and_then(|(p, _)| p[s].lmax_truncated_from),
+            is_outlier: !reasons[s].is_empty(),
+            outlier_reasons: reasons[s].clone(),
+        })
+        .collect();
+    let outliers: Vec<String> = subject_rows
+        .iter()
+        .filter(|r| r.is_outlier)
+        .map(|r| r.key.clone())
+        .collect();
+    for r in subject_rows.iter().filter(|r| r.is_outlier) {
+        eprintln!(
+            "odx combine: warning: '{}' looks like an outlier: {}",
+            r.key,
+            r.outlier_reasons.join("; ")
+        );
+    }
+    let finite_mean = |v: &[f32]| -> Option<f64> {
+        let f: Vec<f64> = v.iter().filter(|x| x.is_finite()).map(|&x| x as f64).collect();
+        (!f.is_empty()).then(|| f.iter().sum::<f64>() / f.len() as f64)
+    };
+
     Ok(CombineReport {
         method: method_str(opts.method).to_string(),
         n_inputs,
@@ -759,12 +1017,22 @@ pub fn combine_odx(
         }
         .to_string(),
         match_angle_deg: opts.match_angle_deg,
-        normalize_fod: match opts.normalize_fod {
-            NormalizeFod::None => "none",
-            NormalizeFod::L0 => "l0",
-            NormalizeFod::Integral => "integral",
-        }
-        .to_string(),
+        normalize_fod: opts.normalize_fod.label().to_string(),
+        min_coverage: agg_opts.min_coverage,
+        lmax_policy: opts.lmax.label(),
+        sh_order: aggregate.as_ref().map(|a| a.target.order),
+        sh_basis: aggregate.as_ref().map(|a| a.target.basis_name.clone()),
+        loo: match qc.as_ref() {
+            None => "unavailable".to_string(),
+            Some(q) if q.loo_enabled => "on".to_string(),
+            Some(_) => "off".to_string(),
+        },
+        acc_lmin: opts.acc_lmin,
+        mean_acc: finite_mean(&subj_acc),
+        mean_acc_loo: finite_mean(&subj_acc_loo),
+        averaged_dpv: dpv_means.iter().map(|(k, _, _)| k.clone()).collect(),
+        subjects: subject_rows,
+        outliers,
         dims,
         n_template_voxels: n_vox as u64,
         n_template_fixels: n_fixels as u64,
@@ -861,85 +1129,23 @@ fn build_template_cluster(
     Ok(Template { mask: mask.to_vec(), ijk, offsets, dirs, rank, is_primary, strength, mean_sh: None })
 }
 
+/// Group fixels from the mean FOD: delegate the aggregation to
+/// [`crate::template`], then peak-find the aggregate **in its own SH basis**.
+///
+/// The basis matters: assuming tournier07 here silently mis-orients every peak
+/// of a descoteaux07 cohort, and dropping the `legacy` bit flips the sign of the
+/// m<0 coefficients.
 fn build_template_mean_fod(
     datasets: &[OdxDataset],
+    prepared: &[PreparedInput],
     mask: &[u8],
     dims: [u64; 3],
-    normalize: NormalizeFod,
+    target: &ShTarget,
+    agg_opts: &AggregateOptions,
     peak_config: &PeakFinderConfig,
 ) -> Result<Template> {
-    let (ny, nz) = (dims[1] as usize, dims[2] as usize);
-    let header0 = datasets[0].header();
-    let order = header0
-        .sh_order
-        .ok_or_else(|| OdxError::Argument("mean-fod requires SH; input 0 has no sh_order (try --method cluster)".into()))?;
-    let basis = header0
-        .sh_basis
-        .clone()
-        .ok_or_else(|| OdxError::Argument("mean-fod requires SH basis metadata (try --method cluster)".into()))?;
-
-    let arr0 = datasets[0]
-        .get_sh("coefficients")
-        .ok_or_else(|| OdxError::Argument("mean-fod requires sh/coefficients on every input (try --method cluster)".into()))?;
-    let ncoeffs = arr0.ncols();
-
-    let flat_to_t = compact_index_map(mask, dims);
-    let n_vox = flat_to_t.iter().filter(|&&c| c != usize::MAX).count();
-
-    let mut sum_sh = vec![0.0f32; n_vox * ncoeffs];
-    let mut counts = vec![0u32; n_vox];
-
-    for (s, ds) in datasets.iter().enumerate() {
-        let arr = ds.get_sh("coefficients").ok_or_else(|| {
-            OdxError::Argument(format!(
-                "mean-fod: input {s} has no sh/coefficients (try --method cluster)"
-            ))
-        })?;
-        if arr.ncols() != ncoeffs {
-            return Err(OdxError::Argument(format!(
-                "mean-fod: input {s} has {} SH coeffs, expected {ncoeffs}",
-                arr.ncols()
-            )));
-        }
-        let rows = arr.to_f32_vec()?;
-        let ijk_s = ds.compact_to_ijk();
-        for (c, v) in ijk_s.iter().enumerate() {
-            let flat = v[0] as usize * ny * nz + v[1] as usize * nz + v[2] as usize;
-            let t = flat_to_t[flat];
-            if t == usize::MAX {
-                continue;
-            }
-            let row = &rows[c * ncoeffs..(c + 1) * ncoeffs];
-            let scale = match normalize {
-                NormalizeFod::None => 1.0,
-                NormalizeFod::L0 => {
-                    let c0 = row[0];
-                    if c0.abs() > 1e-8 { 1.0 / c0 } else { 1.0 }
-                }
-                NormalizeFod::Integral => {
-                    let c0 = row[0];
-                    if c0.abs() > 1e-8 { 1.0 / (c0 * 2.0 * std::f32::consts::PI.sqrt()) } else { 1.0 }
-                }
-            };
-            let dst = &mut sum_sh[t * ncoeffs..(t + 1) * ncoeffs];
-            for (d, &r) in dst.iter_mut().zip(row.iter()) {
-                *d += r * scale;
-            }
-            counts[t] += 1;
-        }
-    }
-    for t in 0..n_vox {
-        let c = counts[t].max(1) as f32;
-        for x in &mut sum_sh[t * ncoeffs..(t + 1) * ncoeffs] {
-            *x /= c;
-        }
-    }
-
-    let lmax = lmax_for_ncoeffs(ncoeffs)?;
-    let finder = SpherePeakFinder::for_dsistudio_odf8(peak_config.clone());
-    let (offsets, dirs, amps) =
-        peaks_from_sh_rows_with_basis(&sum_sh, n_vox, &finder, ShBasisKind::MrtrixTournier { lmax })?;
-
+    let agg = aggregate_fod(datasets, prepared, dims, mask, target, agg_opts)?;
+    let (offsets, dirs, amps) = peaks_from_aggregate(&agg, peak_config, None)?;
     let ijk = mask_compact_ijk(mask, dims);
     let (rank, is_primary) = ranks_from_offsets(&offsets);
     Ok(Template {
@@ -950,7 +1156,7 @@ fn build_template_mean_fod(
         rank,
         is_primary,
         strength: amps,
-        mean_sh: Some((sum_sh, ncoeffs, order, basis)),
+        mean_sh: Some(agg),
     })
 }
 
@@ -1182,6 +1388,47 @@ fn ranks_from_offsets(offsets: &[u32]) -> (Vec<u32>, Vec<u8>) {
     (rank, is_primary)
 }
 
+/// The scalar per-voxel arrays of the FOD reproducibility block, in a stable
+/// order, as `(name, values)` in template compact-voxel order.
+///
+/// `anisotropic_power` is recomputed from the aggregate rather than averaged
+/// from the inputs, because the anisotropic power of a mean is not the mean of
+/// the anisotropic powers.
+fn voxel_qc_arrays(
+    aggregate: &Option<AggregatedFod>,
+    qc: &Option<crate::template::FodQc>,
+    dpv_means: &[(String, Vec<f32>, Vec<f32>)],
+    dpv_sd: bool,
+) -> Vec<(String, Vec<f32>)> {
+    let mut out: Vec<(String, Vec<f32>)> = Vec::new();
+    if let Some(q) = qc {
+        out.push(("coverage_frac".into(), q.coverage_frac.clone()));
+        out.push(("l0_mean".into(), q.l0_mean.clone()));
+        out.push(("l0_sd".into(), q.l0_sd.clone()));
+        out.push(("l0_cv".into(), q.l0_cv.clone()));
+        out.push(("acc_mean".into(), q.acc_mean.clone()));
+        out.push(("acc_sd".into(), q.acc_sd.clone()));
+        out.push(("acc_min".into(), q.acc_min.clone()));
+        if q.loo_enabled {
+            out.push(("acc_loo_mean".into(), q.acc_loo_mean.clone()));
+            out.push(("acc_loo_min".into(), q.acc_loo_min.clone()));
+        }
+    }
+    if let Some(agg) = aggregate {
+        out.push((
+            "anisotropic_power".into(),
+            aggregate_anisotropic_power(agg),
+        ));
+    }
+    for (name, mean, sd) in dpv_means {
+        out.push((name.clone(), mean.clone()));
+        if dpv_sd {
+            out.push((format!("{name}_sd"), sd.clone()));
+        }
+    }
+    out
+}
+
 fn method_str(m: TemplateMethod) -> &'static str {
     match m {
         TemplateMethod::Cluster => "cluster",
@@ -1380,6 +1627,16 @@ mod tests {
     use crate::mmap_backing::vec_into_bytes;
     use crate::odx_file::OdxDataset;
     use crate::stream::OdxBuilder;
+use crate::template::{
+    aggregate_fod, average_dpvs, aggregate_anisotropic_power, coverage_mask, flag_outliers, fod_qc,
+    peaks_from_aggregate, prepare_inputs, reference_header, AggregateOptions, AggregatedFod,
+    LmaxPolicy, LooMode, PreparedInput, ScaleMode, ShTarget,
+};
+
+/// Per-subject FOD rescaling for `mean-fod`, applied *before* averaging.
+/// Re-exported from [`crate::template`] so the existing `--normalize-fod`
+/// spelling keeps working.
+pub use crate::template::ScaleMode as NormalizeFod;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 

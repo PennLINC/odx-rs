@@ -23,6 +23,7 @@ pub mod densify;
 pub mod sh_basis_evaluator;
 pub mod sphere_lookup;
 pub mod stream;
+pub mod template;
 pub mod transform;
 pub mod typed_view;
 pub mod validate;
@@ -31,9 +32,10 @@ pub use data_array::{DataArray, DataArrayInfo};
 pub use dtype::{DType, OdxScalar};
 pub use error::{OdxError, Result};
 pub use combine::{
-    combine_odx, CombineInput, CombineOptions, CombineOutputs, CombineReport, MaskCombine,
-    NormalizeFod, TemplateMethod,
+    combine_odx, CombineInput, CombineOptions, CombineOutputs, CombineReport, CombineSubjectRow,
+    MaskCombine, NormalizeFod, TemplateMethod,
 };
+pub use template::{AggregateOptions, LmaxPolicy, LooMode, ScaleMode, ShTarget};
 pub use compare::{compare_odx, CompareOptions, CompareReport};
 pub use formats::dsistudio;
 pub use formats::mif;

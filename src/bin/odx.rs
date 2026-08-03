@@ -19,8 +19,8 @@ use odx_rs::pam::{self, PamWriteOptions};
 use odx_rs::{
     combine_odx, compare_odx, compute_fixel_qc, write_qc_class_dpf, CombineInput, CombineOptions,
     CombineOutputs, CombineReport, CompareOptions, CompareReport, FixelQcOptions, FixelQcReport,
-    MaskCombine, NormalizeFod, OdxDataset, OdxError, OdxWritePolicy, PeakFinderConfig,
-    TemplateMethod, ThresholdMode,
+    LmaxPolicy, LooMode, MaskCombine, NormalizeFod, OdxDataset, OdxError, OdxWritePolicy,
+    PeakFinderConfig, TemplateMethod, ThresholdMode,
 };
 
 #[derive(Parser, Debug)]
@@ -483,8 +483,62 @@ struct CombineArgs {
     #[arg(long = "match-angle-deg", default_value_t = 30.0)]
     match_angle_deg: f32,
     /// `mean-fod` only: per-subject FOD normalization applied before averaging.
+    /// `none` is correct for quantitative reconstructions (`consh
+    /// --quantitative`, `mtnormalise`d FODs) whose amplitudes already share a
+    /// unit; `l0`/`integral` are per-voxel and destroy apparent-fibre-density
+    /// contrast, leaving a shape-only template.
     #[arg(long = "normalize-fod", value_enum, default_value = "none")]
     normalize_fod: NormalizeFodArg,
+    /// Keep a voxel when at least this FRACTION of inputs cover it. `0` is a
+    /// mask union, `1` an intersection; `0.5` is the recommended template
+    /// setting. Partially-covered voxels are divided by their own contributor
+    /// count, never by N, so the mask edge grows no spurious low-AFD rim.
+    /// Generalizes (and overrides) --mask-combine.
+    #[arg(long = "min-coverage", conflicts_with = "mask_combine")]
+    min_coverage: Option<f32>,
+    /// SH order policy when inputs disagree: `min` truncates every input to the
+    /// smallest lmax present (default, and the uniform choice), `max` zero-pads,
+    /// or give an explicit even integer.
+    #[arg(long = "lmax", default_value = "min")]
+    lmax: String,
+    /// Header/grid/SH-basis reference (default: the first input). Inputs in a
+    /// different basis are converted to this one before averaging.
+    #[arg(long = "reference")]
+    reference: Option<PathBuf>,
+    /// Compute the FOD reproducibility block (coverage, l0 spread, angular
+    /// correlation) under `--method cluster` or `--template` too. It is always
+    /// on for `--method mean-fod`. Needs sh/coefficients on every input.
+    #[arg(long = "fod-qc")]
+    fod_qc: bool,
+    /// Skip the FOD reproducibility block entirely.
+    #[arg(long = "no-fod-qc", conflicts_with = "fod_qc")]
+    no_fod_qc: bool,
+    /// Leave-one-out angular correlation: each subject is scored against a
+    /// template with its own contribution removed, so the score is not inflated
+    /// by self-similarity. `auto` = on for 3..=20 inputs.
+    #[arg(long = "loo", value_enum, default_value = "auto")]
+    loo: LooArg,
+    /// Lowest SH band included in the angular correlation coefficient. `2`
+    /// excludes the isotropic term, which otherwise drives ACC to ~1 even in CSF.
+    #[arg(long = "acc-lmin", default_value_t = 2)]
+    acc_lmin: usize,
+    /// Average this per-voxel scalar (DPV) onto the template (repeatable).
+    /// Default: every scalar float DPV present on all inputs.
+    #[arg(long = "average-dpv", action = clap::ArgAction::Append)]
+    average_dpv: Vec<String>,
+    /// Skip DPV averaging.
+    #[arg(long = "no-average-dpv", conflicts_with = "average_dpv")]
+    no_average_dpv: bool,
+    /// Also emit `<name>_sd` beside each averaged DPV.
+    #[arg(long = "dpv-sd")]
+    dpv_sd: bool,
+    /// Also write the JSON report to this path.
+    #[arg(long = "out-report")]
+    out_report: Option<PathBuf>,
+    /// Exit nonzero if any subject is flagged as an outlier. Off by default —
+    /// the rule warns loudly and never drops a scan on its own.
+    #[arg(long = "fail-on-outlier")]
+    fail_on_outlier: bool,
     /// `mean-fod` peak finding: max peaks per voxel.
     #[arg(long = "npeaks", default_value_t = 5)]
     npeaks: usize,
@@ -584,6 +638,23 @@ impl From<TemplateMethodArg> for TemplateMethod {
         match v {
             TemplateMethodArg::Cluster => TemplateMethod::Cluster,
             TemplateMethodArg::MeanFod => TemplateMethod::MeanFod,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum LooArg {
+    Auto,
+    On,
+    Off,
+}
+
+impl From<LooArg> for LooMode {
+    fn from(v: LooArg) -> Self {
+        match v {
+            LooArg::Auto => LooMode::Auto,
+            LooArg::On => LooMode::On,
+            LooArg::Off => LooMode::Off,
         }
     }
 }
@@ -1094,6 +1165,20 @@ fn run_combine(args: CombineArgs) -> odx_rs::Result<()> {
         }
     }
 
+    if let Some(mc) = args.min_coverage {
+        if !mc.is_finite() || !(0.0..=1.0).contains(&mc) {
+            return Err(OdxError::Argument(format!(
+                "--min-coverage must be in [0, 1], got {mc}"
+            )));
+        }
+    }
+    if args.acc_lmin % 2 != 0 {
+        return Err(OdxError::Argument(format!(
+            "--acc-lmin must be even (the symmetric SH bases hold even orders only), got {}",
+            args.acc_lmin
+        )));
+    }
+
     let opts = CombineOptions {
         method: args.method.into(),
         template_override: args.template.clone(),
@@ -1105,6 +1190,21 @@ fn run_combine(args: CombineArgs) -> odx_rs::Result<()> {
             min_separation_angle_deg: args.min_separation_angle,
         },
         normalize_fod: args.normalize_fod.into(),
+        min_coverage: args.min_coverage,
+        lmax: LmaxPolicy::parse(&args.lmax)?,
+        reference: args.reference.clone(),
+        fod_qc: args.fod_qc,
+        no_fod_qc: args.no_fod_qc,
+        loo: args.loo.into(),
+        acc_lmin: args.acc_lmin,
+        average_dpv: if args.no_average_dpv {
+            Some(Vec::new())
+        } else if args.average_dpv.is_empty() {
+            None
+        } else {
+            Some(args.average_dpv.clone())
+        },
+        dpv_sd: args.dpv_sd,
         min_subjects_per_group_fixel: args.min_subjects,
         matched_scalars: if args.scalar.is_empty() {
             None
@@ -1124,10 +1224,20 @@ fn run_combine(args: CombineArgs) -> odx_rs::Result<()> {
     };
 
     let report = combine_odx(&inputs, &opts, &outputs)?;
+    if let Some(p) = args.out_report.as_ref() {
+        std::fs::write(p, serde_json::to_string_pretty(&report)?)?;
+    }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", render_combine_report(&report));
+    }
+    if args.fail_on_outlier && !report.outliers.is_empty() {
+        return Err(OdxError::Argument(format!(
+            "{} input(s) flagged as outliers: {}",
+            report.outliers.len(),
+            report.outliers.join(", ")
+        )));
     }
     Ok(())
 }
@@ -1174,8 +1284,55 @@ fn render_combine_report(r: &CombineReport) -> String {
             r.design_columns.join(", ")
         }
     ));
+    if let (Some(order), Some(basis)) = (r.sh_order, r.sh_basis.as_ref()) {
+        out.push_str(&format!(
+            "aggregate: lmax {order} {basis} (--lmax {}), min_coverage {:.2}\n",
+            r.lmax_policy, r.min_coverage
+        ));
+    }
+    if r.loo != "unavailable" {
+        out.push_str(&format!(
+            "acc (l>={}) mean: {}   leave-one-out [{}]: {}\n",
+            r.acc_lmin,
+            render_optional_f64(r.mean_acc),
+            r.loo,
+            render_optional_f64(r.mean_acc_loo)
+        ));
+    }
+    if !r.averaged_dpv.is_empty() {
+        out.push_str(&format!("averaged_dpv: {}\n", r.averaged_dpv.join(", ")));
+    }
+    if !r.subjects.is_empty() && r.sh_order.is_some() {
+        let width = r.subjects.iter().map(|s| s.key.len()).max().unwrap_or(7).max(7);
+        out.push_str(&format!(
+            "\n{:<width$}  {:>6}  {:>6}  {:>7}  {:>7}  {}\n",
+            "subject", "cov", "fixels", "acc", "acc_loo", "flags"
+        ));
+        for s in &r.subjects {
+            out.push_str(&format!(
+                "{:<width$}  {:>5.1}%  {:>6}  {:>7}  {:>7}  {}\n",
+                s.key,
+                s.coverage_frac * 100.0,
+                s.n_fixels,
+                render_f32(s.mean_acc),
+                render_f32(s.mean_acc_loo),
+                if s.is_outlier { "OUTLIER" } else { "" }
+            ));
+        }
+    }
+    for s in r.subjects.iter().filter(|s| s.is_outlier) {
+        out.push_str(&format!("outlier {}: {}\n", s.key, s.outlier_reasons.join("; ")));
+    }
     out.push_str(&format!("written: {} files\n", r.written_paths.len()));
     out
+}
+
+fn render_f32(v: f32) -> String {
+    if v.is_finite() {
+        format!("{v:.4}")
+    } else {
+        "n/a".to_string()
+    }
 }
 
 /// A parsed design/participants table (TSV/CSV): header columns, the key column
