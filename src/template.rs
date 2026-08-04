@@ -579,31 +579,45 @@ pub struct FodQc {
     /// Per subject: template voxels covered.
     pub subject_voxels: Vec<u64>,
     pub loo_enabled: bool,
+    /// Template voxels whose aggregate carries no anisotropic energy, so ACC is
+    /// undefined there. Large in multi-tissue cohorts, where the WM compartment
+    /// is identically zero over much of the brain mask.
+    pub n_voxels_without_orientation: u64,
 }
 
 /// Index of the first coefficient with ℓ >= `lmin`, i.e. how many leading
 /// coefficients the ACC skips.
+///
+/// In a symmetric basis only even bands are stored, so an odd `lmin` resolves
+/// to the next even band — `lmin = 3` must skip all of ℓ=2, not land in the
+/// middle of it.
 fn acc_skip(target: &ShTarget, lmin: usize) -> usize {
     if lmin == 0 {
         return 0;
     }
     if target.full_basis {
-        // Full basis packs every m of every ℓ: (lmin)² coefficients precede ℓ=lmin.
+        // Full basis packs every m of every ℓ: lmin² coefficients precede ℓ=lmin.
         (lmin * lmin).min(target.ncoeffs)
     } else {
-        // Symmetric basis holds even ℓ only; ℓ=lmin starts after ncoeffs(lmin-2).
-        if lmin < 2 {
-            0
-        } else {
-            mrtrix_sh::ncoeffs_for_lmax(lmin - 2).min(target.ncoeffs)
-        }
+        // Symmetric basis: round up to the next even band, then count what
+        // precedes it. ℓ=2 starts after ncoeffs(0)=1, ℓ=4 after ncoeffs(2)=6.
+        let even = lmin + (lmin % 2);
+        mrtrix_sh::ncoeffs_for_lmax(even - 2).min(target.ncoeffs)
     }
 }
 
 /// Angular correlation coefficient of two SH rows over the bands at or above
-/// `skip`. `NaN` when either side has no anisotropic energy.
+/// `skip`.
+///
+/// `NaN` when either side's anisotropic energy is at or below `floor`, which
+/// means the voxel carries no orientation information and any correlation
+/// between the two rows is arithmetic on rounding noise. This is not a corner
+/// case: multi-tissue deconvolution leaves the WM compartment identically zero
+/// across a large interior region of a brain mask, and without the floor those
+/// voxels return ~1/√n — a *finite* number that then drags every whole-brain
+/// summary toward it.
 #[inline]
-fn acc(u: &[f32], v: &[f32], skip: usize) -> f32 {
+fn acc(u: &[f32], v: &[f32], skip: usize, floor: f64) -> f32 {
     let (mut num, mut nu, mut nv) = (0.0f64, 0.0f64, 0.0f64);
     for k in skip..u.len() {
         let (a, b) = (u[k] as f64, v[k] as f64);
@@ -611,10 +625,39 @@ fn acc(u: &[f32], v: &[f32], skip: usize) -> f32 {
         nu += a * a;
         nv += b * b;
     }
-    if nu <= 0.0 || nv <= 0.0 {
+    let f2 = floor * floor;
+    if nu <= f2 || nv <= f2 {
         return f32::NAN;
     }
     (num / (nu.sqrt() * nv.sqrt())) as f32
+}
+
+/// The anisotropic-energy floor below which a row carries no orientation.
+///
+/// Scale-free by construction: `ANISOTROPY_FLOOR_FRACTION` of the median ℓ≥2
+/// norm over template voxels that have any. That adapts to whatever units the
+/// cohort is in (absolute AFD, S/S0, ℓ=0-normalized) instead of hardcoding a
+/// threshold that only suits one of them.
+const ANISOTROPY_FLOOR_FRACTION: f64 = 1e-6;
+
+fn anisotropy_floor(agg: &AggregatedFod, skip: usize) -> f64 {
+    let c = agg.ncoeffs();
+    let mut norms: Vec<f64> = (0..agg.n_voxels())
+        .map(|v| {
+            agg.sh[v * c + skip..(v + 1) * c]
+                .iter()
+                .map(|&x| (x as f64) * (x as f64))
+                .sum::<f64>()
+                .sqrt()
+        })
+        .filter(|n| *n > 0.0)
+        .collect();
+    if norms.is_empty() {
+        return 0.0;
+    }
+    let mid = norms.len() / 2;
+    norms.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    norms[mid] * ANISOTROPY_FLOOR_FRACTION
 }
 
 /// Running mean/sd/min accumulator that ignores `NaN`.
@@ -678,6 +721,7 @@ pub(crate) fn fod_qc(
     let n_vox = agg.n_voxels();
     let ncoeffs = agg.ncoeffs();
     let skip = acc_skip(&agg.target, opts.acc_lmin);
+    let floor = anisotropy_floor(agg, skip);
     let loo_enabled = opts.loo.resolve(n);
 
     let total = (dims[0] * dims[1] * dims[2]) as usize;
@@ -709,16 +753,21 @@ pub(crate) fn fod_qc(
             }
             read_sh_row(arr, c, &mut row)?;
             let scale = opts.scale.row_scale(row[0]);
+            // Record the ℓ=0 term BEFORE scaling. Under `--normalize-fod l0`
+            // the post-scale value is exactly 1.0 by construction, which would
+            // make l0_mean/sd/cv degenerate; the pre-scale value is the one
+            // that carries the apparent-fibre-density information.
+            let l0_raw = row[0];
             if scale != 1.0 {
                 for x in row.iter_mut() {
                     *x *= scale;
                 }
             }
             subject_voxels[s] += 1;
-            l0[t].push(row[0]);
+            l0[t].push(l0_raw);
 
             let tmpl = &agg.sh[t * ncoeffs..(t + 1) * ncoeffs];
-            let a = acc(&row, tmpl, skip);
+            let a = acc(&row, tmpl, skip, floor);
             acc_stats[t].push(a);
             subject_acc[s].push(a);
 
@@ -728,7 +777,7 @@ pub(crate) fn fod_qc(
                     // mean_{-i} = (c*mean - x) / (c - 1)
                     *d = (c_v * m - x) / (c_v - 1.0);
                 }
-                let al = acc(&row, &loo_row, skip);
+                let al = acc(&row, &loo_row, skip, floor);
                 acc_loo_stats[t].push(al);
                 subject_acc_loo[s].push(al);
             }
@@ -744,7 +793,15 @@ pub(crate) fn fod_qc(
         .map(|(&m, &s)| if m.abs() > 1e-12 { s / m } else { f32::NAN })
         .collect();
 
+    let n_voxels_without_orientation = (0..n_vox)
+        .filter(|&t| {
+            let row = &agg.sh[t * ncoeffs + skip..(t + 1) * ncoeffs];
+            row.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt() <= floor
+        })
+        .count() as u64;
+
     Ok(FodQc {
+        n_voxels_without_orientation,
         coverage_frac,
         l0_mean,
         l0_sd,
@@ -1256,7 +1313,7 @@ mod tests {
                     *m += x / 3.0;
                 }
             }
-            let want = acc(&rows[i], &mean, skip);
+            let want = acc(&rows[i], &mean, skip, 0.0);
             let got = qc.subject_acc_loo[i];
             assert!(
                 (want - got).abs() < 1e-5,
@@ -1366,6 +1423,108 @@ mod tests {
         assert!(r[0].is_empty());
         assert_eq!(r[1].len(), 1);
         assert!(r[1][0].starts_with("low_coverage"));
+    }
+
+    /// A voxel with no anisotropic energy carries no orientation, so ACC there
+    /// is arithmetic on rounding noise. Without a floor it returns ~1/sqrt(n) —
+    /// a *finite* value that drags every whole-brain summary toward it.
+    #[test]
+    fn zero_signal_voxels_give_nan_acc_not_one_over_sqrt_n() {
+        let tmp = TempDir::new().unwrap();
+        let dims = [1u64, 1, 2];
+        // v0: a real lobe. v1: pure denormal noise, as multi-tissue CSD leaves
+        // wherever the WM compartment went entirely to GM/CSF.
+        let lobe = lobe_sh([0.0, 0.0, 1.0], 8, 8.0);
+        let paths: Vec<PathBuf> = (0..8)
+            .map(|i| {
+                let mut dead = vec![0.0f32; 45];
+                // deterministic per-subject noise at the f32 rounding floor
+                for (k, x) in dead.iter_mut().enumerate() {
+                    *x = ((i * 7 + k * 13) % 17) as f32 * 1e-20;
+                }
+                build_sh_input(
+                    tmp.path(), &format!("s{i}"), identity_affine(), dims, vec![1, 1],
+                    vec![lobe.clone(), dead], 8, "tournier07", false,
+                )
+            })
+            .collect();
+        let ds = open_all(&paths).unwrap();
+        let l: Vec<String> = (0..8).map(|i| format!("s{i}")).collect();
+        let (prepared, target) = prep(&ds, &l, dims, &identity_affine(), LmaxPolicy::Min);
+        let opts = AggregateOptions { loo: LooMode::On, ..Default::default() };
+        let agg = aggregate_fod(
+            &ds, &prepared, dims, &coverage_mask(&lookups_of(&prepared), dims, 0.0), &target, &opts,
+        )
+        .unwrap();
+        let qc = fod_qc(&ds, &prepared, dims, &agg, &opts).unwrap();
+
+        assert!((qc.acc_mean[0] - 1.0).abs() < 1e-5, "the real lobe still scores 1");
+        assert!(
+            qc.acc_mean[1].is_nan(),
+            "the zero-signal voxel must be NaN, got {} (1/sqrt(8) = {})",
+            qc.acc_mean[1],
+            1.0 / 8f32.sqrt()
+        );
+        assert_eq!(qc.n_voxels_without_orientation, 1, "the count must be reported");
+    }
+
+    /// Under `--normalize-fod l0` every scaled row has c0 == 1 by construction,
+    /// so the l0 maps must record the PRE-scale value or they are degenerate.
+    #[test]
+    fn l0_stats_record_the_pre_scale_coefficient() {
+        let tmp = TempDir::new().unwrap();
+        let mk = |n: &str, c0: f32| {
+            let mut r = lobe_sh([0.0, 0.0, 1.0], 8, 8.0);
+            r[0] = c0;
+            build_sh_input(
+                tmp.path(), n, identity_affine(), [1, 1, 1], vec![1], vec![r], 8,
+                "tournier07", false,
+            )
+        };
+        let paths = vec![mk("a", 2.0), mk("b", 4.0), mk("c", 6.0)];
+        let ds = open_all(&paths).unwrap();
+        let l = labels(&["a", "b", "c"]);
+        let (prepared, target) = prep(&ds, &l, [1, 1, 1], &identity_affine(), LmaxPolicy::Min);
+        let opts = AggregateOptions { scale: ScaleMode::L0, ..Default::default() };
+        let agg = aggregate_fod(
+            &ds, &prepared, [1, 1, 1],
+            &coverage_mask(&lookups_of(&prepared), [1, 1, 1], 0.0), &target, &opts,
+        )
+        .unwrap();
+        let qc = fod_qc(&ds, &prepared, [1, 1, 1], &agg, &opts).unwrap();
+        assert!(
+            (qc.l0_mean[0] - 4.0).abs() < 1e-5,
+            "l0_mean must be the mean of 2/4/6 = 4, got {} (1.0 means the \
+             post-scale value leaked in)",
+            qc.l0_mean[0]
+        );
+        assert!(qc.l0_sd[0] > 1.0, "l0_sd must see the spread, got {}", qc.l0_sd[0]);
+    }
+
+    /// A symmetric basis stores even bands only, so an odd `acc_lmin` must
+    /// resolve to the next even band rather than landing inside a block.
+    #[test]
+    fn acc_skip_rounds_odd_lmin_up_to_the_next_even_band() {
+        let sym = ShTarget {
+            order: 8, ncoeffs: 45, basis_name: "tournier07".into(),
+            full_basis: false, legacy: false,
+        };
+        // tournier lmax 8 layout: l=0 at [0], l=2 at [1..6), l=4 at [6..15),
+        // l=6 at [15..28), l=8 at [28..45)
+        assert_eq!(acc_skip(&sym, 0), 0);
+        assert_eq!(acc_skip(&sym, 1), 1, "l>=1 in a symmetric basis means l>=2");
+        assert_eq!(acc_skip(&sym, 2), 1);
+        assert_eq!(acc_skip(&sym, 3), 6, "l>=3 means l>=4, not the middle of l=2");
+        assert_eq!(acc_skip(&sym, 4), 6);
+        assert_eq!(acc_skip(&sym, 6), 15);
+
+        let full = ShTarget {
+            order: 8, ncoeffs: 81, basis_name: "descoteaux07".into(),
+            full_basis: true, legacy: false,
+        };
+        assert_eq!(acc_skip(&full, 1), 1);
+        assert_eq!(acc_skip(&full, 2), 4, "full basis: l=2 starts after 1+3 = 4");
+        assert_eq!(acc_skip(&full, 3), 9);
     }
 
     #[test]

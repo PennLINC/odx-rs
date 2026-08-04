@@ -1298,6 +1298,13 @@ fn render_combine_report(r: &CombineReport) -> String {
             r.loo,
             render_optional_f64(r.mean_acc_loo)
         ));
+        if r.n_voxels_without_orientation > 0 {
+            out.push_str(&format!(
+                "  ({} of {} template voxels carry no anisotropic energy and are excluded \
+                 from the acc summaries)\n",
+                r.n_voxels_without_orientation, r.n_template_voxels
+            ));
+        }
     }
     if !r.averaged_dpv.is_empty() {
         out.push_str(&format!("averaged_dpv: {}\n", r.averaged_dpv.join(", ")));

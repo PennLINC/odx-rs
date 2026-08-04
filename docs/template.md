@@ -116,7 +116,7 @@ a `<name>.nii.gz` sidecar carrying the same numbers.
 | `n_subjects` (u32) | contributing inputs at this voxel |
 | `coverage_frac` | `n_subjects / N` |
 | `l0_mean`, `l0_sd`, `l0_cv` | ℓ=0 spread across contributors (`n−1` divisor, `NaN` below 2). **`l0_cv` is the test–retest AFD reproducibility map.** |
-| `acc_mean`, `acc_sd`, `acc_min` | angular correlation of each subject against the template |
+| `acc_mean`, `acc_sd`, `acc_min` | angular correlation of each subject against the template — a coefficient correlation, **not** an angle; see the calibration below |
 | `acc_loo_mean`, `acc_loo_min` | leave-one-out versions |
 | `anisotropic_power` | recomputed *from the aggregate* |
 | `<name>`, `<name>_sd` | averaged shared scalar DPVs |
@@ -134,9 +134,17 @@ ACC(u, v) = Σ_{ℓ≥L} u_k v_k / sqrt( Σ_{ℓ≥L} u_k² · Σ_{ℓ≥L} v_k�
 ```
 
 Excluding ℓ=0 is the whole point. The isotropic DC term dominates the inner
-product and would drive ACC to ~1 everywhere, including CSF. The value is `NaN`
-in a voxel with no anisotropic energy, and the accumulators skip `NaN` so those
-voxels do not poison the map.
+product and would drive ACC to ~1 everywhere, including CSF.
+
+The value is `NaN` where the aggregate carries no anisotropic energy, and the
+accumulators skip `NaN`. That floor is load-bearing rather than defensive:
+multi-tissue deconvolution leaves the WM compartment identically zero across a
+large interior region of a brain mask (16.2% of voxels in the cohort above), and
+a naive "norm > 0" test lets those rows through at ~1e-16, where ACC evaluates
+to `1/√n` on rounding noise — a *finite* value that drags every whole-brain
+summary toward it. The threshold is 1e-6 of the median ℓ≥2 norm over template
+voxels that have one, so it adapts to the cohort's units. The excluded count is
+reported as `n_voxels_without_orientation`; read the ACC numbers against it.
 
 ### Leave-one-out
 
@@ -234,9 +242,10 @@ reconstructed with `consh --quantitative --read-responses-from <pooled>`:
 |---|---|---|
 | template | 207 243 voxels, 376 091 fixels | 9 s wall clock for all 8 subjects |
 | peaks/voxel vs sessions | **0.934×** | matched peak finder; averaging suppresses noise lobes |
-| ACC median, WM | **0.982** | WM = top tercile of anisotropic power |
-| ACC median, whole brain | 0.845 | drops in GM/CSF, as expected |
-| leave-one-out self-bias | **0.098** | `acc_mean − acc_loo_mean` at n=8 |
+| ACC median, WM | **0.985** (leave-one-out 0.980) | WM = top tercile of anisotropic power |
+| ACC median, whole brain | 0.956 | over the 83.8% of voxels where ACC is defined |
+| leave-one-out self-bias | 0.070 | `acc_mean − acc_loo_mean` at n=8 |
+| voxels with no orientation | 33 543 (16.2%) | WM compartment identically zero; excluded from every ACC summary |
 | coverage | 2.2% of voxels below full | consistent with mask Dice 0.98–0.995 |
 | `l0_cv` median in WM | **7.5%** | the test–retest AFD reproducibility number |
 | pooled response spread | ≤0.7% (r₀), ≤2.8% (r₂) | across the 8 sessions, before pooling |
@@ -255,13 +264,47 @@ Two cross-checks worth repeating on new data:
   normalization would not be holding — worth knowing independently of the
   template.
 
-**Watch the peaks-per-voxel ratio.** It is the single most informative check
-here: if the template has *more* fixels per voxel than its inputs, the inputs
-are not aligned and the average is smearing distinct orientations into spurious
-crossings. Compare against a *matched* peak finder — a session ODX peak-found
-with `--peak-min-amplitude-frac` is not comparable to a template peak-found
-without one. A one-input `odx combine --method mean-fod --no-fod-qc` run
-re-peaks a session through the identical path.
+**Watch the peaks-per-voxel ratio.** If the template has *more* fixels per voxel
+than its inputs, the inputs are not aligned and the average is smearing distinct
+orientations into spurious crossings. Two traps in reading it:
+
+- Compare against a *matched* peak finder. A session ODX peak-found with
+  `--peak-min-amplitude-frac` is not comparable to a template peak-found without
+  one. A one-input `odx combine --method mean-fod --no-fod-qc` run re-peaks a
+  session through the identical path.
+- Restrict to voxels where every side has signal. In a multi-tissue cohort the
+  template's zero set is the *intersection* of the sessions' zero sets, so an
+  unrestricted ratio partly measures dead-voxel fractions rather than sharpness.
+  On matched support the ratio above is 0.99; in WM it is 0.97.
+
+## ACC is not an angle
+
+`acc_*` is a correlation of SH coefficient vectors, not an angular difference,
+and it is considerably more forgiving than one. Measured on this cohort in WM
+(Spearman −0.90 against the per-voxel mean fixel angle):
+
+| ACC | median fixel angle |
+|---|---|
+| ≥0.995 | 1.3° |
+| 0.990–0.995 | 1.9° |
+| 0.985–0.990 | 2.5° |
+| 0.980–0.985 | **3.0°** |
+| 0.970–0.980 | 3.6° |
+| 0.950–0.970 | 4.5° |
+| 0.900–0.950 | 5.8° |
+
+Near ACC = 1 the relationship follows roughly `θ ≈ 29·√(1 − ACC)` degrees, so
+ACC 0.99 is still about 2°, and you need ~0.998 before the angle drops below 1°.
+**Quote ACC with this calibration attached, or quote the angle instead.** The
+band powers in the denominator are cohort-specific, so recalibrate on your own
+data rather than reusing this table.
+
+The angular numbers for the same cohort, for comparison: 2.6° WM per-voxel
+median, 4.8° whole-brain, 6.4° as `combine` reports it (fixel-weighted, gated at
+30°, and **in-sample** — a subject scored against a template it helped build).
+Held-out sessions against retrained 7-session templates give 7.3–8.0°, and
+plain session-to-session `odx compare` gives 8.2–9.2°. `mean_angle_deg` has no
+leave-one-out variant, unlike ACC; treat it as optimistic by ~1.2–1.3×.
 
 ## Division of labour with the rest of `odx combine`
 

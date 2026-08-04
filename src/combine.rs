@@ -181,6 +181,11 @@ pub struct CombineReport {
     pub acc_lmin: usize,
     pub mean_acc: Option<f64>,
     pub mean_acc_loo: Option<f64>,
+    /// Template voxels whose aggregate carries no anisotropic energy, so ACC is
+    /// undefined there and they are excluded from every ACC summary. Large in
+    /// multi-tissue cohorts, where the WM compartment is identically zero over
+    /// much of the brain mask — read the ACC numbers against this count.
+    pub n_voxels_without_orientation: u64,
     pub averaged_dpv: Vec<String>,
     pub subjects: Vec<CombineSubjectRow>,
     /// Keys of the subjects flagged by the outlier rule.
@@ -1036,6 +1041,10 @@ pub fn combine_odx(
             Some(_) => "off".to_string(),
         },
         acc_lmin: opts.acc_lmin,
+        n_voxels_without_orientation: qc
+            .as_ref()
+            .map(|q| q.n_voxels_without_orientation)
+            .unwrap_or(0),
         mean_acc: finite_mean(&subj_acc),
         mean_acc_loo: finite_mean(&subj_acc_loo),
         averaged_dpv: dpv_means.iter().map(|(k, _, _)| k.clone()).collect(),
