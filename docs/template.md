@@ -162,6 +162,15 @@ costs nothing and needs no re-aggregation. MRtrix's `population_template` uses
 the same identity, auto-enabling it for `2 < n < 15`; `--loo auto` here is on
 for `3 ≤ n ≤ 20`.
 
+At **n = 2** the identity collapses to `T_{-i} = x_j`, so `acc_loo` becomes the
+direct pairwise agreement between the two scans — the number a two-session
+test-retest actually wants. `--loo on` enables it there; `auto` does not, so the
+default is unchanged. Note that a two-input "template" carries no more
+information than `odx compare` between the two scans: `acc_loo`, and the angles,
+are pairwise either way. Its value is the shared fixel geometry and the map
+layout, not extra statistical power. `l0_sd` has one degree of freedom and every
+`_sd` companion is degenerate.
+
 ### The report
 
 `--json` (or `--out-report <path>`) includes one row per subject:

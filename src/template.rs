@@ -76,6 +76,10 @@ pub enum LooMode {
     /// On for 3..=20 inputs. MRtrix's `population_template` uses `2 < n < 15`;
     /// the analytic form here is free, so the window is wider.
     Auto,
+    /// On whenever it is defined, which includes `n = 2`: there the leave-one-out
+    /// template reduces to the *other* input, so `acc_loo` becomes the direct
+    /// pairwise agreement — exactly the number a two-session test-retest wants.
+    /// The `_sd` companions are degenerate at `n = 2` (one value per voxel).
     On,
     Off,
 }
@@ -84,7 +88,7 @@ impl LooMode {
     fn resolve(self, n: usize) -> bool {
         match self {
             LooMode::Auto => (3..=20).contains(&n),
-            LooMode::On => n >= 3,
+            LooMode::On => n >= 2,
             LooMode::Off => false,
         }
     }
@@ -1320,6 +1324,50 @@ mod tests {
                 "subject {i}: analytic LOO {got} vs brute force {want}"
             );
         }
+    }
+
+    /// At n = 2 the leave-one-out template is algebraically the other input, so
+    /// acc_loo is the direct session-to-session agreement.
+    #[test]
+    fn loo_at_two_inputs_is_the_pairwise_agreement() {
+        let tmp = TempDir::new().unwrap();
+        let a_row = lobe_sh([0.0, 0.0, 1.0], 8, 8.0);
+        let b_row = lobe_sh([0.12, 0.0, 0.993], 8, 8.0);
+        let a = build_sh_input(
+            tmp.path(), "a", identity_affine(), [1, 1, 1], vec![1], vec![a_row.clone()], 8,
+            "tournier07", false,
+        );
+        let b = build_sh_input(
+            tmp.path(), "b", identity_affine(), [1, 1, 1], vec![1], vec![b_row.clone()], 8,
+            "tournier07", false,
+        );
+        let ds = open_all(&[a, b]).unwrap();
+        let l = labels(&["a", "b"]);
+        let (prepared, target) = prep(&ds, &l, [1, 1, 1], &identity_affine(), LmaxPolicy::Min);
+        let opts = AggregateOptions { loo: LooMode::On, ..Default::default() };
+        let agg = aggregate_fod(
+            &ds, &prepared, [1, 1, 1],
+            &coverage_mask(&lookups_of(&prepared), [1, 1, 1], 0.0), &target, &opts,
+        )
+        .unwrap();
+        let qc = fod_qc(&ds, &prepared, [1, 1, 1], &agg, &opts).unwrap();
+        assert!(qc.loo_enabled, "n=2 leave-one-out is well defined");
+
+        let skip = acc_skip(&target, 2);
+        let pairwise = acc(&a_row, &b_row, skip, 0.0);
+        assert!(
+            (qc.subject_acc_loo[0] - pairwise).abs() < 1e-5,
+            "n=2 acc_loo must equal the direct a-vs-b agreement: {} vs {pairwise}",
+            qc.subject_acc_loo[0]
+        );
+        assert!(
+            (qc.subject_acc_loo[1] - pairwise).abs() < 1e-5,
+            "and symmetrically for b"
+        );
+        // Auto still keeps its 3..=20 window, so the default is unchanged.
+        let auto = AggregateOptions { loo: LooMode::Auto, ..Default::default() };
+        let qc_auto = fod_qc(&ds, &prepared, [1, 1, 1], &agg, &auto).unwrap();
+        assert!(!qc_auto.loo_enabled, "--loo auto must stay off at n=2");
     }
 
     #[test]

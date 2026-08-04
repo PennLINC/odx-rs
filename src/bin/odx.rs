@@ -515,7 +515,9 @@ struct CombineArgs {
     no_fod_qc: bool,
     /// Leave-one-out angular correlation: each subject is scored against a
     /// template with its own contribution removed, so the score is not inflated
-    /// by self-similarity. `auto` = on for 3..=20 inputs.
+    /// by self-similarity. `auto` = on for 3..=20 inputs; `on` also covers
+    /// n=2, where the leave-one-out template is the other input and `acc_loo`
+    /// becomes the direct pairwise agreement.
     #[arg(long = "loo", value_enum, default_value = "auto")]
     loo: LooArg,
     /// Lowest SH band included in the angular correlation coefficient. `2`
