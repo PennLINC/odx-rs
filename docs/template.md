@@ -339,6 +339,34 @@ data and partly selection. That is the right stratum to quote for a
 fixel-based analysis, because it is the one you would actually analyze — but it
 is not "the scan's accuracy".
 
+### `mean_angle_deg` is not comparable across cohort sizes
+
+The angle is measured *to the template*, and the template moves toward whatever
+scans built it. With two sessions it lands roughly on the bisector, so each scan
+sits about half the pairwise disagreement away from it; with eight it is close
+enough to the truth that each scan shows nearly its full deviation. Measured on
+three subjects from one study, same acquisition and pipeline:
+
+| subject | sessions | template-referenced | pairwise session-to-session | ratio |
+|---|---|---|---|---|
+| sub-0001a | 8 | 2.43° | 3.47° (7 pairs, 3.18–3.60) | 1.43× |
+| sub-1412a | 2 | 1.74° | 3.56° | **2.05×** |
+| sub-2463p | 2 | 2.05° | 4.21° | **2.05×** |
+
+The two-session subjects look *better* than the eight-session one on the
+template-referenced number and are in fact the same or worse. **Compare cohorts
+on the pairwise angle, not the template-referenced one**, or compare only at
+equal N. Build a one-session "template" and match the partner onto it to get the
+pairwise figure:
+
+```bash
+odx combine ses-1.odx --method mean-fod --no-fod-qc --out-odx t1.odx
+odx combine ses-2.odx --template t1.odx --out-odx pair_1v2.odx
+```
+
+The 2.05× is not a coincidence — it is the two-scan bisector, and it reproduced
+to two decimal places on two independent subjects.
+
 ### In-sample versus held-out
 
 `mean_angle_deg` is computed against a template the subject helped build, and
