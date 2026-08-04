@@ -299,12 +299,55 @@ ACC 0.99 is still about 2°, and you need ~0.998 before the angle drops below 1�
 band powers in the denominator are cohort-specific, so recalibrate on your own
 data rather than reusing this table.
 
-The angular numbers for the same cohort, for comparison: 2.6° WM per-voxel
-median, 4.8° whole-brain, 6.4° as `combine` reports it (fixel-weighted, gated at
-30°, and **in-sample** — a subject scored against a template it helped build).
-Held-out sessions against retrained 7-session templates give 7.3–8.0°, and
-plain session-to-session `odx compare` gives 8.2–9.2°. `mean_angle_deg` has no
-leave-one-out variant, unlike ACC; treat it as optimistic by ~1.2–1.3×.
+### Report angles on a stratum, or the number means nothing
+
+A whole-brain fixel angle is dominated by low-amplitude fixels in grey matter and
+CSF, where the orientation is barely determined. The same cohort, same
+`mean_angle_deg` array, stratified:
+
+| stratum | fixels | median angle |
+|---|---|---|
+| all fixels where the angle is defined | 200 892 | 6.25° |
+| + matched by ≥4 of 8 sessions | 162 256 | 5.33° |
+| + white matter (multi-tissue WM fraction > 0.7) | 53 140 | 2.99° |
+| + above the Otsu amplitude threshold | 43 398 | **2.54°** |
+| + primary fixel only | 39 491 | 2.41° |
+| Otsu threshold alone, any tissue | 68 252 | 2.87° |
+
+The white-matter definition comes from the multi-tissue ℓ=0 terms —
+`wm/(wm+gm+csf)`, all three on the mtnormalise scale — which is more principled
+than an anisotropy proxy when the reconstruction is multi-tissue. The Otsu
+threshold is whatever `odx qc` resolves on the primary metric.
+
+Both cutoffs are gentle: the WM-fraction cutoff moves the median from 2.73° at
+0.5 to 2.34° at 0.9, and the amplitude cutoff from 3.15° unthresholded to 1.83°
+at twice Otsu. So the stratum choice is worth ~1°, not an order of magnitude —
+but quote which one you used.
+
+**Selection is part of the answer.** Thresholding on amplitude keeps the fixels
+whose orientation is best determined, so a lower angle there is partly better
+data and partly selection. That is the right stratum to quote for a
+fixel-based analysis, because it is the one you would actually analyze — but it
+is not "the scan's accuracy".
+
+### In-sample versus held-out
+
+`mean_angle_deg` is computed against a template the subject helped build, and
+unlike `acc_loo_*` it has no leave-one-out variant. Measured on this cohort by
+retraining eight 7-session templates and matching the held-out session, on the
+same statistic (one session's angle, WM + that template's own Otsu):
+
+| | median angle |
+|---|---|
+| in-sample | 2.23° |
+| held out | **2.56°** (range 2.28–2.92 across sessions) |
+
+so about **1.15×** optimistic in this stratum. Compare the two on the *same*
+statistic — a mean over N subjects against a single subject's angle is a
+smoother quantity and makes the optimism look like 1.0×.
+
+For wider context on the same data: whole-brain per-voxel median 4.8°, and plain
+session-to-session `odx compare` with no template at all gives 8.2–9.2°.
 
 ## Division of labour with the rest of `odx combine`
 
