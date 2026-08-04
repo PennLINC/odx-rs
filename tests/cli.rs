@@ -281,6 +281,13 @@ fn combine_mean_fod_writes_the_reproducibility_block() {
         "mean-fod template must carry dpf/amplitude"
     );
     assert!(maps.join("acc_mean.nii.gz").exists());
+    // dispersion is dimensionless and quadratic in the angle; its degrees twin
+    // must ship beside it or viewers read 0.01 as "1 degree" when it is ~6
+    assert!(
+        maps.join("primary_dispersion.nii.gz").exists()
+            && maps.join("primary_sd_angle_deg.nii.gz").exists(),
+        "primary_dispersion must ship with its angular twin"
+    );
     assert!(maps.join("coverage_frac.nii.gz").exists());
     assert!(maps.join("l0_cv.nii.gz").exists());
 

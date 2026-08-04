@@ -264,6 +264,14 @@ Useful options:
   `--per-subject-odx <dir>`, `--out-table <csv|tsv>`, `--out-dir <dir>`
 - `--json`
 
+**Units trap in the outputs.** `dispersion` / `primary_dispersion` are
+*dimensionless* dyadic-tensor spreads in `[0, 2/3]`, **not** degrees, and they
+grow as the **square** of the angle. A typical white-matter value of `0.01`
+means about **6°**, not 1° and not 1%. Convert with
+`angle = degrees(asin(sqrt(dispersion)))`, or just read `sd_angle_deg` /
+`primary_sd_angle_deg.nii.gz`, which carry the same information in degrees.
+Anything named `*_deg` is in degrees; anything not is not.
+
 ### `odx import-aodf`
 
 ```bash

@@ -888,6 +888,7 @@ pub fn combine_odx(
         let mut n_cov = vec![0.0f32; n_vox];
         let mut vox_angle = vec![f32::NAN; n_vox];
         let mut prim_disp = vec![f32::NAN; n_vox];
+        let mut prim_sd_angle = vec![f32::NAN; n_vox];
         for t in 0..n_vox {
             let st = template.offsets[t] as usize;
             let en = template.offsets[t + 1] as usize;
@@ -905,6 +906,7 @@ pub fn combine_odx(
             }
             if let Some(&gf0) = (st..en).find(|&gf| template.is_primary[gf] == 1).as_ref() {
                 prim_disp[t] = dispersion[gf0];
+                prim_sd_angle[t] = sd_angle[gf0];
             }
         }
         for (name, data) in [
@@ -912,6 +914,11 @@ pub fn combine_odx(
             ("n_subjects_covering", &n_cov),
             ("mean_voxel_angle_deg", &vox_angle),
             ("primary_dispersion", &prim_disp),
+            // The angular twin of `primary_dispersion`. Dispersion is
+            // dimensionless and grows as the SQUARE of the angle, so 0.01 reads
+            // as "1%" in a viewer while meaning ~6 degrees. Shipping the degrees
+            // map beside it is what stops that misreading.
+            ("primary_sd_angle_deg", &prim_sd_angle),
         ] {
             let path = dir.join(format!("{name}.nii.gz"));
             write_voxel_scalar_nifti_f32(&path, data, &template.ijk, dims_us, affine)?;
@@ -1324,6 +1331,13 @@ fn principal_axis(t: &[f64; 6]) -> ([f32; 3], [f64; 3]) {
 
 /// Dyadic dispersion `1 − λ1` of the *normalized* mean tensor (trace 1): 0 when
 /// all matched directions are collinear, up to 2/3 for fully isotropic spread.
+///
+/// **Dimensionless, not degrees, and quadratic in the angle.** For a tight
+/// cluster it equals ⟨sin²θ⟩ about the principal axis, so the angular
+/// equivalent is `asin(sqrt(dispersion))` — 0.01 is ~6°, not ~1° and certainly
+/// not 1%. Reading this map as if it were an angle makes agreement look an
+/// order of magnitude better than it is. `sd_angle_deg` is the same information
+/// in degrees.
 fn dyadic_dispersion(t: &[f64; 6], n: f64) -> f32 {
     if n <= 0.0 {
         return f32::NAN;
