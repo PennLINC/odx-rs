@@ -350,14 +350,19 @@ three subjects from one study, same acquisition and pipeline:
 | subject | sessions | template-referenced | pairwise session-to-session | ratio |
 |---|---|---|---|---|
 | sub-0001a | 8 | 2.43° | 3.47° (7 pairs, 3.18–3.60) | 1.43× |
+| sub-4961a | 8 | 2.05° | 2.83° (7 pairs, 2.55–3.33) | 1.38× |
 | sub-1412a | 2 | 1.74° | 3.56° | **2.05×** |
 | sub-2463p | 2 | 2.05° | 4.21° | **2.05×** |
 
-The two-session subjects look *better* than the eight-session one on the
-template-referenced number and are in fact the same or worse. **Compare cohorts
-on the pairwise angle, not the template-referenced one**, or compare only at
-equal N. Build a one-session "template" and match the partner onto it to get the
-pairwise figure:
+The ratio is set by the session count, not the subject: 1.38–1.43× at n=8 and
+2.05× at n=2, each replicated on an independent subject. So a two-session
+subject can look *better* than an eight-session one on the template-referenced
+number while actually being worse — sub-1412a and sub-4961a read 1.74° and
+2.05°, and their real disagreement is 3.56° and 2.83°, the opposite ordering.
+
+**Compare cohorts on the pairwise angle, not the template-referenced one**, or
+compare only at equal N. Build a one-session "template" and match the partner
+onto it to get the pairwise figure:
 
 ```bash
 odx combine ses-1.odx --method mean-fod --no-fod-qc --out-odx t1.odx
