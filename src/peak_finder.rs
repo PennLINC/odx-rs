@@ -308,6 +308,15 @@ impl SpherePeakFinder {
     pub fn vertices(&self) -> &[[f32; 3]] {
         &self.vertices
     }
+
+    /// Per-vertex mesh adjacency, derived from the face list at construction.
+    ///
+    /// Exposed for [`crate::fmls`], whose watershed needs the same
+    /// neighbourhoods the peak finder uses, so peaks and lobes are segmented
+    /// against one identical notion of adjacency.
+    pub fn neighbors(&self) -> &[Vec<usize>] {
+        &self.neighbors
+    }
 }
 
 /// Evaluate SH rows on the finder's sphere, then extract peaks. Default

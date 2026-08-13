@@ -63,6 +63,37 @@ pub struct TransformOptions {
     /// coords → target coords). When `None`, fixels are pulled via the same
     /// `chain` as SH/DPV (default).
     pub fixel_chain: Option<TransformChain>,
+    /// Emit a fibre cross-section (FC) DPF under this name. Default: off.
+    ///
+    /// FC is the morphological companion to AFD in the fixel-based analysis
+    /// framework (Raffelt et al. 2017): the change in fibre-bundle
+    /// cross-sectional area, in the plane perpendicular to the fixel, implied
+    /// by the warp. It derives *entirely* from the deformation — no diffusion
+    /// signal enters it.
+    ///
+    /// Matches `warp2metric -fc`:
+    ///
+    /// ```text
+    ///   FC = det(J) / ‖J · v‖
+    /// ```
+    ///
+    /// where `J = d(subject)/d(template)` and `v` is the **template-space**
+    /// (i.e. output) fixel direction. `det(J)` is the volume ratio and `‖J·v‖`
+    /// the length ratio along the fibre, so their quotient is the ratio of
+    /// areas perpendicular to it.
+    ///
+    /// Note the orientation: `d(subject)/d(template)` is the Jacobian of the
+    /// map that *pulls* template coordinates back to subject coordinates. In
+    /// mrtrix3 that is the Jacobian of `subject2template_warp.mif`, which
+    /// despite its name is defined on the template grid and stores subject
+    /// coordinates. The pull path's `chain` has exactly this orientation and
+    /// is used directly; the push path's `fixel_chain` runs the other way and
+    /// is inverted first.
+    ///
+    /// Like mrtrix3's, this FC is *relative to the template*: interpretable
+    /// only within a study sharing one template, and usually log-transformed
+    /// for statistics.
+    pub fc_dpf_name: Option<String>,
 }
 
 impl Default for TransformOptions {
@@ -80,8 +111,52 @@ impl Default for TransformOptions {
                 "fdc".to_string(),
             ],
             fixel_chain: None,
+            fc_dpf_name: None,
         }
     }
+}
+
+/// Fibre cross-section from a warp Jacobian and a template-space direction.
+///
+/// `j_t2s` must be `d(subject)/d(template)`; `v` the template-space fixel
+/// direction (need not be unit — it is normalized here, matching
+/// `warp2metric`'s explicit `fixel_direction.normalize()`).
+///
+/// Returns `None` when the result would not be a usable positive ratio: a
+/// singular or near-singular Jacobian, a direction that collapses to zero
+/// length under `J`, or any non-finite input. Callers substitute NaN rather
+/// than silently emitting a garbage finite value — a spurious `FC = 0` or
+/// `FC = 1e12` would survive a log-transform and poison downstream statistics,
+/// whereas NaN is caught by ModelArray's finite-value thresholds.
+///
+/// mrtrix3 performs no such guarding; this is a deliberate robustification.
+///
+/// ATTRIBUTION: the `det(J) / ‖J·v‖` formulation and the explicit direction
+/// normalisation are taken from MRtrix3's `cmd/warp2metric.cpp` (`-fc`),
+/// copyright (c) 2008-2026 the MRtrix3 contributors, which implements the FC
+/// metric of Raffelt et al. 2017 (NeuroImage 144:58-73). This function is a
+/// derivative work of that code and is made available under the terms of the
+/// Mozilla Public License, v. 2.0 (see `LICENSE-MRTRIX`); the remainder of this
+/// file is under odx-rs's own terms.
+#[inline]
+fn fibre_cross_section(j_t2s: &Matrix3<f64>, v: [f32; 3]) -> Option<f32> {
+    let det = j_t2s.determinant();
+    if !det.is_finite() || det <= 0.0 {
+        // det <= 0 means the warp folded (non-diffeomorphic) at this point.
+        return None;
+    }
+    let d = nalgebra::Vector3::new(v[0] as f64, v[1] as f64, v[2] as f64);
+    let dn = d.norm();
+    if !dn.is_finite() || dn < 1e-12 {
+        return None;
+    }
+    let stretched = j_t2s * (d / dn);
+    let len = stretched.norm();
+    if !len.is_finite() || len < 1e-12 {
+        return None;
+    }
+    let fc = det / len;
+    if fc.is_finite() && fc > 0.0 { Some(fc as f32) } else { None }
 }
 
 pub fn run(
@@ -194,6 +269,11 @@ pub fn run(
         .keys()
         .map(|name| (name.clone(), Vec::new()))
         .collect();
+    // FC is *derived* here rather than carried from the input, so it gets its
+    // own accumulator and is merged into the DPF maps at assembly time. If the
+    // input already has a DPF under this name it is overwritten, since a
+    // carried-through FC would refer to a previous warp, not this one.
+    let mut fc_out_compact: Vec<f32> = Vec::new();
 
     let mut sh_scratch_in: Vec<f32> =
         vec![0.0; sh_in.values().next().map(|(_, c)| *c).unwrap_or(0)];
@@ -264,6 +344,11 @@ pub fn run(
                         debug_assert_eq!(row.len(), dirs.len() * ncols);
                         dpf_out_compact.get_mut(name).unwrap().extend_from_slice(row);
                     }
+                    if opts.fc_dpf_name.is_some() {
+                        let row = &buckets.fc[flat];
+                        debug_assert_eq!(row.len(), dirs.len());
+                        fc_out_compact.extend_from_slice(row);
+                    }
                 } else {
                     // Pull-fixel: nearest source voxel.
                     let src_row = nn_compact as usize;
@@ -280,11 +365,16 @@ pub fn run(
                                 d[2] as f64,
                             );
                         let n = v.norm().max(1e-12);
-                        out_dirs.push([
-                            (v[0] / n) as f32,
-                            (v[1] / n) as f32,
-                            (v[2] / n) as f32,
-                        ]);
+                        let dir_out =
+                            [(v[0] / n) as f32, (v[1] / n) as f32, (v[2] / n) as f32];
+                        out_dirs.push(dir_out);
+                        if opts.fc_dpf_name.is_some() {
+                            // `j_chain` is target→source, i.e. d(subject)/d(template):
+                            // exactly warp2metric's Jacobian. Use it directly.
+                            fc_out_compact.push(
+                                fibre_cross_section(&j_chain, dir_out).unwrap_or(f32::NAN),
+                            );
+                        }
                     }
                     out_offsets.push(out_dirs.len() as u32);
 
@@ -313,6 +403,16 @@ pub fn run(
                 }
             }
         }
+    }
+
+    // Merge the derived FC in alongside the carried-through DPFs. Done here so
+    // both the push and pull paths converge on one place, and so an FC already
+    // present on the input (from a previous warp) is replaced rather than kept.
+    let mut dpf_ncols = dpf_ncols;
+    if let Some(name) = &opts.fc_dpf_name {
+        debug_assert_eq!(fc_out_compact.len(), out_dirs.len());
+        dpf_out_compact.insert(name.clone(), fc_out_compact);
+        dpf_ncols.insert(name.clone(), 1);
     }
 
     assemble_output(
@@ -344,6 +444,8 @@ struct PushFixelBuckets {
     /// Per-DPF, per-target-voxel concatenated row data: `dpf[name][flat]` has
     /// length `nb_fixels[flat] * ncols`.
     dpf: HashMap<String, Vec<Vec<f32>>>,
+    /// Per-target-voxel FC values, parallel to `dirs`. Empty when FC is off.
+    fc: Vec<Vec<f32>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -371,6 +473,12 @@ fn push_source_fixels(
         .keys()
         .map(|name| (name.clone(), (0..total_voxels).map(|_| Vec::new()).collect()))
         .collect();
+    let want_fc = opts.fc_dpf_name.is_some();
+    let mut fc: Vec<Vec<f32>> = if want_fc {
+        (0..total_voxels).map(|_| Vec::new()).collect()
+    } else {
+        Vec::new()
+    };
 
     let in_header = input.header();
     let source_affine = nalgebra::Matrix4::from_row_slice(&[
@@ -427,7 +535,18 @@ fn push_source_fixels(
             let v = j_chain_fixel
                 * nalgebra::Vector3::new(d[0] as f64, d[1] as f64, d[2] as f64);
             let n = v.norm().max(1e-12);
-            dirs[target_flat].push([(v[0] / n) as f32, (v[1] / n) as f32, (v[2] / n) as f32]);
+            let dir_out = [(v[0] / n) as f32, (v[1] / n) as f32, (v[2] / n) as f32];
+            dirs[target_flat].push(dir_out);
+            if want_fc {
+                // `fixel_chain` maps source→target, i.e. d(template)/d(subject).
+                // warp2metric wants the other orientation, so invert. A singular
+                // Jacobian yields NaN rather than a fabricated value.
+                let val = j_chain_fixel
+                    .try_inverse()
+                    .and_then(|j_t2s| fibre_cross_section(&j_t2s, dir_out))
+                    .unwrap_or(f32::NAN);
+                fc[target_flat].push(val);
+            }
             for (name, (data, ncols)) in dpf_in {
                 let factor = if is_modulated_dpf(name, &opts.modulated_dpf_names) {
                     amp_factor
@@ -446,7 +565,7 @@ fn push_source_fixels(
         let _ = dpf_ncols;
     }
 
-    Ok(PushFixelBuckets { dirs, dpf })
+    Ok(PushFixelBuckets { dirs, dpf, fc })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -544,5 +663,95 @@ impl OdxDataset {
     }
     pub(crate) fn dpf_arrays_get(&self, name: &str) -> Option<&crate::data_array::DataArray> {
         self.dpf_arrays().get(name)
+    }
+}
+
+#[cfg(test)]
+mod fc_tests {
+    use super::*;
+
+    fn approx(a: f32, b: f32, tol: f32) -> bool {
+        (a - b).abs() <= tol * b.abs().max(1.0)
+    }
+
+    /// Identity warp deforms nothing, so every fixel has FC exactly 1.
+    #[test]
+    fn identity_jacobian_gives_unit_fc() {
+        let j = Matrix3::<f64>::identity();
+        for v in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.577, 0.577, 0.577]] {
+            let fc = fibre_cross_section(&j, v).expect("finite");
+            assert!(approx(fc, 1.0, 1e-6), "expected 1.0, got {fc}");
+        }
+    }
+
+    /// Pure isotropic scaling by s: volume scales s^3, length along any fixel
+    /// scales s, so the perpendicular area scales s^2.
+    #[test]
+    fn isotropic_scaling_gives_s_squared() {
+        for s in [0.5_f64, 1.0, 2.0, 3.0] {
+            let j = Matrix3::<f64>::from_diagonal(&nalgebra::Vector3::new(s, s, s));
+            let fc = fibre_cross_section(&j, [0.0, 0.0, 1.0]).expect("finite");
+            assert!(
+                approx(fc, (s * s) as f32, 1e-5),
+                "s={s}: expected {}, got {fc}",
+                s * s
+            );
+        }
+    }
+
+    /// Anisotropic case — the discriminating test. Stretch x by 2 and y by 3,
+    /// leaving z alone: det = 6. A fixel along z has |J·z| = 1, so FC = 6 (the
+    /// full xy-area change). A fixel along x has |J·x| = 2, so FC = 3 (only the
+    /// yz-plane change). This is what distinguishes FC from the Jacobian
+    /// determinant, and it fails if the direction is dropped or mis-normalized.
+    #[test]
+    fn anisotropic_scaling_is_direction_dependent() {
+        let j = Matrix3::<f64>::from_diagonal(&nalgebra::Vector3::new(2.0, 3.0, 1.0));
+        assert!(approx(fibre_cross_section(&j, [0.0, 0.0, 1.0]).unwrap(), 6.0, 1e-5));
+        assert!(approx(fibre_cross_section(&j, [1.0, 0.0, 0.0]).unwrap(), 3.0, 1e-5));
+        assert!(approx(fibre_cross_section(&j, [0.0, 1.0, 0.0]).unwrap(), 2.0, 1e-5));
+    }
+
+    /// Direction need not arrive unit-length; warp2metric normalizes explicitly
+    /// and so do we. A non-unit input must not scale the answer.
+    #[test]
+    fn direction_is_normalized_before_use() {
+        let j = Matrix3::<f64>::from_diagonal(&nalgebra::Vector3::new(2.0, 3.0, 1.0));
+        let unit = fibre_cross_section(&j, [0.0, 0.0, 1.0]).unwrap();
+        let long = fibre_cross_section(&j, [0.0, 0.0, 17.0]).unwrap();
+        assert!(approx(unit, long, 1e-6), "{unit} vs {long}");
+    }
+
+    /// Robustification beyond mrtrix3: degenerate inputs yield None (written as
+    /// NaN) instead of Inf/0/negative values that would survive a log and
+    /// corrupt group statistics.
+    #[test]
+    fn degenerate_inputs_return_none() {
+        let singular = Matrix3::<f64>::from_diagonal(&nalgebra::Vector3::new(1.0, 1.0, 0.0));
+        assert!(fibre_cross_section(&singular, [0.0, 0.0, 1.0]).is_none(), "singular J");
+
+        let folded = Matrix3::<f64>::from_diagonal(&nalgebra::Vector3::new(-1.0, 1.0, 1.0));
+        assert!(fibre_cross_section(&folded, [0.0, 0.0, 1.0]).is_none(), "det < 0 (folded warp)");
+
+        let ok = Matrix3::<f64>::identity();
+        assert!(fibre_cross_section(&ok, [0.0, 0.0, 0.0]).is_none(), "zero-length direction");
+
+        let nan_j = Matrix3::<f64>::from_diagonal(&nalgebra::Vector3::new(f64::NAN, 1.0, 1.0));
+        assert!(fibre_cross_section(&nan_j, [0.0, 0.0, 1.0]).is_none(), "non-finite J");
+    }
+
+    /// A shear has det = 1 but still changes cross-section for fixels not
+    /// aligned with the shear-invariant direction. Guards against anyone
+    /// "simplifying" FC to det(J).
+    #[test]
+    fn shear_is_not_the_jacobian_determinant() {
+        let mut j = Matrix3::<f64>::identity();
+        j[(0, 1)] = 1.0; // x += y
+        assert!((j.determinant() - 1.0).abs() < 1e-12);
+        let along_z = fibre_cross_section(&j, [0.0, 0.0, 1.0]).unwrap();
+        let along_y = fibre_cross_section(&j, [0.0, 1.0, 0.0]).unwrap();
+        assert!(approx(along_z, 1.0, 1e-6), "z unaffected by x+=y shear: {along_z}");
+        // |J·y| = |(1,1,0)| = sqrt(2), so FC = 1/sqrt(2).
+        assert!(approx(along_y, std::f32::consts::FRAC_1_SQRT_2, 1e-5), "{along_y}");
     }
 }

@@ -113,6 +113,15 @@ enum Command {
     ///   --transform         sub-01_from-ACPC_to-MNI152NLin2009cAsym_xfm.h5
     ///   --transform-inverse sub-01_from-MNI152NLin2009cAsym_to-ACPC_xfm.h5
     Transform(TransformArgs),
+    /// Segment FODs into lobes (FMLS) and write an ODX whose fixels ARE the
+    /// lobes, carrying `afd` (lobe integral) and `amplitude` (peak) DPFs.
+    ///
+    /// Follows `fod2fixel`: a fixel is created FROM each surviving lobe rather
+    /// than AFD being attached to pre-existing peak fixels, so direction, AFD
+    /// and amplitude all come off one lobe and correspondence is 1:1 by
+    /// construction. The output is a derived dataset with different fixel
+    /// cardinality and directions from the input.
+    Afd(AfdArgs),
     /// Attach a NIfTI volume to an ODX as a DPV (per-voxel scalar), in
     /// place. The NIfTI grid must match the ODX (dimensions + affine
     /// within 1e-3 mm); voxels outside the ODX mask are silently dropped.
@@ -132,6 +141,42 @@ enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+}
+
+#[derive(Args, Debug)]
+struct AfdArgs {
+    /// Input ODX with SH/FOD coefficients.
+    input: PathBuf,
+    /// Output ODX (fixels = lobes).
+    output: PathBuf,
+    /// Icosphere subdivision level. 3 = 321 hemisphere directions (mrtrix3
+    /// `tesselation_321`); 4 = 1281, `fod2fixel`'s default. Higher is finer
+    /// and slower.
+    #[arg(long = "ico-level", default_value_t = 4)]
+    ico_level: usize,
+    /// Drop lobes whose maximal peak is below this (`fod2fixel -fmls_peak_value`).
+    #[arg(long = "fmls-peak-value", default_value_t = odx_rs::fmls::DEFAULT_PEAK_VALUE_THRESHOLD)]
+    fmls_peak_value: f32,
+    /// Drop lobes whose integral is below this (`-fmls_integral`). 0 = off.
+    #[arg(long = "fmls-integral", default_value_t = odx_rs::fmls::DEFAULT_INTEGRAL_THRESHOLD)]
+    fmls_integral: f32,
+    /// Keep at most N lobes per voxel, largest AFD first (`-maxnum`).
+    #[arg(long = "maxnum")]
+    maxnum: Option<usize>,
+    /// Use each lobe's maximal-peak direction instead of its amplitude-weighted
+    /// mean direction (`fod2fixel -dirpeak`). mrtrix3 defaults to the mean.
+    #[arg(long = "dirpeak")]
+    dirpeak: bool,
+    /// Do not carry the input SH through; yields a bare fixel ODX (smaller,
+    /// but no glyphs to render).
+    #[arg(long = "no-sh")]
+    no_sh: bool,
+    #[arg(long = "odx-layout", value_enum, default_value = "directory")]
+    odx_layout: OdxLayoutArg,
+    #[arg(long)]
+    overwrite: bool,
+    #[arg(long)]
+    quiet: bool,
 }
 
 #[derive(Args, Debug)]
@@ -232,6 +277,19 @@ struct TransformArgs {
     /// reorientation. 80 covers lmax 8 reliably; 300 for lmax 12.
     #[arg(long = "apsf-dirs", default_value_t = 80)]
     apsf_dirs: usize,
+    /// Also emit a fibre cross-section (FC) DPF under this name, computed from
+    /// the warp Jacobian as `det(J) / ‖J·v‖` (matching `warp2metric -fc`).
+    ///
+    /// FC is the morphological half of the fixel-based analysis pair: the
+    /// change in fibre-bundle cross-sectional area implied by the warp, with no
+    /// diffusion signal in it. Pair with an `afd` DPF to form FDC.
+    ///
+    /// Values are relative to the target space, so they compare only within a
+    /// study sharing one template, and log(FC) is the usual form for
+    /// statistics. Degenerate Jacobians (singular, or folded with det <= 0)
+    /// give NaN rather than a fabricated finite value.
+    #[arg(long = "fc")]
+    fc: Option<String>,
     #[arg(long = "odx-layout", value_enum, default_value = "directory")]
     odx_layout: OdxLayoutArg,
     #[arg(long)]
@@ -827,6 +885,7 @@ fn run(cli: Cli) -> odx_rs::Result<()> {
         Command::ImportAodf(args) => run_import_aodf(args),
         Command::Upsample(args) => run_upsample(args),
         Command::Transform(args) => run_transform(args),
+        Command::Afd(args) => run_afd(args),
         Command::AttachDpv(args) => run_attach_dpv(args),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -1648,6 +1707,42 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
     Ok(())
 }
 
+fn run_afd(args: AfdArgs) -> odx_rs::Result<()> {
+    use odx_rs::fmls::{afd_dataset, AfdOptions, FmlsConfig};
+
+    ensure_output_path(&args.output, args.overwrite)?;
+    let input = OdxDataset::load(&args.input)?;
+    let opts = AfdOptions {
+        ico_level: args.ico_level,
+        fmls: FmlsConfig {
+            integral_threshold: args.fmls_integral,
+            peak_value_threshold: args.fmls_peak_value,
+            ..FmlsConfig::default()
+        },
+        max_per_voxel: args.maxnum,
+        dir_from_peak: args.dirpeak,
+        keep_sh: !args.no_sh,
+    };
+    let (out, report) = afd_dataset(&input, &opts)?;
+    let policy = OdxWritePolicy::default();
+    match args.odx_layout {
+        OdxLayoutArg::Directory => out.save_directory_with_policy(&args.output, policy)?,
+        OdxLayoutArg::Archive => out.save_archive_with_policy(&args.output, policy)?,
+    }
+    if !args.quiet {
+        eprintln!(
+            "afd: {} directions (ico level {}), {} fixels over {}/{} voxels -> {}",
+            report.n_directions,
+            args.ico_level,
+            report.n_fixels,
+            report.n_voxels_with_fixels,
+            report.n_voxels,
+            args.output.display()
+        );
+    }
+    Ok(())
+}
+
 fn run_attach_dpv(args: AttachDpvArgs) -> odx_rs::Result<()> {
     use ndarray::Array3;
     use nifti::{IntoNdArray, NiftiObject, NiftiVolume, ReaderOptions};
@@ -1824,6 +1919,7 @@ fn run_transform(args: TransformArgs) -> odx_rs::Result<()> {
         // (cardinality already preserved).
         modulate_fixel: false,
         apsf_dirs: args.apsf_dirs,
+        fc_dpf_name: args.fc.clone(),
         ..Default::default()
     };
 

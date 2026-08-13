@@ -18,6 +18,22 @@ Files in odx-rs containing MRtrix3-derived code:
       `trx-mrtrix2/cpp/core/math/SH.h` (upstream:
       `MRtrix3/core/math/SH.h`).
 
+  - odx-rs/src/fmls.rs
+      The entire module is a port of the FOD maxima-and-lobe segmentation
+      (FMLS) algorithm from `MRtrix3/src/dwi/fmls.h` and
+      `MRtrix3/src/dwi/fmls.cpp`, together with the lobe-to-fixel conversion
+      (`Primitive_FOD_lobes`) and option semantics (`-fmls_peak_value`,
+      `-fmls_integral`, `-maxnum`, `-dirpeak`) from
+      `MRtrix3/cmd/fod2fixel.cpp`, and the antipodal-wrapped adjacency
+      construction from `DWI::Directions::Set::initialise_adjacency` in
+      `MRtrix3/src/dwi/directions/set.cpp`. Documented deviations from the
+      original are listed in the module documentation.
+
+  - odx-rs/src/transform/resample.rs
+      `fibre_cross_section` is derived from the `-fc` computation in
+      `MRtrix3/cmd/warp2metric.cpp` (the FC metric of Raffelt et al. 2017).
+      Only that function is MRtrix3-derived; the rest of the file is not.
+
 These portions, and any modifications thereof, are distributed under the
 Mozilla Public License Version 2.0, the verbatim text of which follows. A
 copy of the MPL 2.0 is also available at http://mozilla.org/MPL/2.0/.

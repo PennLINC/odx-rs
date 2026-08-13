@@ -7,8 +7,10 @@ pub mod descoteaux_sh;
 pub mod dtype;
 pub mod error;
 pub(crate) mod fixel_match;
+pub mod fmls;
 pub mod formats;
 pub mod header;
+pub mod icosphere;
 pub mod interop;
 pub mod io;
 pub mod mmap_backing;
@@ -70,4 +72,5 @@ pub use validate::{
 pub use transform::{
     apply_transform, apply_transform_h5, TransformMode, TransformOptions,
 };
+pub use transform::source_volume::{SourceLookup, TriCorner, TrilinearWeights};
 pub use transform::upsample::{upsample, UpsampleOptions};
