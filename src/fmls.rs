@@ -124,6 +124,20 @@ pub struct Lobe {
     pub vertices: Vec<usize>,
 }
 
+impl Lobe {
+    /// Dispersion — lobe integral / peak amplitude, `fod2fixel -disp`.
+    ///
+    /// Grows as the lobe spreads its mass away from the peak: a tight
+    /// single-fibre lobe is small, a fanning/dispersed lobe large. Both terms
+    /// scale linearly with the FOD, so the ratio is invariant under any global
+    /// amplitude rescaling. Lobes from [`Fmls::segment`] always have
+    /// `peak_value > 0` (zero-amplitude vertices are never assigned), so the
+    /// ratio is finite for them.
+    pub fn dispersion(&self) -> f32 {
+        self.integral / self.peak_value
+    }
+}
+
 /// Quadrature weights for integrating a band-limited function sampled on a
 /// fixed direction set.
 ///
@@ -770,6 +784,38 @@ mod tests {
         assert!(
             (b - 3.0 * a).abs() < 1e-3 * b.abs().max(1.0),
             "expected 3x scaling: {a} -> {b}"
+        );
+    }
+
+    /// Dispersion (`fod2fixel -disp`) must rank lobe widths — broader lobes
+    /// larger — and must not move under global amplitude rescaling, or it
+    /// would inherit the FOD's arbitrary units and stop being comparable
+    /// across normalization schemes.
+    #[test]
+    fn dispersion_ranks_lobe_width_and_ignores_scale() {
+        let (v, nb) = sphere();
+        let w = IntegrationWeights::uniform(v.len());
+        let cfg = FmlsConfig { peak_value_threshold: 0.0, ..Default::default() };
+        let sharp: Vec<f32> = v.iter().map(|d| d[2].abs().powi(16)).collect();
+        let broad: Vec<f32> = v.iter().map(|d| d[2].abs().powi(4)).collect();
+        let d_sharp = Fmls::new(&v, &nb, &w, cfg).segment(&sharp)[0].dispersion();
+        let d_broad = Fmls::new(&v, &nb, &w, cfg).segment(&broad)[0].dispersion();
+        assert!(
+            d_broad > d_sharp,
+            "broad lobe must disperse more: broad={d_broad} sharp={d_sharp}"
+        );
+        // |cos θ|^p integrates to 4π/(p+1) with unit peak, so the ratio is
+        // known analytically; the tolerance covers quadrature error only.
+        let expect = 4.0 * std::f32::consts::PI / 5.0;
+        assert!(
+            (d_broad - expect).abs() < 0.05 * expect,
+            "disp {d_broad} vs analytic {expect}"
+        );
+        let scaled: Vec<f32> = broad.iter().map(|x| x * 3.0).collect();
+        let d_scaled = Fmls::new(&v, &nb, &w, cfg).segment(&scaled)[0].dispersion();
+        assert!(
+            (d_scaled - d_broad).abs() < 1e-4 * d_broad,
+            "dispersion must be scale-invariant: {d_broad} -> {d_scaled}"
         );
     }
 
