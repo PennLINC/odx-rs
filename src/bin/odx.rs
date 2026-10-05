@@ -17,10 +17,11 @@ use odx_rs::mrtrix::{
 };
 use odx_rs::pam::{self, PamWriteOptions};
 use odx_rs::{
-    combine_odx, compare_odx, compute_fixel_qc, write_qc_class_dpf, CombineInput, CombineOptions,
-    CombineOutputs, CombineReport, CompareOptions, CompareReport, FixelQcOptions, FixelQcReport,
-    LmaxPolicy, LooMode, MaskCombine, NormalizeFod, OdxDataset, OdxError, OdxWritePolicy,
-    PeakFinderConfig, TemplateMethod, ThresholdMode,
+    apply_graddev, combine_odx, compare_odx, compute_fixel_qc, convert_sh_basis,
+    write_qc_class_dpf, CombineInput, CombineOptions, CombineOutputs, CombineReport,
+    CompareOptions, CompareReport, FixelQcOptions, FixelQcReport, GradDevField, GradDevOptions,
+    IdentityPolicy, LmaxPolicy, LooMode, MaskCombine, NormalizeFod, OdxDataset, OdxError,
+    OdxWritePolicy, PeakFinderConfig, ShBasisTarget, TemplateMethod, ThresholdMode,
 };
 
 #[derive(Parser, Debug)]
@@ -113,6 +114,38 @@ enum Command {
     ///   --transform         sub-01_from-ACPC_to-MNI152NLin2009cAsym_xfm.h5
     ///   --transform-inverse sub-01_from-MNI152NLin2009cAsym_to-ACPC_xfm.h5
     Transform(TransformArgs),
+    /// Apply a gradient-nonlinearity deviation field ("graddev") to a
+    /// reconstruction and write it back in its native format.
+    ///
+    /// A reconstruction fitted with one global b-table is expressed against a
+    /// locally distorted q-space wherever the scanner's gradients deviate from
+    /// nominal. Given the 9-volume deviation image (qsiprep's
+    /// `*_space-ACPC_graddev.nii.gz`, or an HCP/FSL `grad_dev.nii.gz`), this
+    /// rotates SH/FOD coefficients, dense ODF amplitudes and fixel/peak
+    /// directions per voxel so that they describe the tissue rather than the
+    /// distorted encoding. Scalars, the mask, the grid and the peak count are
+    /// untouched.
+    ///
+    /// CONVENTION: the 9 volumes are read row-major into `T`; the effective
+    /// gradient is `Tᵀ·g` in the image's voxel frame (FSL `xfibres`
+    /// `correct_bvals_bvecs` = TORTOISE "HCP ordering"). ODF/FOD:
+    /// `ψ_true(u) = ψ_est(normalize(T·u))`; peaks: `normalize(T⁻¹·u)`.
+    /// The per-voxel b-value change `|Tᵀ·g|²` cannot be undone on a fitted
+    /// ODF and is only reported.
+    ///
+    /// INPUTS: DSI Studio `.fib.gz`/`.fz` (pass `--reference-affine` for a
+    /// native-space file without a `trans` record), MRtrix SH image
+    /// (`--fixel-dir` optional), MRtrix fixel directory, DIPY `.pam5`, ODX.
+    /// OUTPUTS: any of those except `.pam5`. DSI Studio output always gets
+    /// exact float `dir{p}` records (DSI Studio tracks with them) — the
+    /// sphere-quantized `index{p}` alone would swallow a 1–4° correction.
+    ///
+    /// EXAMPLES:
+    ///   odx graddev sub-01_model-gqi_dwimap.fib.gz sub-01_desc-graddev_dwimap.fib.gz
+    ///       --graddev sub-01_space-ACPC_graddev.nii.gz
+    ///       --reference-affine sub-01_space-ACPC_desc-preproc_dwi.nii.gz
+    ///   odx graddev wm_fod.mif.gz wm_fod_graddev.mif.gz --graddev graddev.nii.gz
+    Graddev(GraddevArgs),
     /// Segment FODs into lobes (FMLS) and write an ODX whose fixels ARE the
     /// lobes, carrying `afd` (lobe integral) and `amplitude` (peak) DPFs.
     ///
@@ -433,6 +466,70 @@ struct ConvertArgs {
     /// `fod2fixel` voxels). No-op if the dataset already has fixels.
     #[arg(long = "peaks-from-sh")]
     peaks_from_sh: bool,
+    /// DSI Studio output only: also write exact float32 `dir{p}` records so
+    /// peak directions are not snapped to the ODF sphere. DSI Studio's
+    /// tracker prefers them over `index{p}`.
+    #[arg(long = "dsistudio-float-dirs")]
+    dsistudio_float_dirs: bool,
+}
+
+#[derive(Args, Debug)]
+struct GraddevArgs {
+    /// Reconstruction to correct: DSI Studio `.fib.gz`/`.fz`, MRtrix SH image
+    /// (`.mif`/`.mif.gz`/`.nii`/`.nii.gz`, optionally with `--fixel-dir`),
+    /// MRtrix fixel directory, DIPY `.pam5`, or ODX.
+    input: PathBuf,
+    /// Output path; the format is detected from the extension as in
+    /// `odx convert` (DSI Studio, MRtrix, ODX). `.pam5` output is not supported.
+    output: PathBuf,
+    /// 9-volume gradient deviation NIfTI (float32), e.g. qsiprep's
+    /// `*_space-ACPC_graddev.nii.gz` or HCP's `grad_dev.nii.gz`.
+    #[arg(long = "graddev")]
+    graddev: PathBuf,
+    /// Whether the diagonal already contains the identity. `auto` inspects
+    /// the data; `included` = TORTOISE/qsiprep (diagonal ≈ 1); `absent` =
+    /// HCP/FSL `grad_dev` (diagonal ≈ 0, identity is added).
+    #[arg(long, value_enum, default_value = "auto")]
+    identity: IdentityArg,
+    /// lmax of the SH round trip used to rotate dense ODF arrays (DSI Studio
+    /// `odf` records, PAM `odf`). Default: up to 12, capped by what the
+    /// sampling sphere supports.
+    #[arg(long = "odf-lmax")]
+    odf_lmax: Option<usize>,
+    /// Fibonacci reference directions for aPSF SH reorientation. Default:
+    /// max(80, 3 × number of SH coefficients).
+    #[arg(long = "apsf-dirs")]
+    apsf_dirs: Option<usize>,
+    /// Debug only: apply `Tᵀ` instead of `T` (to demonstrate a convention
+    /// error). Never for real data.
+    #[arg(long, hide = true)]
+    transpose: bool,
+    #[arg(long)]
+    sh: Option<PathBuf>,
+    #[arg(long = "fixel-dir")]
+    fixel_dir: Option<PathBuf>,
+    #[arg(long = "reference-affine")]
+    reference_affine: Option<PathBuf>,
+    #[arg(long = "input-format", value_enum)]
+    input_format: Option<InputFormatOverride>,
+    #[arg(long = "preserve-affine", hide = true)]
+    preserve_affine: bool,
+    #[arg(long = "output-format", value_enum)]
+    output_format: Option<OutputFormatOverride>,
+    /// Write SH alongside a MRtrix fixel-directory output.
+    #[arg(long = "out-sh")]
+    out_sh: Option<PathBuf>,
+    #[arg(long = "fixel-container", value_enum, default_value = "nifti")]
+    fixel_container: MrtrixFixelContainerArg,
+    /// Force NIfTI-2 instead of NIfTI-1 when writing MRtrix SH to `.nii`/`.nii.gz`.
+    #[arg(long = "nifti2")]
+    nifti2: bool,
+    #[arg(long)]
+    overwrite: bool,
+    #[arg(long)]
+    quiet: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -793,6 +890,23 @@ enum Z0PolicyArg {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum IdentityArg {
+    Auto,
+    Included,
+    Absent,
+}
+
+impl From<IdentityArg> for IdentityPolicy {
+    fn from(value: IdentityArg) -> Self {
+        match value {
+            IdentityArg::Auto => IdentityPolicy::Auto,
+            IdentityArg::Included => IdentityPolicy::Included,
+            IdentityArg::Absent => IdentityPolicy::Absent,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum QcThresholdArg {
     Otsu,
     Positive,
@@ -885,6 +999,7 @@ fn run(cli: Cli) -> odx_rs::Result<()> {
         Command::ImportAodf(args) => run_import_aodf(args),
         Command::Upsample(args) => run_upsample(args),
         Command::Transform(args) => run_transform(args),
+        Command::Graddev(args) => run_graddev(args),
         Command::Afd(args) => run_afd(args),
         Command::AttachDpv(args) => run_attach_dpv(args),
         Command::Completions { shell } => {
@@ -1587,98 +1702,25 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
         odx
     };
 
-    let quant_policy = OdxWritePolicy {
-        quantize_dense: args.quantize_dense,
-        quantize_min_len: args.quantize_min_len,
+    let write_opts = OutputWriteOptions {
+        quant_policy: OdxWritePolicy {
+            quantize_dense: args.quantize_dense,
+            quantize_min_len: args.quantize_min_len,
+        },
+        dsistudio: MrtrixToDsistudioOptions {
+            output_format: DsistudioFormat::FibGz,
+            dense_odf_mode: args.dense_odf.into(),
+            peak_source: args.peak_source.into(),
+            amplitude_key: args.amplitude_key.clone(),
+            write_z0: args.z0.into(),
+            write_float_directions: args.dsistudio_float_dirs,
+        },
+        out_sh: args.out_sh.clone(),
+        fixel_container: args.fixel_container.into(),
+        nifti2: args.nifti2,
+        sh_lmax: args.sh_lmax,
     };
-
-    match output_format {
-        DetectedFormat::OdxDirectory => {
-            odx.save_directory_with_policy(&args.output, quant_policy)?;
-        }
-        DetectedFormat::OdxArchive => {
-            odx.save_archive_with_policy(&args.output, quant_policy)?;
-        }
-        DetectedFormat::DsistudioFibGz | DetectedFormat::DsistudioFz => {
-            let options = MrtrixToDsistudioOptions {
-                output_format: match output_format {
-                    DetectedFormat::DsistudioFibGz => DsistudioFormat::FibGz,
-                    DetectedFormat::DsistudioFz => DsistudioFormat::Fz,
-                    _ => unreachable!(),
-                },
-                dense_odf_mode: args.dense_odf.into(),
-                peak_source: args.peak_source.into(),
-                amplitude_key: args.amplitude_key.clone(),
-                write_z0: args.z0.into(),
-            };
-            save_dsistudio_from_odx(&odx, &args.output, &options)?;
-        }
-        DetectedFormat::DipyPam5 => {
-            pam::save_pam5(&odx, &args.output, &PamWriteOptions::default())?;
-        }
-        DetectedFormat::TortoiseMapmriNifti => {
-            return Err(OdxError::Argument(
-                "TORTOISE MAPMRI output is not supported; this format is import-only".into(),
-            ));
-        }
-        DetectedFormat::MrtrixFixelDir => {
-            mrtrix::save_mrtrix_fixels(
-                &odx,
-                &args.output,
-                &MrtrixFixelWriteOptions {
-                    container: args.fixel_container.into(),
-                    include_dpf: true,
-                    include_dpv: false,
-                },
-            )?;
-            if let Some(out_sh) = args.out_sh.as_deref() {
-                let fitted = if odx.sh::<f32>("coefficients").is_ok() {
-                    None
-                } else {
-                    fit_mrtrix_sh_from_odf(&odx, args.sh_lmax)?
-                };
-                if odx.sh::<f32>("coefficients").is_err() && fitted.is_none() {
-                    return Err(OdxError::Argument(
-                        "MRtrix SH output requires existing sh/coefficients or dense ODF data to fit from"
-                            .into(),
-                    ));
-                }
-                let sh_dataset = fitted.as_ref().unwrap_or(&odx);
-                mrtrix::save_mrtrix_sh(
-                    sh_dataset,
-                    out_sh,
-                    &MrtrixShWriteOptions {
-                        array_name: "coefficients".into(),
-                        container: infer_sh_container(out_sh, args.nifti2),
-                        gzip: infer_sh_gzip(out_sh),
-                    },
-                )?;
-            }
-        }
-        DetectedFormat::MrtrixShImage => {
-            let fitted = if odx.sh::<f32>("coefficients").is_ok() {
-                None
-            } else {
-                fit_mrtrix_sh_from_odf(&odx, args.sh_lmax)?
-            };
-            if odx.sh::<f32>("coefficients").is_err() && fitted.is_none() {
-                return Err(OdxError::Argument(
-                    "MRtrix SH output requires existing sh/coefficients or dense ODF data to fit from"
-                        .into(),
-                ));
-            }
-            let sh_dataset = fitted.as_ref().unwrap_or(&odx);
-            mrtrix::save_mrtrix_sh(
-                sh_dataset,
-                &args.output,
-                &MrtrixShWriteOptions {
-                    array_name: "coefficients".into(),
-                    container: infer_sh_container(&args.output, args.nifti2),
-                    gzip: infer_sh_gzip(&args.output),
-                },
-            )?;
-        }
-    }
+    write_dataset(&odx, &args.output, output_format, &write_opts)?;
 
     if args.json {
         let summary = ConversionSummary {
@@ -1704,6 +1746,214 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Output-side settings shared by `convert` and `graddev`.
+struct OutputWriteOptions {
+    quant_policy: OdxWritePolicy,
+    /// `output_format` is overridden from the detected target.
+    dsistudio: MrtrixToDsistudioOptions,
+    out_sh: Option<PathBuf>,
+    fixel_container: MrtrixFixelContainer,
+    nifti2: bool,
+    sh_lmax: Option<u32>,
+}
+
+fn write_dataset(
+    odx: &OdxDataset,
+    output: &Path,
+    output_format: DetectedFormat,
+    opts: &OutputWriteOptions,
+) -> odx_rs::Result<()> {
+    match output_format {
+        DetectedFormat::OdxDirectory => {
+            odx.save_directory_with_policy(output, opts.quant_policy)?;
+        }
+        DetectedFormat::OdxArchive => {
+            odx.save_archive_with_policy(output, opts.quant_policy)?;
+        }
+        DetectedFormat::DsistudioFibGz | DetectedFormat::DsistudioFz => {
+            let mut options = opts.dsistudio.clone();
+            options.output_format = match output_format {
+                DetectedFormat::DsistudioFibGz => DsistudioFormat::FibGz,
+                DetectedFormat::DsistudioFz => DsistudioFormat::Fz,
+                _ => unreachable!(),
+            };
+            save_dsistudio_from_odx(odx, output, &options)?;
+        }
+        DetectedFormat::DipyPam5 => {
+            pam::save_pam5(odx, output, &PamWriteOptions::default())?;
+        }
+        DetectedFormat::TortoiseMapmriNifti => {
+            return Err(OdxError::Argument(
+                "TORTOISE MAPMRI output is not supported; this format is import-only".into(),
+            ));
+        }
+        DetectedFormat::MrtrixFixelDir => {
+            mrtrix::save_mrtrix_fixels(
+                odx,
+                output,
+                &MrtrixFixelWriteOptions {
+                    container: opts.fixel_container,
+                    include_dpf: true,
+                    include_dpv: false,
+                },
+            )?;
+            if let Some(out_sh) = opts.out_sh.as_deref() {
+                write_mrtrix_sh(odx, out_sh, opts)?;
+            }
+        }
+        DetectedFormat::MrtrixShImage => {
+            write_mrtrix_sh(odx, output, opts)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_mrtrix_sh(odx: &OdxDataset, path: &Path, opts: &OutputWriteOptions) -> odx_rs::Result<()> {
+    let fitted = if odx.sh::<f32>("coefficients").is_ok() {
+        None
+    } else {
+        fit_mrtrix_sh_from_odf(odx, opts.sh_lmax)?
+    };
+    if odx.sh::<f32>("coefficients").is_err() && fitted.is_none() {
+        return Err(OdxError::Argument(
+            "MRtrix SH output requires existing sh/coefficients or dense ODF data to fit from"
+                .into(),
+        ));
+    }
+    let sh_dataset = fitted.as_ref().unwrap_or(odx);
+    mrtrix::save_mrtrix_sh(
+        sh_dataset,
+        path,
+        &MrtrixShWriteOptions {
+            array_name: "coefficients".into(),
+            container: infer_sh_container(path, opts.nifti2),
+            gzip: infer_sh_gzip(path),
+        },
+    )
+}
+
+fn run_graddev(args: GraddevArgs) -> odx_rs::Result<()> {
+    let output_format = resolve_output_format(&args.output, args.output_format)?;
+    if output_format == DetectedFormat::DipyPam5 {
+        return Err(OdxError::Argument(
+            "graddev does not write .pam5; write ODX (or another format) instead".into(),
+        ));
+    }
+    if output_format == DetectedFormat::MrtrixShImage && args.out_sh.is_some() {
+        return Err(OdxError::Argument(
+            "--out-sh is only valid when the main output is a MRtrix fixel directory".into(),
+        ));
+    }
+    ensure_output_path(&args.output, args.overwrite)?;
+    if let Some(out_sh) = args.out_sh.as_deref() {
+        ensure_output_path(out_sh, args.overwrite)?;
+    }
+
+    let (odx, input_format) = load_from_args(
+        &args.input,
+        args.sh.as_deref(),
+        args.fixel_dir.as_deref(),
+        None,
+        None,
+        args.reference_affine.as_deref(),
+        args.input_format,
+        args.preserve_affine,
+    )?;
+
+    let field = GradDevField::load_nifti(&args.graddev, args.identity.into())?;
+    let opts = GradDevOptions {
+        apsf_dirs: args.apsf_dirs,
+        odf_lmax: args.odf_lmax,
+        transpose: args.transpose,
+    };
+    let (corrected, report) = apply_graddev(&odx, &field, &opts)?;
+
+    // MRtrix SH containers only accept tournier07; convert a dipy-basis
+    // dataset (e.g. from PAM5) on the way out.
+    let writes_sh = output_format == DetectedFormat::MrtrixShImage
+        || (output_format == DetectedFormat::MrtrixFixelDir && args.out_sh.is_some());
+    let corrected = if writes_sh
+        && corrected.sh::<f32>("coefficients").is_ok()
+        && corrected.header().dipy_basis_name() != Some("tournier07")
+    {
+        convert_sh_basis(&corrected, ShBasisTarget::Tournier07, None)?
+    } else {
+        corrected
+    };
+
+    let has_dense_odf = !corrected.odf_names().is_empty();
+    let write_opts = OutputWriteOptions {
+        quant_policy: OdxWritePolicy::default(),
+        dsistudio: MrtrixToDsistudioOptions {
+            output_format: DsistudioFormat::FibGz,
+            // Carry the rotated dense ODF when the input had one; otherwise
+            // sample it from the (rotated) SH as `convert` does.
+            dense_odf_mode: if has_dense_odf {
+                DenseOdfMode::Off
+            } else {
+                DenseOdfMode::FromSh
+            },
+            peak_source: PeakSource::Fixels,
+            amplitude_key: None,
+            write_z0: Z0Policy::Auto,
+            write_float_directions: true,
+        },
+        out_sh: args.out_sh.clone(),
+        fixel_container: args.fixel_container.into(),
+        nifti2: args.nifti2,
+        sh_lmax: None,
+    };
+    write_dataset(&corrected, &args.output, output_format, &write_opts)?;
+
+    if args.json {
+        let summary = serde_json::json!({
+            "input_format": input_format.as_str(),
+            "output_format": output_format.as_str(),
+            "output": args.output.display().to_string(),
+            "out_sh": args.out_sh.as_ref().map(|p| p.display().to_string()),
+            "graddev": args.graddev.display().to_string(),
+            "report": report,
+        });
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else if !args.quiet {
+        println!(
+            "wrote {} ({} -> {})",
+            args.output.display(),
+            input_format.as_str(),
+            output_format.as_str()
+        );
+        println!(
+            "graddev: {} (identity {})",
+            args.graddev.display(),
+            if report.identity_added { "added" } else { "included" }
+        );
+        println!(
+            "voxels: {} corrected of {} in mask ({} outside field, {} singular)",
+            report.nb_corrected, report.nb_voxels, report.nb_outside_field, report.nb_singular
+        );
+        println!(
+            "rotation: median {:.3} deg, max {:.3} deg; max |ln det T| = {:.4}",
+            report.median_rotation_deg, report.max_rotation_deg, report.max_abs_log_det
+        );
+        println!(
+            "arrays: sh {:?}, odf {:?}{}, peaks {}{}",
+            report.sh_arrays,
+            report.odf_arrays,
+            report
+                .odf_lmax
+                .map(|l| format!(" (lmax {l})"))
+                .unwrap_or_default(),
+            report.nb_peaks,
+            if report.dropped_dpf.is_empty() {
+                String::new()
+            } else {
+                format!("; dropped dpf {:?}", report.dropped_dpf)
+            }
+        );
+    }
     Ok(())
 }
 

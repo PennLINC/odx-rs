@@ -9,6 +9,7 @@ pub mod error;
 pub(crate) mod fixel_match;
 pub mod fmls;
 pub mod formats;
+pub mod graddev;
 pub mod header;
 pub mod icosphere;
 pub mod interop;
@@ -44,6 +45,10 @@ pub use formats::mif;
 pub use formats::mrtrix;
 pub use formats::pam;
 pub use formats::tortoise_mapmri;
+pub use graddev::{
+    apply_graddev, GradDevField, GradDevOptions, GradDevReport, IdentityPolicy,
+    GRADDEV_APPLIED_KEY,
+};
 pub use header::{CanonicalDenseRepresentation, Header, QuantizationSpec};
 pub use interop::{
     convert_sh_basis, dsistudio_to_mrtrix, mrtrix_to_dsistudio, DenseOdfMode, DsistudioFormat,

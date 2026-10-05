@@ -947,6 +947,18 @@ pub(crate) fn load_nifti_f32_volume(path: &Path) -> Result<(Vec<usize>, [[f64; 4
     Ok((loaded.dims, loaded.affine, loaded.data))
 }
 
+/// Like [`load_nifti_f32_volume`] but keeps the on-disk `(i, j, k)` ordering
+/// and the raw sform/qform affine instead of canonicalizing the axes to RAS+.
+/// Use this for images whose voxel values are expressed in the image's own
+/// voxel frame (e.g. a gradient-deviation tensor field): reordering the grid
+/// without re-expressing the components would silently change their meaning.
+pub(crate) fn load_nifti_f32_volume_native(
+    path: &Path,
+) -> Result<(Vec<usize>, [[f64; 4]; 4], Vec<f32>)> {
+    let loaded = load_nifti_f32(path, true)?;
+    Ok((loaded.dims, loaded.affine, loaded.data))
+}
+
 fn load_nifti_u32(path: &Path, preserve_affine: bool) -> Result<LoadedU32Image> {
     let image = read_nifti(path, ExpectedNiftiType::UInt32)?;
     let mut loaded = LoadedU32Image {

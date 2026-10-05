@@ -16,7 +16,7 @@
 //!   `from-B_to-A.h5` as inverse.
 
 mod resample;
-mod sh_apsf;
+pub(crate) mod sh_apsf;
 pub mod source_volume;
 pub mod upsample;
 

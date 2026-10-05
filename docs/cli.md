@@ -392,6 +392,70 @@ odx transform \
   aPSF SH reorientation. Default 80 (covers lmax 8 reliably); use 300 for
   lmax 12.
 
+### `odx graddev`
+
+```bash
+odx graddev <input> <output> --graddev <graddev.nii.gz> [options]
+```
+
+Applies a gradient-nonlinearity deviation field to a reconstruction and writes
+it back in its native format. A reconstruction fitted with a single global
+b-table (every ODF/FOD and every peak) is expressed against a locally distorted
+q-space wherever the scanner gradients deviate from nominal; this command
+rotates the fitted quantities per voxel so they describe the tissue instead.
+
+Inputs are the same as `odx convert` (DSI Studio `.fib.gz`/`.fz`, MRtrix SH
+image with optional `--fixel-dir`, MRtrix fixel directory, DIPY `.pam5`, ODX);
+outputs are any of those except `.pam5`. The output grid, mask, scalar arrays
+and peak count are unchanged.
+
+What is corrected, per voxel with matrix `T` (see below):
+
+- SH / FOD coefficients: `ψ_true(u) = ψ_est(normalize(T·u))`, via the same aPSF
+  reorienter as `odx transform` (no modulation).
+- Dense ODF amplitudes (DSI Studio `odf` records, PAM `odf`): refit to SH
+  (`--odf-lmax`, default up to 12) and re-evaluated at the rotated sphere
+  directions.
+- Fixel / peak directions: `normalize(T⁻¹·u)`.
+
+Not corrected: the per-voxel b-value deviation `|Tᵀ·g|²`. It cannot be undone
+on an already-fitted ODF and is only reported (`max_abs_log_det`). DSI Studio's
+own `grad_dev.nii.gz` handling at `.src` creation time is the complementary
+magnitude-only correction; it never rotates ODFs or peaks.
+
+#### File convention
+
+The field is a 4-D NIfTI with 9 volumes in the HCP/FSL `grad_dev` layout.
+Reading one voxel's 9 values row-major into `T` (`T[i][j] = vol[3*i + j]`,
+numpy `reshape(3, 3)` in C order) the effective gradient is `Tᵀ · g` in the
+image's own voxel axes. This is FSL's `correct_bvals_bvecs` (which fills its
+matrix column-major and applies `(I + L)·g`) and TORTOISE's
+`CreateGradientNonlinearityBMatrix` output (qsiprep `*_space-ACPC_graddev.nii.gz`).
+The field is rotated into RAS with the affine's rotation part and sampled at
+each ODX voxel centre (nearest neighbour); it is never axis-canonicalized.
+
+`--identity auto|included|absent` says whether the diagonal already holds the
+identity: TORTOISE/qsiprep files do (`included`, diagonal ≈ 1); HCP/FSL
+`grad_dev` files store `T − I` (`absent`). `auto` inspects the median diagonal.
+
+#### DSI Studio output
+
+`index{p}` snaps every peak to the 642-vertex ODF sphere (~8° apart), which
+would swallow a typical 1–4° correction. DSI Studio's tracker prefers exact
+float `dir{p}` records whenever they exist, in both `.fib.gz` and `.fz`, so
+`odx graddev` always writes them (and `odx convert --dsistudio-float-dirs`
+can). The loader also reads them back in preference to `index{p}`.
+
+Useful options:
+
+- `--reference-affine <nifti>`: required for a native-space `.fib.gz`/`.fz`
+  without a `trans` record (e.g. the preprocessed DWI it was built from).
+- `--odf-lmax <even-int>`, `--apsf-dirs <N>`: accuracy knobs for the dense-ODF
+  and SH paths.
+- `--json`: machine-readable summary including the correction report
+  (`nb_corrected`, `nb_outside_field`, `median_rotation_deg`, `max_rotation_deg`,
+  `max_abs_log_det`, arrays touched, dropped DPFs).
+
 ### `odx attach-dpv`
 
 ```bash

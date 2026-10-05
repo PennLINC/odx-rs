@@ -980,3 +980,85 @@ fn transform_refuses_existing_output_without_overwrite() {
         .failure()
         .stderr(predicate::str::contains("already exists"));
 }
+
+mod common;
+
+#[test]
+fn graddev_cli_corrects_and_writes_native_formats() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("in.odxd");
+    let dims = [3u64, 3, 3];
+    let mut builder = OdxBuilder::new(Header::identity_affine(), dims, vec![1u8; 27]);
+    for _ in 0..27 {
+        builder.push_voxel_peaks(&[[1.0, 0.0, 0.0]]);
+    }
+    builder.set_dpf_data(
+        "amplitude",
+        bytemuck::cast_slice(&vec![1.0f32; 27]).to_vec(),
+        1,
+        DType::Float32,
+    );
+    builder.finalize().unwrap().save_directory(&input).unwrap();
+
+    // g_eff = R_z(20°) g  ⇒  file stores T = Rᵀ.
+    let (s, c) = 20.0f64.to_radians().sin_cos();
+    let t = [[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]];
+    let field = tmp.path().join("graddev.nii");
+    common::write_uniform_graddev_nifti(&field, [3, 3, 3], Header::identity_affine(), t);
+
+    let out_odx = tmp.path().join("out.odx");
+    let output = Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "graddev",
+            input.to_str().unwrap(),
+            out_odx.to_str().unwrap(),
+            "--graddev",
+            field.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["report"]["nb_corrected"], 27);
+    assert_eq!(summary["report"]["nb_outside_field"], 0);
+    assert_eq!(summary["report"]["identity_added"], false);
+    let median = summary["report"]["median_rotation_deg"].as_f64().unwrap();
+    assert!((median - 20.0).abs() < 0.01, "median {median}");
+
+    let corrected = OdxDataset::load(&out_odx).unwrap();
+    for d in corrected.directions() {
+        assert!((d[0] - c as f32).abs() < 1e-4 && (d[1] - s as f32).abs() < 1e-4, "{d:?}");
+    }
+
+    let out_fib = tmp.path().join("out.fib.gz");
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "graddev",
+            input.to_str().unwrap(),
+            out_fib.to_str().unwrap(),
+            "--graddev",
+            field.to_str().unwrap(),
+            "--quiet",
+        ])
+        .assert()
+        .success();
+    let mat = odx_rs::formats::mat4::read_mat4_gz(&out_fib).unwrap();
+    assert!(mat.get("dir0").is_some(), "DSI Studio output carries float dir records");
+
+    let out_pam = tmp.path().join("out.pam5");
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "graddev",
+            input.to_str().unwrap(),
+            out_pam.to_str().unwrap(),
+            "--graddev",
+            field.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("pam5"));
+}

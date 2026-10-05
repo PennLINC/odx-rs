@@ -26,6 +26,12 @@ use crate::mmap_backing::{vec_to_bytes, MmapBacking};
 use crate::nifti_canon::{affine_column_norms, nibabel_io_orientation, nibabel_ornt_transform};
 use crate::odx_file::{OdxDataset, OdxParts};
 
+/// Header-extra flag telling the writer to emit exact float32 `dir{p}`
+/// records next to the sphere-quantized `index{p}` ones. DSI Studio's tracker
+/// prefers `dir{p}` whenever present (`fib_data.cpp`, `get_fib`), in both
+/// `.fib.gz` and `.fz` containers.
+pub const WRITE_DIR_RECORDS_KEY: &str = "_ODX_DSISTUDIO_WRITE_DIR_RECORDS";
+
 pub fn load_fibgz(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxDataset> {
     load_dsistudio_mat(path, affine)
 }
@@ -180,7 +186,10 @@ fn load_dsistudio_mat(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxD
 
     let max_peaks = count_peak_fields(&mat);
     let mut fa_cache = Vec::with_capacity(max_peaks);
-    let mut index_cache = Vec::with_capacity(max_peaks);
+    let mut index_cache: Vec<Option<Vec<i32>>> = Vec::with_capacity(max_peaks);
+    // DSI Studio's tracker takes exact float `dir{p}` records over the
+    // sphere-quantized `index{p}` whenever both exist; so does this loader.
+    let mut dir_cache: Vec<Option<Vec<f32>>> = Vec::with_capacity(max_peaks);
     for p in 0..max_peaks {
         fa_cache.push(load_volume_f32(
             get_required(&mat, &format!("fa{p}"))?,
@@ -188,12 +197,12 @@ fn load_dsistudio_mat(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxD
             &sparse_row_by_f,
             sparse_count,
         ));
-        index_cache.push(load_volume_i32(
-            get_required(&mat, &format!("index{p}"))?,
-            nvoxels_total,
-            &sparse_row_by_f,
-            sparse_count,
-        ));
+        dir_cache.push(mat.get(&format!("dir{p}")).map(|record| {
+            load_volume_vec3(record, nvoxels_total, &sparse_row_by_f, sparse_count)
+        }));
+        index_cache.push(mat.get(&format!("index{p}")).map(|record| {
+            load_volume_i32(record, nvoxels_total, &sparse_row_by_f, sparse_count)
+        }));
     }
 
     let mut offsets: Vec<u32> = Vec::with_capacity(nb_masked + 1);
@@ -208,13 +217,24 @@ fn load_dsistudio_mat(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxD
             if fa_val <= 0.0 {
                 break;
             }
-            let dir_idx = index_cache[p][f_idx] as usize;
-            if let Some(verts) = sphere_vertices.as_ref() {
-                if dir_idx < verts.len() {
-                    directions.push(verts[dir_idx]);
-                    amplitudes.push(fa_val);
-                    n_peaks_this_voxel += 1;
+            let direction = if let Some(dirs) = dir_cache[p].as_ref() {
+                let d = &dirs[f_idx * 3..f_idx * 3 + 3];
+                let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                // DSI Studio stores directions in LPS; ODX keeps RAS.
+                (n > 0.0).then(|| [-d[0] / n, -d[1] / n, d[2] / n])
+            } else {
+                match (index_cache[p].as_ref(), sphere_vertices.as_ref()) {
+                    (Some(indices), Some(verts)) => {
+                        let dir_idx = indices[f_idx] as usize;
+                        (dir_idx < verts.len()).then(|| verts[dir_idx])
+                    }
+                    _ => None,
                 }
+            };
+            if let Some(direction) = direction {
+                directions.push(direction);
+                amplitudes.push(fa_val);
+                n_peaks_this_voxel += 1;
             }
         }
         offsets.push(offsets.last().unwrap() + n_peaks_this_voxel);
@@ -395,6 +415,31 @@ fn load_volume_f32(
     }
 }
 
+/// Per-voxel 3-vectors (`dir{p}`): DSI Studio interleaves xyz per voxel in
+/// Fortran voxel order, either dense (`3 × nvoxels`) or masked
+/// (`3 × sparse_count`, expanded here through the mask).
+fn load_volume_vec3(
+    record: MatRecord<'_>,
+    nvoxels_total: usize,
+    sparse_row_by_f: &[usize],
+    sparse_count: usize,
+) -> Vec<f32> {
+    let values = record.as_f32_vec();
+    if values.len() == nvoxels_total * 3 {
+        return values;
+    }
+    let mut out = vec![0.0f32; nvoxels_total * 3];
+    if sparse_count > 0 && values.len() == sparse_count * 3 {
+        for f_idx in 0..nvoxels_total {
+            let row = sparse_row_by_f[f_idx];
+            if row != usize::MAX {
+                out[f_idx * 3..f_idx * 3 + 3].copy_from_slice(&values[row * 3..row * 3 + 3]);
+            }
+        }
+    }
+    out
+}
+
 fn load_volume_i32(
     record: MatRecord<'_>,
     nvoxels_total: usize,
@@ -433,7 +478,9 @@ fn collect_odf_chunks(mat: &MatCatalog) -> Vec<MatRecord<'_>> {
 
 fn count_peak_fields(mat: &MatCatalog) -> usize {
     let mut n = 0usize;
-    while mat.has(&format!("fa{n}")) && mat.has(&format!("index{n}")) {
+    while mat.has(&format!("fa{n}"))
+        && (mat.has(&format!("index{n}")) || mat.has(&format!("dir{n}")))
+    {
         n += 1;
     }
     n
@@ -453,7 +500,7 @@ fn collect_peak_scalar_prefixes(
         if peak_idx >= max_peaks {
             continue;
         }
-        if matches!(prefix, "fa" | "index" | "odf") {
+        if matches!(prefix, "fa" | "index" | "odf" | "dir") {
             continue;
         }
         if !mat.has(&format!("{prefix}0")) {
@@ -702,6 +749,16 @@ fn build_dsistudio_records(odx: &OdxDataset, masked_sloped: bool) -> Result<Vec<
         .map(|_| vec![0.0f32; nvoxels_total])
         .collect();
     let mut idx_arrays: Vec<Vec<i16>> = (0..max_peaks).map(|_| vec![0i16; nvoxels_total]).collect();
+    let write_dir_records = header
+        .extra
+        .get(WRITE_DIR_RECORDS_KEY)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut dir_arrays: Vec<Vec<f32>> = if write_dir_records {
+        (0..max_peaks).map(|_| vec![0.0f32; nvoxels_total * 3]).collect()
+    } else {
+        Vec::new()
+    };
     let mut extra_peak_arrays = Vec::new();
     for (name, info) in odx.iter_dpf() {
         if info.ncols != 1 || name == "amplitude" || name == "pam_peak_index" {
@@ -732,6 +789,9 @@ fn build_dsistudio_records(odx: &OdxDataset, masked_sloped: bool) -> Result<Vec<
             // directions are flipped back before nearest-vertex lookup.
             let lps_dir = [-dir[0], -dir[1], dir[2]];
             idx_arrays[p][f_idx] = closest_vertex(&lps_verts, &lps_dir) as i16;
+            if write_dir_records {
+                dir_arrays[p][f_idx * 3..f_idx * 3 + 3].copy_from_slice(&lps_dir);
+            }
             for (_, values, per_peak) in &mut extra_peak_arrays {
                 if peak_idx < values.len() {
                     per_peak[p][f_idx] = values[peak_idx];
@@ -790,6 +850,17 @@ fn build_dsistudio_records(odx: &OdxDataset, masked_sloped: bool) -> Result<Vec<
                 1,
                 nvoxels_total,
             ));
+        }
+    }
+    for (p, values) in dir_arrays.into_iter().enumerate() {
+        if masked_sloped {
+            records.push(masked_vec3_record(
+                format!("dir{p}"),
+                &values,
+                &sparse_indices,
+            ));
+        } else {
+            records.push(float_record(format!("dir{p}"), values, 3, nvoxels_total));
         }
     }
     for (name, _, per_peak) in extra_peak_arrays {
@@ -920,6 +991,20 @@ fn masked_float_record(
 ) -> OwnedMatRecord {
     let sparse: Vec<f32> = sparse_indices.iter().map(|&idx| values[idx]).collect();
     float_record(name, sparse, 1, sparse_indices.len())
+}
+
+/// Masked `3 × sparse_count` float record (xyz per masked voxel), the layout
+/// DSI Studio's `.fz` reader expands for `dir{p}`.
+fn masked_vec3_record(
+    name: impl Into<String>,
+    values: &[f32],
+    sparse_indices: &[usize],
+) -> OwnedMatRecord {
+    let mut sparse = Vec::with_capacity(sparse_indices.len() * 3);
+    for &idx in sparse_indices {
+        sparse.extend_from_slice(&values[idx * 3..idx * 3 + 3]);
+    }
+    float_record(name, sparse, 3, sparse_indices.len())
 }
 
 fn masked_i16_record(
