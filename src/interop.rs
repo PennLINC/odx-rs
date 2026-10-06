@@ -444,7 +444,33 @@ fn prepare_dsistudio_dataset(
     }
 
     let (offsets, directions, amplitudes) = match options.peak_source {
-        PeakSource::Fixels => sort_fixels_by_amplitude(odx, &amplitude)?,
+        PeakSource::Fixels => {
+            let fixels = sort_fixels_by_amplitude(odx, &amplitude)?;
+            if fixels.1.is_empty() {
+                // A DSI Studio fz/fib is a peak/ODF format and cannot be valid without
+                // peaks. When the source carries no fixels (e.g. a bare-SH MRtrix
+                // population_template), derive peaks from the SH-sampled ODF instead of
+                // writing an empty peak set — which previously surfaced as a confusing
+                // `cast_slice` alignment panic in the fz writer.
+                let fallback_dense;
+                let dense = match sampled_odf.as_ref() {
+                    Some(dense) => dense,
+                    None => {
+                        fallback_dense = sample_dense_odf_from_sh(odx)?;
+                        fallback_dense.as_ref().ok_or_else(|| {
+                            OdxError::Argument(
+                                "cannot export DSI Studio peaks: the input has no fixels and no \
+                                 SH coefficients to derive them from"
+                                    .into(),
+                            )
+                        })?
+                    }
+                };
+                peaks_from_sampled_odf(odx, dense)
+            } else {
+                fixels
+            }
+        }
         PeakSource::SampledOdf => {
             let dense = sampled_odf.as_ref().ok_or_else(|| {
                 OdxError::Argument(
