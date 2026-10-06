@@ -638,10 +638,13 @@ fn summarize_scalar_dpf_partitions(
         let mut disconnected_sum = 0.0f64;
 
         for (idx, value) in values.iter().enumerate() {
+            // NaN in an *auxiliary* DPF means "undefined for this fixel", which
+            // is normal — `odx compare` writes NaN for unmatched fixels and
+            // `odx combine` for group fixels with too few contributors. Skip
+            // those rather than refusing the file; only the primary metric,
+            // which drives thresholding, must be finite throughout.
             if !value.is_finite() {
-                return Err(OdxError::Argument(format!(
-                    "DPF '{name}' contains a non-finite value at row {idx}"
-                )));
+                continue;
             }
 
             match states[idx] {

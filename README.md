@@ -25,7 +25,9 @@ Subcommands:
 - `compare` — pairwise fixel comparison between two ODX files
   (`--a <odx> --b <odx> --out-dir <dir>`)
 - `combine` — build group fixels from many template-space ODX and write per-subject
-  angular distance (the N-way generalization of `compare`)
+  angular distance (the N-way generalization of `compare`); with `--method mean-fod`
+  it also builds an average ODF **template** with reproducibility maps
+  (see [`docs/template.md`](docs/template.md))
 - `import-aodf` — import a pyAFQ asymmetric ODF (`*_param-aodf_dwimap.nii.gz`) into ODX
 - `upsample` — resample an ODX onto a finer isotropic grid (`--voxel-spacing <mm>`)
 - `transform` — apply an ANTs/ITK spatial transform to an ODX (`--transform <h5>`)

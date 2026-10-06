@@ -25,8 +25,9 @@ import pytest
 
 import odx
 
-nib = pytest.importorskip("nibabel")
-from odx.adapters import nibabel as odx_nib  # noqa: E402
+import nibabel as nib
+
+from odx.adapters import nibabel as odx_nib
 
 
 # ─── shared fixture ────────────────────────────────────────────────────────

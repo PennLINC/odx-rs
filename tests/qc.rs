@@ -92,6 +92,74 @@ fn write_u8_dpf(builder: &mut OdxBuilder, name: &str, values: &[u8]) {
     builder.set_dpf_data(name, values.to_vec(), 1, DType::UInt8);
 }
 
+/// NaN in an auxiliary DPF means "undefined for this fixel" -- `odx compare`
+/// writes it for unmatched fixels and `odx combine` for group fixels with too
+/// few contributors. QC must summarize the defined values rather than refuse
+/// the file, or the crate cannot read back what it just wrote.
+#[test]
+fn nonfinite_auxiliary_dpf_values_are_skipped_not_rejected() {
+    let odx = build_qc_dataset(
+        [2, 1, 1],
+        vec![
+            TestVoxel {
+                coord: [0, 0, 0],
+                peaks: vec![[1.0, 0.0, 0.0]],
+            },
+            TestVoxel {
+                coord: [1, 0, 0],
+                peaks: vec![[1.0, 0.0, 0.0]],
+            },
+        ],
+        vec![
+            ("amplitude", vec![1.0, 1.0]),
+            ("dispersion", vec![f32::NAN, 0.5]),
+        ],
+        vec![],
+    );
+
+    let computation = compute_fixel_qc(
+        &odx,
+        &FixelQcOptions {
+            threshold: ThresholdMode::All,
+            ..Default::default()
+        },
+    )
+    .expect("a NaN in an auxiliary DPF must not fail the QC pass");
+    let disp = computation.report.per_dpf.get("dispersion").unwrap();
+    assert_eq!(disp.connected.count, 1, "only the finite value is summarized");
+    assert_eq!(disp.connected.mean, Some(0.5));
+}
+
+/// The primary metric drives thresholding, so a NaN there is still fatal.
+#[test]
+fn nonfinite_primary_dpf_is_still_rejected() {
+    let odx = build_qc_dataset(
+        [2, 1, 1],
+        vec![
+            TestVoxel {
+                coord: [0, 0, 0],
+                peaks: vec![[1.0, 0.0, 0.0]],
+            },
+            TestVoxel {
+                coord: [1, 0, 0],
+                peaks: vec![[1.0, 0.0, 0.0]],
+            },
+        ],
+        vec![("amplitude", vec![f32::NAN, 1.0])],
+        vec![],
+    );
+
+    let err = compute_fixel_qc(
+        &odx,
+        &FixelQcOptions {
+            threshold: ThresholdMode::All,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("primary DPF"), "{err}");
+}
+
 #[test]
 fn connected_pair_reports_all_fixels_connected_and_skips_vector_dpf() {
     let odx = build_qc_dataset(

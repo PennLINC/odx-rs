@@ -46,14 +46,19 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Medical Science Apps.",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
+# nibabel is required, not optional: every NIfTI crossing between odx and
+# Python goes through it, so its orientation/affine conventions are handled in
+# one place (and always exercised by the tests) instead of re-derived per caller.
 dependencies = [
     "numpy>=1.24",
+    "nibabel>=5",
 ]
 
 [project.optional-dependencies]
 dipy = ["dipy>=1.10"]
-nibabel = ["nibabel>=5"]
-test = ["pytest", "nibabel>=5"]
+# Kept so existing `pip install odx[nibabel]` invocations keep working.
+nibabel = []
+test = ["pytest"]
 
 [project.urls]
 Homepage = "https://github.com/PennLINC/odx-rs"

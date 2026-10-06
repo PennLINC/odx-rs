@@ -12,7 +12,7 @@ use std::sync::Arc;
 use ndarray::Array2;
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArray5, PyArrayMethods,
-    PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4,
+    PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
     PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyIOError, PyValueError};
@@ -35,7 +35,10 @@ use odx_rs::sh_basis_evaluator::{
     basis_kind_from_dipy_name, compute_b_matrix as core_compute_b_matrix,
 };
 use odx_rs::sphere_lookup::{median_nearest_vertex_angle_deg, nearest_vertex_indices};
-use odx_rs::{OdxBuilder, OdxDataset};
+use odx_rs::{
+    apply_graddev as core_apply_graddev, GradDevField, GradDevOptions, IdentityPolicy, OdxBuilder,
+    OdxDataset,
+};
 
 // ─── Error helpers ───────────────────────────────────────────────────────────
 
@@ -752,6 +755,48 @@ impl PyOdx {
         }
     }
 
+    /// Correct this dataset for gradient nonlinearity, as `odx graddev` does.
+    ///
+    /// `graddev` is the 9-component deviation field — row-major `T` per voxel,
+    /// `g_eff = Tᵀ g` in the field image's voxel axes (qsiprep's
+    /// `*_space-ACPC_graddev.nii.gz`, or an HCP/FSL `grad_dev.nii.gz`) — given
+    /// as a nibabel image (preferred: it brings its own affine), a NIfTI path,
+    /// or an array of shape `(X, Y, Z, 9)` or `(X, Y, Z, 3, 3)` together with
+    /// its voxel→RAS+ `affine`. Never reorient the field (e.g. with
+    /// `nib.as_closest_canonical`): its components are expressed in its own
+    /// voxel axes, so permuting the grid without re-expressing them changes
+    /// their meaning. `identity`
+    /// says whether the field stores `T` (`"included"`, qsiprep/TORTOISE) or
+    /// `T − I` (`"absent"`, HCP/FSL); `"auto"` decides from the data.
+    ///
+    /// SH/FOD coefficients are reoriented (`ψ(normalize(T u))`, aPSF, no
+    /// modulation; `apsf_dirs` sets its sphere), dense ODF amplitudes are
+    /// refit to SH (`odf_lmax`) and re-evaluated, and fixel directions map to
+    /// `normalize(T⁻¹ u)`. The per-voxel b-value deviation `|Tᵀg|²` cannot be
+    /// undone on fitted data and is only reported. Returns
+    /// `(corrected Odx, report dict)`; the grid, mask, scalars and peak count
+    /// are unchanged.
+    #[pyo3(signature = (graddev, *, identity="auto", affine=None, apsf_dirs=None, odf_lmax=None))]
+    fn apply_graddev(
+        &self,
+        py: Python<'_>,
+        graddev: &Bound<'_, PyAny>,
+        identity: &str,
+        affine: Option<PyReadonlyArray2<'_, f64>>,
+        apsf_dirs: Option<usize>,
+        odf_lmax: Option<usize>,
+    ) -> PyResult<(PyOdx, PyObject)> {
+        let policy = parse_identity_policy(identity)?;
+        let field = graddev_field_from_py(graddev, policy, affine.as_ref())?;
+        let opts = GradDevOptions { apsf_dirs, odf_lmax, transpose: false };
+        let inner = Arc::clone(&self.inner);
+        let (corrected, report) = py
+            .allow_threads(move || core_apply_graddev(&inner, &field, &opts))
+            .map_err(map_err)?;
+        let report = serde_json::to_value(&report).map_err(map_err)?;
+        Ok((PyOdx::from_dataset(corrected), json_to_py(py, &report)))
+    }
+
     /// Run the Rust peak finder on this dataset's SH coefficients and return
     /// a *new* Odx with `directions` and `dpf/amplitude` populated. Niche path
     /// — prefer `OdxBuilder.compute_peaks` or `from_sh_coefficients`.
@@ -1358,6 +1403,103 @@ fn convert_sh_basis(odx: &PyOdx, target: &str) -> PyResult<PyOdx> {
     odx.convert_sh_basis_to(target)
 }
 
+/// Correct an Odx for gradient nonlinearity; see `Odx.apply_graddev`.
+/// Returns `(corrected Odx, report dict)`.
+#[pyfunction]
+#[pyo3(signature = (odx, graddev, *, identity="auto", affine=None, apsf_dirs=None, odf_lmax=None))]
+fn apply_graddev(
+    py: Python<'_>,
+    odx: &PyOdx,
+    graddev: &Bound<'_, PyAny>,
+    identity: &str,
+    affine: Option<PyReadonlyArray2<'_, f64>>,
+    apsf_dirs: Option<usize>,
+    odf_lmax: Option<usize>,
+) -> PyResult<(PyOdx, PyObject)> {
+    odx.apply_graddev(py, graddev, identity, affine, apsf_dirs, odf_lmax)
+}
+
+fn parse_identity_policy(identity: &str) -> PyResult<IdentityPolicy> {
+    match identity {
+        "auto" => Ok(IdentityPolicy::Auto),
+        "included" => Ok(IdentityPolicy::Included),
+        "absent" => Ok(IdentityPolicy::Absent),
+        other => Err(PyValueError::new_err(format!(
+            "identity must be 'auto', 'included' or 'absent'; got {other:?}"
+        ))),
+    }
+}
+
+/// A deviation field from a nibabel image (or anything with `.dataobj` and
+/// `.affine`), a NIfTI path, or an `(X, Y, Z, 9)` / `(X, Y, Z, 3, 3)` float
+/// array plus its affine.
+fn graddev_field_from_py(
+    obj: &Bound<'_, PyAny>,
+    policy: IdentityPolicy,
+    affine: Option<&PyReadonlyArray2<'_, f64>>,
+) -> PyResult<GradDevField> {
+    // A spatial image carries its own affine; reading `dataobj` (not
+    // `get_fdata()` on a reoriented copy) keeps the stored voxel order, which
+    // the field's components are expressed in, and applies scl_slope/inter.
+    if obj.hasattr("dataobj")? && obj.hasattr("affine")? {
+        if affine.is_some() {
+            return Err(PyValueError::new_err(
+                "affine= is only for array input; an image carries its own",
+            ));
+        }
+        let np = obj.py().import_bound("numpy")?;
+        let data = np.call_method1("asarray", (obj.getattr("dataobj")?, "float32"))?;
+        let img_affine = np.call_method1("asarray", (obj.getattr("affine")?, "float64"))?;
+        let img_affine: PyReadonlyArray2<'_, f64> = img_affine.extract()?;
+        return graddev_field_from_array(&data, policy, &img_affine);
+    }
+    if let Ok(path) = obj.extract::<PathBuf>() {
+        if affine.is_some() {
+            return Err(PyValueError::new_err(
+                "affine= is only for array input; a NIfTI file carries its own",
+            ));
+        }
+        return GradDevField::load_nifti(&path, policy).map_err(map_io);
+    }
+    let affine = affine.ok_or_else(|| {
+        PyValueError::new_err(
+            "graddev given as an array needs affine= (its voxel→RAS+ 4x4); \
+             or pass the nibabel image itself",
+        )
+    })?;
+    graddev_field_from_array(obj, policy, affine)
+}
+
+fn graddev_field_from_array(
+    obj: &Bound<'_, PyAny>,
+    policy: IdentityPolicy,
+    affine: &PyReadonlyArray2<'_, f64>,
+) -> PyResult<GradDevField> {
+    let (shape, data): (Vec<usize>, Vec<f32>) =
+        if let Ok(a) = obj.extract::<PyReadonlyArrayDyn<'_, f32>>() {
+            let v = a.as_array();
+            (v.shape().to_vec(), v.iter().copied().collect())
+        } else if let Ok(a) = obj.extract::<PyReadonlyArrayDyn<'_, f64>>() {
+            let v = a.as_array();
+            (v.shape().to_vec(), v.iter().map(|&x| x as f32).collect())
+        } else {
+            return Err(PyValueError::new_err(
+                "graddev must be a nibabel image, a NIfTI path, or a float32/float64 array \
+                 of shape (X, Y, Z, 9) or (X, Y, Z, 3, 3)",
+            ));
+        };
+    let ok = (shape.len() == 4 && shape[3] == 9) || (shape.len() == 5 && shape[3] == 3 && shape[4] == 3);
+    if !ok {
+        return Err(PyValueError::new_err(format!(
+            "graddev array must have shape (X, Y, Z, 9) or (X, Y, Z, 3, 3); got {shape:?}"
+        )));
+    }
+    // `iter()` walks logical (C) order, so each voxel's 9 values come out
+    // contiguous and row-major — the layout GradDevField expects.
+    GradDevField::from_parts([shape[0], shape[1], shape[2]], read_4x4_affine(affine)?, data, policy)
+        .map_err(map_err)
+}
+
 /// Compute the SH→SF transform matrix for the given sphere and basis.
 /// Returns a `(M, K) float32` ndarray where `M = sphere_vertices.shape[0]`
 /// and `K = (sh_order+1)(sh_order+2)/2` (or `(sh_order+1)^2` if
@@ -1665,6 +1807,7 @@ fn _odx(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(peaks_from_sh, m)?)?;
     m.add_function(wrap_pyfunction!(from_sh_coefficients, m)?)?;
     m.add_function(wrap_pyfunction!(convert_sh_basis, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_graddev, m)?)?;
     m.add_function(wrap_pyfunction!(from_fz, m)?)?;
     m.add_function(wrap_pyfunction!(from_fibgz, m)?)?;
     m.add_function(wrap_pyfunction!(from_mrtrix, m)?)?;

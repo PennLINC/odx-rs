@@ -17,10 +17,11 @@ use odx_rs::mrtrix::{
 };
 use odx_rs::pam::{self, PamWriteOptions};
 use odx_rs::{
-    combine_odx, compare_odx, compute_fixel_qc, write_qc_class_dpf, CombineInput, CombineOptions,
-    CombineOutputs, CombineReport, CompareOptions, CompareReport, FixelQcOptions, FixelQcReport,
-    MaskCombine, NormalizeFod, OdxDataset, OdxError, OdxWritePolicy, PeakFinderConfig,
-    TemplateMethod, ThresholdMode,
+    apply_graddev, combine_odx, compare_odx, compute_fixel_qc, convert_sh_basis,
+    write_qc_class_dpf, CombineInput, CombineOptions, CombineOutputs, CombineReport,
+    CompareOptions, CompareReport, FixelQcOptions, FixelQcReport, GradDevField, GradDevOptions,
+    IdentityPolicy, LmaxPolicy, LooMode, MaskCombine, NormalizeFod, OdxDataset, OdxError,
+    OdxWritePolicy, PeakFinderConfig, ShBasisTarget, TemplateMethod, ThresholdMode,
 };
 
 #[derive(Parser, Debug)]
@@ -113,6 +114,47 @@ enum Command {
     ///   --transform         sub-01_from-ACPC_to-MNI152NLin2009cAsym_xfm.h5
     ///   --transform-inverse sub-01_from-MNI152NLin2009cAsym_to-ACPC_xfm.h5
     Transform(TransformArgs),
+    /// Apply a gradient-nonlinearity deviation field ("graddev") to a
+    /// reconstruction and write it back in its native format.
+    ///
+    /// A reconstruction fitted with one global b-table is expressed against a
+    /// locally distorted q-space wherever the scanner's gradients deviate from
+    /// nominal. Given the 9-volume deviation image (qsiprep's
+    /// `*_space-ACPC_graddev.nii.gz`, or an HCP/FSL `grad_dev.nii.gz`), this
+    /// rotates SH/FOD coefficients, dense ODF amplitudes and fixel/peak
+    /// directions per voxel so that they describe the tissue rather than the
+    /// distorted encoding. Scalars, the mask, the grid and the peak count are
+    /// untouched.
+    ///
+    /// CONVENTION: the 9 volumes are read row-major into `T`; the effective
+    /// gradient is `Tᵀ·g` in the image's voxel frame (FSL `xfibres`
+    /// `correct_bvals_bvecs` = TORTOISE "HCP ordering"). ODF/FOD:
+    /// `ψ_true(u) = ψ_est(normalize(T·u))`; peaks: `normalize(T⁻¹·u)`.
+    /// The per-voxel b-value change `|Tᵀ·g|²` cannot be undone on a fitted
+    /// ODF and is only reported.
+    ///
+    /// INPUTS: DSI Studio `.fib.gz`/`.fz` (pass `--reference-affine` for a
+    /// native-space file without a `trans` record), MRtrix SH image
+    /// (`--fixel-dir` optional), MRtrix fixel directory, DIPY `.pam5`, ODX.
+    /// OUTPUTS: any of those except `.pam5`. DSI Studio output always gets
+    /// exact float `dir{p}` records (DSI Studio tracks with them) — the
+    /// sphere-quantized `index{p}` alone would swallow a 1–4° correction.
+    ///
+    /// EXAMPLES:
+    ///   odx graddev sub-01_model-gqi_dwimap.fib.gz sub-01_desc-graddev_dwimap.fib.gz
+    ///       --graddev sub-01_space-ACPC_graddev.nii.gz
+    ///       --reference-affine sub-01_space-ACPC_desc-preproc_dwi.nii.gz
+    ///   odx graddev wm_fod.mif.gz wm_fod_graddev.mif.gz --graddev graddev.nii.gz
+    Graddev(GraddevArgs),
+    /// Segment FODs into lobes (FMLS) and write an ODX whose fixels ARE the
+    /// lobes, carrying `afd` (lobe integral) and `amplitude` (peak) DPFs.
+    ///
+    /// Follows `fod2fixel`: a fixel is created FROM each surviving lobe rather
+    /// than AFD being attached to pre-existing peak fixels, so direction, AFD
+    /// and amplitude all come off one lobe and correspondence is 1:1 by
+    /// construction. The output is a derived dataset with different fixel
+    /// cardinality and directions from the input.
+    Afd(AfdArgs),
     /// Attach a NIfTI volume to an ODX as a DPV (per-voxel scalar), in
     /// place. The NIfTI grid must match the ODX (dimensions + affine
     /// within 1e-3 mm); voxels outside the ODX mask are silently dropped.
@@ -132,6 +174,42 @@ enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+}
+
+#[derive(Args, Debug)]
+struct AfdArgs {
+    /// Input ODX with SH/FOD coefficients.
+    input: PathBuf,
+    /// Output ODX (fixels = lobes).
+    output: PathBuf,
+    /// Icosphere subdivision level. 3 = 321 hemisphere directions (mrtrix3
+    /// `tesselation_321`); 4 = 1281, `fod2fixel`'s default. Higher is finer
+    /// and slower.
+    #[arg(long = "ico-level", default_value_t = 4)]
+    ico_level: usize,
+    /// Drop lobes whose maximal peak is below this (`fod2fixel -fmls_peak_value`).
+    #[arg(long = "fmls-peak-value", default_value_t = odx_rs::fmls::DEFAULT_PEAK_VALUE_THRESHOLD)]
+    fmls_peak_value: f32,
+    /// Drop lobes whose integral is below this (`-fmls_integral`). 0 = off.
+    #[arg(long = "fmls-integral", default_value_t = odx_rs::fmls::DEFAULT_INTEGRAL_THRESHOLD)]
+    fmls_integral: f32,
+    /// Keep at most N lobes per voxel, largest AFD first (`-maxnum`).
+    #[arg(long = "maxnum")]
+    maxnum: Option<usize>,
+    /// Use each lobe's maximal-peak direction instead of its amplitude-weighted
+    /// mean direction (`fod2fixel -dirpeak`). mrtrix3 defaults to the mean.
+    #[arg(long = "dirpeak")]
+    dirpeak: bool,
+    /// Do not carry the input SH through; yields a bare fixel ODX (smaller,
+    /// but no glyphs to render).
+    #[arg(long = "no-sh")]
+    no_sh: bool,
+    #[arg(long = "odx-layout", value_enum, default_value = "directory")]
+    odx_layout: OdxLayoutArg,
+    #[arg(long)]
+    overwrite: bool,
+    #[arg(long)]
+    quiet: bool,
 }
 
 #[derive(Args, Debug)]
@@ -232,6 +310,19 @@ struct TransformArgs {
     /// reorientation. 80 covers lmax 8 reliably; 300 for lmax 12.
     #[arg(long = "apsf-dirs", default_value_t = 80)]
     apsf_dirs: usize,
+    /// Also emit a fibre cross-section (FC) DPF under this name, computed from
+    /// the warp Jacobian as `det(J) / ‖J·v‖` (matching `warp2metric -fc`).
+    ///
+    /// FC is the morphological half of the fixel-based analysis pair: the
+    /// change in fibre-bundle cross-sectional area implied by the warp, with no
+    /// diffusion signal in it. Pair with an `afd` DPF to form FDC.
+    ///
+    /// Values are relative to the target space, so they compare only within a
+    /// study sharing one template, and log(FC) is the usual form for
+    /// statistics. Degenerate Jacobians (singular, or folded with det <= 0)
+    /// give NaN rather than a fabricated finite value.
+    #[arg(long = "fc")]
+    fc: Option<String>,
     #[arg(long = "odx-layout", value_enum, default_value = "directory")]
     odx_layout: OdxLayoutArg,
     #[arg(long)]
@@ -375,6 +466,70 @@ struct ConvertArgs {
     /// `fod2fixel` voxels). No-op if the dataset already has fixels.
     #[arg(long = "peaks-from-sh")]
     peaks_from_sh: bool,
+    /// DSI Studio output only: also write exact float32 `dir{p}` records so
+    /// peak directions are not snapped to the ODF sphere. DSI Studio's
+    /// tracker prefers them over `index{p}`.
+    #[arg(long = "dsistudio-float-dirs")]
+    dsistudio_float_dirs: bool,
+}
+
+#[derive(Args, Debug)]
+struct GraddevArgs {
+    /// Reconstruction to correct: DSI Studio `.fib.gz`/`.fz`, MRtrix SH image
+    /// (`.mif`/`.mif.gz`/`.nii`/`.nii.gz`, optionally with `--fixel-dir`),
+    /// MRtrix fixel directory, DIPY `.pam5`, or ODX.
+    input: PathBuf,
+    /// Output path; the format is detected from the extension as in
+    /// `odx convert` (DSI Studio, MRtrix, ODX). `.pam5` output is not supported.
+    output: PathBuf,
+    /// 9-volume gradient deviation NIfTI (float32), e.g. qsiprep's
+    /// `*_space-ACPC_graddev.nii.gz` or HCP's `grad_dev.nii.gz`.
+    #[arg(long = "graddev")]
+    graddev: PathBuf,
+    /// Whether the diagonal already contains the identity. `auto` inspects
+    /// the data; `included` = TORTOISE/qsiprep (diagonal ≈ 1); `absent` =
+    /// HCP/FSL `grad_dev` (diagonal ≈ 0, identity is added).
+    #[arg(long, value_enum, default_value = "auto")]
+    identity: IdentityArg,
+    /// lmax of the SH round trip used to rotate dense ODF arrays (DSI Studio
+    /// `odf` records, PAM `odf`). Default: up to 12, capped by what the
+    /// sampling sphere supports.
+    #[arg(long = "odf-lmax")]
+    odf_lmax: Option<usize>,
+    /// Fibonacci reference directions for aPSF SH reorientation. Default:
+    /// max(80, 3 × number of SH coefficients).
+    #[arg(long = "apsf-dirs")]
+    apsf_dirs: Option<usize>,
+    /// Debug only: apply `Tᵀ` instead of `T` (to demonstrate a convention
+    /// error). Never for real data.
+    #[arg(long, hide = true)]
+    transpose: bool,
+    #[arg(long)]
+    sh: Option<PathBuf>,
+    #[arg(long = "fixel-dir")]
+    fixel_dir: Option<PathBuf>,
+    #[arg(long = "reference-affine")]
+    reference_affine: Option<PathBuf>,
+    #[arg(long = "input-format", value_enum)]
+    input_format: Option<InputFormatOverride>,
+    #[arg(long = "preserve-affine", hide = true)]
+    preserve_affine: bool,
+    #[arg(long = "output-format", value_enum)]
+    output_format: Option<OutputFormatOverride>,
+    /// Write SH alongside a MRtrix fixel-directory output.
+    #[arg(long = "out-sh")]
+    out_sh: Option<PathBuf>,
+    #[arg(long = "fixel-container", value_enum, default_value = "nifti")]
+    fixel_container: MrtrixFixelContainerArg,
+    /// Force NIfTI-2 instead of NIfTI-1 when writing MRtrix SH to `.nii`/`.nii.gz`.
+    #[arg(long = "nifti2")]
+    nifti2: bool,
+    #[arg(long)]
+    overwrite: bool,
+    #[arg(long)]
+    quiet: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -483,8 +638,64 @@ struct CombineArgs {
     #[arg(long = "match-angle-deg", default_value_t = 30.0)]
     match_angle_deg: f32,
     /// `mean-fod` only: per-subject FOD normalization applied before averaging.
+    /// `none` is correct for quantitative reconstructions (`consh
+    /// --quantitative`, `mtnormalise`d FODs) whose amplitudes already share a
+    /// unit; `l0`/`integral` are per-voxel and destroy apparent-fibre-density
+    /// contrast, leaving a shape-only template.
     #[arg(long = "normalize-fod", value_enum, default_value = "none")]
     normalize_fod: NormalizeFodArg,
+    /// Keep a voxel when at least this FRACTION of inputs cover it. `0` is a
+    /// mask union, `1` an intersection; `0.5` is the recommended template
+    /// setting. Partially-covered voxels are divided by their own contributor
+    /// count, never by N, so the mask edge grows no spurious low-AFD rim.
+    /// Generalizes (and overrides) --mask-combine.
+    #[arg(long = "min-coverage", conflicts_with = "mask_combine")]
+    min_coverage: Option<f32>,
+    /// SH order policy when inputs disagree: `min` truncates every input to the
+    /// smallest lmax present (default, and the uniform choice), `max` zero-pads,
+    /// or give an explicit even integer.
+    #[arg(long = "lmax", default_value = "min")]
+    lmax: String,
+    /// Header/grid/SH-basis reference (default: the first input). Inputs in a
+    /// different basis are converted to this one before averaging.
+    #[arg(long = "reference")]
+    reference: Option<PathBuf>,
+    /// Compute the FOD reproducibility block (coverage, l0 spread, angular
+    /// correlation) under `--method cluster` or `--template` too. It is always
+    /// on for `--method mean-fod`. Needs sh/coefficients on every input.
+    #[arg(long = "fod-qc")]
+    fod_qc: bool,
+    /// Skip the FOD reproducibility block entirely.
+    #[arg(long = "no-fod-qc", conflicts_with = "fod_qc")]
+    no_fod_qc: bool,
+    /// Leave-one-out angular correlation: each subject is scored against a
+    /// template with its own contribution removed, so the score is not inflated
+    /// by self-similarity. `auto` = on for 3..=20 inputs; `on` also covers
+    /// n=2, where the leave-one-out template is the other input and `acc_loo`
+    /// becomes the direct pairwise agreement.
+    #[arg(long = "loo", value_enum, default_value = "auto")]
+    loo: LooArg,
+    /// Lowest SH band included in the angular correlation coefficient. `2`
+    /// excludes the isotropic term, which otherwise drives ACC to ~1 even in CSF.
+    #[arg(long = "acc-lmin", default_value_t = 2)]
+    acc_lmin: usize,
+    /// Average this per-voxel scalar (DPV) onto the template (repeatable).
+    /// Default: every scalar float DPV present on all inputs.
+    #[arg(long = "average-dpv", action = clap::ArgAction::Append)]
+    average_dpv: Vec<String>,
+    /// Skip DPV averaging.
+    #[arg(long = "no-average-dpv", conflicts_with = "average_dpv")]
+    no_average_dpv: bool,
+    /// Also emit `<name>_sd` beside each averaged DPV.
+    #[arg(long = "dpv-sd")]
+    dpv_sd: bool,
+    /// Also write the JSON report to this path.
+    #[arg(long = "out-report")]
+    out_report: Option<PathBuf>,
+    /// Exit nonzero if any subject is flagged as an outlier. Off by default —
+    /// the rule warns loudly and never drops a scan on its own.
+    #[arg(long = "fail-on-outlier")]
+    fail_on_outlier: bool,
     /// `mean-fod` peak finding: max peaks per voxel.
     #[arg(long = "npeaks", default_value_t = 5)]
     npeaks: usize,
@@ -588,6 +799,23 @@ impl From<TemplateMethodArg> for TemplateMethod {
     }
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum LooArg {
+    Auto,
+    On,
+    Off,
+}
+
+impl From<LooArg> for LooMode {
+    fn from(v: LooArg) -> Self {
+        match v {
+            LooArg::Auto => LooMode::Auto,
+            LooArg::On => LooMode::On,
+            LooArg::Off => LooMode::Off,
+        }
+    }
+}
+
 impl From<NormalizeFodArg> for NormalizeFod {
     fn from(v: NormalizeFodArg) -> Self {
         match v {
@@ -659,6 +887,23 @@ enum Z0PolicyArg {
     Auto,
     Never,
     Always,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum IdentityArg {
+    Auto,
+    Included,
+    Absent,
+}
+
+impl From<IdentityArg> for IdentityPolicy {
+    fn from(value: IdentityArg) -> Self {
+        match value {
+            IdentityArg::Auto => IdentityPolicy::Auto,
+            IdentityArg::Included => IdentityPolicy::Included,
+            IdentityArg::Absent => IdentityPolicy::Absent,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -754,6 +999,8 @@ fn run(cli: Cli) -> odx_rs::Result<()> {
         Command::ImportAodf(args) => run_import_aodf(args),
         Command::Upsample(args) => run_upsample(args),
         Command::Transform(args) => run_transform(args),
+        Command::Graddev(args) => run_graddev(args),
+        Command::Afd(args) => run_afd(args),
         Command::AttachDpv(args) => run_attach_dpv(args),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -1094,6 +1341,20 @@ fn run_combine(args: CombineArgs) -> odx_rs::Result<()> {
         }
     }
 
+    if let Some(mc) = args.min_coverage {
+        if !mc.is_finite() || !(0.0..=1.0).contains(&mc) {
+            return Err(OdxError::Argument(format!(
+                "--min-coverage must be in [0, 1], got {mc}"
+            )));
+        }
+    }
+    if args.acc_lmin % 2 != 0 {
+        return Err(OdxError::Argument(format!(
+            "--acc-lmin must be even (the symmetric SH bases hold even orders only), got {}",
+            args.acc_lmin
+        )));
+    }
+
     let opts = CombineOptions {
         method: args.method.into(),
         template_override: args.template.clone(),
@@ -1105,6 +1366,21 @@ fn run_combine(args: CombineArgs) -> odx_rs::Result<()> {
             min_separation_angle_deg: args.min_separation_angle,
         },
         normalize_fod: args.normalize_fod.into(),
+        min_coverage: args.min_coverage,
+        lmax: LmaxPolicy::parse(&args.lmax)?,
+        reference: args.reference.clone(),
+        fod_qc: args.fod_qc,
+        no_fod_qc: args.no_fod_qc,
+        loo: args.loo.into(),
+        acc_lmin: args.acc_lmin,
+        average_dpv: if args.no_average_dpv {
+            Some(Vec::new())
+        } else if args.average_dpv.is_empty() {
+            None
+        } else {
+            Some(args.average_dpv.clone())
+        },
+        dpv_sd: args.dpv_sd,
         min_subjects_per_group_fixel: args.min_subjects,
         matched_scalars: if args.scalar.is_empty() {
             None
@@ -1124,10 +1400,20 @@ fn run_combine(args: CombineArgs) -> odx_rs::Result<()> {
     };
 
     let report = combine_odx(&inputs, &opts, &outputs)?;
+    if let Some(p) = args.out_report.as_ref() {
+        std::fs::write(p, serde_json::to_string_pretty(&report)?)?;
+    }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", render_combine_report(&report));
+    }
+    if args.fail_on_outlier && !report.outliers.is_empty() {
+        return Err(OdxError::Argument(format!(
+            "{} input(s) flagged as outliers: {}",
+            report.outliers.len(),
+            report.outliers.join(", ")
+        )));
     }
     Ok(())
 }
@@ -1174,8 +1460,62 @@ fn render_combine_report(r: &CombineReport) -> String {
             r.design_columns.join(", ")
         }
     ));
+    if let (Some(order), Some(basis)) = (r.sh_order, r.sh_basis.as_ref()) {
+        out.push_str(&format!(
+            "aggregate: lmax {order} {basis} (--lmax {}), min_coverage {:.2}\n",
+            r.lmax_policy, r.min_coverage
+        ));
+    }
+    if r.loo != "unavailable" {
+        out.push_str(&format!(
+            "acc (l>={}) mean: {}   leave-one-out [{}]: {}\n",
+            r.acc_lmin,
+            render_optional_f64(r.mean_acc),
+            r.loo,
+            render_optional_f64(r.mean_acc_loo)
+        ));
+        if r.n_voxels_without_orientation > 0 {
+            out.push_str(&format!(
+                "  ({} of {} template voxels carry no anisotropic energy and are excluded \
+                 from the acc summaries)\n",
+                r.n_voxels_without_orientation, r.n_template_voxels
+            ));
+        }
+    }
+    if !r.averaged_dpv.is_empty() {
+        out.push_str(&format!("averaged_dpv: {}\n", r.averaged_dpv.join(", ")));
+    }
+    if !r.subjects.is_empty() && r.sh_order.is_some() {
+        let width = r.subjects.iter().map(|s| s.key.len()).max().unwrap_or(7).max(7);
+        out.push_str(&format!(
+            "\n{:<width$}  {:>6}  {:>6}  {:>7}  {:>7}  {}\n",
+            "subject", "cov", "fixels", "acc", "acc_loo", "flags"
+        ));
+        for s in &r.subjects {
+            out.push_str(&format!(
+                "{:<width$}  {:>5.1}%  {:>6}  {:>7}  {:>7}  {}\n",
+                s.key,
+                s.coverage_frac * 100.0,
+                s.n_fixels,
+                render_f32(s.mean_acc),
+                render_f32(s.mean_acc_loo),
+                if s.is_outlier { "OUTLIER" } else { "" }
+            ));
+        }
+    }
+    for s in r.subjects.iter().filter(|s| s.is_outlier) {
+        out.push_str(&format!("outlier {}: {}\n", s.key, s.outlier_reasons.join("; ")));
+    }
     out.push_str(&format!("written: {} files\n", r.written_paths.len()));
     out
+}
+
+fn render_f32(v: f32) -> String {
+    if v.is_finite() {
+        format!("{v:.4}")
+    } else {
+        "n/a".to_string()
+    }
 }
 
 /// A parsed design/participants table (TSV/CSV): header columns, the key column
@@ -1362,98 +1702,25 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
         odx
     };
 
-    let quant_policy = OdxWritePolicy {
-        quantize_dense: args.quantize_dense,
-        quantize_min_len: args.quantize_min_len,
+    let write_opts = OutputWriteOptions {
+        quant_policy: OdxWritePolicy {
+            quantize_dense: args.quantize_dense,
+            quantize_min_len: args.quantize_min_len,
+        },
+        dsistudio: MrtrixToDsistudioOptions {
+            output_format: DsistudioFormat::FibGz,
+            dense_odf_mode: args.dense_odf.into(),
+            peak_source: args.peak_source.into(),
+            amplitude_key: args.amplitude_key.clone(),
+            write_z0: args.z0.into(),
+            write_float_directions: args.dsistudio_float_dirs,
+        },
+        out_sh: args.out_sh.clone(),
+        fixel_container: args.fixel_container.into(),
+        nifti2: args.nifti2,
+        sh_lmax: args.sh_lmax,
     };
-
-    match output_format {
-        DetectedFormat::OdxDirectory => {
-            odx.save_directory_with_policy(&args.output, quant_policy)?;
-        }
-        DetectedFormat::OdxArchive => {
-            odx.save_archive_with_policy(&args.output, quant_policy)?;
-        }
-        DetectedFormat::DsistudioFibGz | DetectedFormat::DsistudioFz => {
-            let options = MrtrixToDsistudioOptions {
-                output_format: match output_format {
-                    DetectedFormat::DsistudioFibGz => DsistudioFormat::FibGz,
-                    DetectedFormat::DsistudioFz => DsistudioFormat::Fz,
-                    _ => unreachable!(),
-                },
-                dense_odf_mode: args.dense_odf.into(),
-                peak_source: args.peak_source.into(),
-                amplitude_key: args.amplitude_key.clone(),
-                write_z0: args.z0.into(),
-            };
-            save_dsistudio_from_odx(&odx, &args.output, &options)?;
-        }
-        DetectedFormat::DipyPam5 => {
-            pam::save_pam5(&odx, &args.output, &PamWriteOptions::default())?;
-        }
-        DetectedFormat::TortoiseMapmriNifti => {
-            return Err(OdxError::Argument(
-                "TORTOISE MAPMRI output is not supported; this format is import-only".into(),
-            ));
-        }
-        DetectedFormat::MrtrixFixelDir => {
-            mrtrix::save_mrtrix_fixels(
-                &odx,
-                &args.output,
-                &MrtrixFixelWriteOptions {
-                    container: args.fixel_container.into(),
-                    include_dpf: true,
-                    include_dpv: false,
-                },
-            )?;
-            if let Some(out_sh) = args.out_sh.as_deref() {
-                let fitted = if odx.sh::<f32>("coefficients").is_ok() {
-                    None
-                } else {
-                    fit_mrtrix_sh_from_odf(&odx, args.sh_lmax)?
-                };
-                if odx.sh::<f32>("coefficients").is_err() && fitted.is_none() {
-                    return Err(OdxError::Argument(
-                        "MRtrix SH output requires existing sh/coefficients or dense ODF data to fit from"
-                            .into(),
-                    ));
-                }
-                let sh_dataset = fitted.as_ref().unwrap_or(&odx);
-                mrtrix::save_mrtrix_sh(
-                    sh_dataset,
-                    out_sh,
-                    &MrtrixShWriteOptions {
-                        array_name: "coefficients".into(),
-                        container: infer_sh_container(out_sh, args.nifti2),
-                        gzip: infer_sh_gzip(out_sh),
-                    },
-                )?;
-            }
-        }
-        DetectedFormat::MrtrixShImage => {
-            let fitted = if odx.sh::<f32>("coefficients").is_ok() {
-                None
-            } else {
-                fit_mrtrix_sh_from_odf(&odx, args.sh_lmax)?
-            };
-            if odx.sh::<f32>("coefficients").is_err() && fitted.is_none() {
-                return Err(OdxError::Argument(
-                    "MRtrix SH output requires existing sh/coefficients or dense ODF data to fit from"
-                        .into(),
-                ));
-            }
-            let sh_dataset = fitted.as_ref().unwrap_or(&odx);
-            mrtrix::save_mrtrix_sh(
-                sh_dataset,
-                &args.output,
-                &MrtrixShWriteOptions {
-                    array_name: "coefficients".into(),
-                    container: infer_sh_container(&args.output, args.nifti2),
-                    gzip: infer_sh_gzip(&args.output),
-                },
-            )?;
-        }
-    }
+    write_dataset(&odx, &args.output, output_format, &write_opts)?;
 
     if args.json {
         let summary = ConversionSummary {
@@ -1479,6 +1746,250 @@ fn run_convert(args: ConvertArgs) -> odx_rs::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Output-side settings shared by `convert` and `graddev`.
+struct OutputWriteOptions {
+    quant_policy: OdxWritePolicy,
+    /// `output_format` is overridden from the detected target.
+    dsistudio: MrtrixToDsistudioOptions,
+    out_sh: Option<PathBuf>,
+    fixel_container: MrtrixFixelContainer,
+    nifti2: bool,
+    sh_lmax: Option<u32>,
+}
+
+fn write_dataset(
+    odx: &OdxDataset,
+    output: &Path,
+    output_format: DetectedFormat,
+    opts: &OutputWriteOptions,
+) -> odx_rs::Result<()> {
+    match output_format {
+        DetectedFormat::OdxDirectory => {
+            odx.save_directory_with_policy(output, opts.quant_policy)?;
+        }
+        DetectedFormat::OdxArchive => {
+            odx.save_archive_with_policy(output, opts.quant_policy)?;
+        }
+        DetectedFormat::DsistudioFibGz | DetectedFormat::DsistudioFz => {
+            let mut options = opts.dsistudio.clone();
+            options.output_format = match output_format {
+                DetectedFormat::DsistudioFibGz => DsistudioFormat::FibGz,
+                DetectedFormat::DsistudioFz => DsistudioFormat::Fz,
+                _ => unreachable!(),
+            };
+            save_dsistudio_from_odx(odx, output, &options)?;
+        }
+        DetectedFormat::DipyPam5 => {
+            pam::save_pam5(odx, output, &PamWriteOptions::default())?;
+        }
+        DetectedFormat::TortoiseMapmriNifti => {
+            return Err(OdxError::Argument(
+                "TORTOISE MAPMRI output is not supported; this format is import-only".into(),
+            ));
+        }
+        DetectedFormat::MrtrixFixelDir => {
+            mrtrix::save_mrtrix_fixels(
+                odx,
+                output,
+                &MrtrixFixelWriteOptions {
+                    container: opts.fixel_container,
+                    include_dpf: true,
+                    include_dpv: false,
+                },
+            )?;
+            if let Some(out_sh) = opts.out_sh.as_deref() {
+                write_mrtrix_sh(odx, out_sh, opts)?;
+            }
+        }
+        DetectedFormat::MrtrixShImage => {
+            write_mrtrix_sh(odx, output, opts)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_mrtrix_sh(odx: &OdxDataset, path: &Path, opts: &OutputWriteOptions) -> odx_rs::Result<()> {
+    let fitted = if odx.sh::<f32>("coefficients").is_ok() {
+        None
+    } else {
+        fit_mrtrix_sh_from_odf(odx, opts.sh_lmax)?
+    };
+    if odx.sh::<f32>("coefficients").is_err() && fitted.is_none() {
+        return Err(OdxError::Argument(
+            "MRtrix SH output requires existing sh/coefficients or dense ODF data to fit from"
+                .into(),
+        ));
+    }
+    let sh_dataset = fitted.as_ref().unwrap_or(odx);
+    mrtrix::save_mrtrix_sh(
+        sh_dataset,
+        path,
+        &MrtrixShWriteOptions {
+            array_name: "coefficients".into(),
+            container: infer_sh_container(path, opts.nifti2),
+            gzip: infer_sh_gzip(path),
+        },
+    )
+}
+
+fn run_graddev(args: GraddevArgs) -> odx_rs::Result<()> {
+    let output_format = resolve_output_format(&args.output, args.output_format)?;
+    if output_format == DetectedFormat::DipyPam5 {
+        return Err(OdxError::Argument(
+            "graddev does not write .pam5; write ODX (or another format) instead".into(),
+        ));
+    }
+    if output_format == DetectedFormat::MrtrixShImage && args.out_sh.is_some() {
+        return Err(OdxError::Argument(
+            "--out-sh is only valid when the main output is a MRtrix fixel directory".into(),
+        ));
+    }
+    ensure_output_path(&args.output, args.overwrite)?;
+    if let Some(out_sh) = args.out_sh.as_deref() {
+        ensure_output_path(out_sh, args.overwrite)?;
+    }
+
+    let (odx, input_format) = load_from_args(
+        &args.input,
+        args.sh.as_deref(),
+        args.fixel_dir.as_deref(),
+        None,
+        None,
+        args.reference_affine.as_deref(),
+        args.input_format,
+        args.preserve_affine,
+    )?;
+
+    let field = GradDevField::load_nifti(&args.graddev, args.identity.into())?;
+    let opts = GradDevOptions {
+        apsf_dirs: args.apsf_dirs,
+        odf_lmax: args.odf_lmax,
+        transpose: args.transpose,
+    };
+    let (corrected, report) = apply_graddev(&odx, &field, &opts)?;
+
+    // MRtrix SH containers only accept tournier07; convert a dipy-basis
+    // dataset (e.g. from PAM5) on the way out.
+    let writes_sh = output_format == DetectedFormat::MrtrixShImage
+        || (output_format == DetectedFormat::MrtrixFixelDir && args.out_sh.is_some());
+    let corrected = if writes_sh
+        && corrected.sh::<f32>("coefficients").is_ok()
+        && corrected.header().dipy_basis_name() != Some("tournier07")
+    {
+        convert_sh_basis(&corrected, ShBasisTarget::Tournier07, None)?
+    } else {
+        corrected
+    };
+
+    let has_dense_odf = !corrected.odf_names().is_empty();
+    let write_opts = OutputWriteOptions {
+        quant_policy: OdxWritePolicy::default(),
+        dsistudio: MrtrixToDsistudioOptions {
+            output_format: DsistudioFormat::FibGz,
+            // Carry the rotated dense ODF when the input had one; otherwise
+            // sample it from the (rotated) SH as `convert` does.
+            dense_odf_mode: if has_dense_odf {
+                DenseOdfMode::Off
+            } else {
+                DenseOdfMode::FromSh
+            },
+            peak_source: PeakSource::Fixels,
+            amplitude_key: None,
+            write_z0: Z0Policy::Auto,
+            write_float_directions: true,
+        },
+        out_sh: args.out_sh.clone(),
+        fixel_container: args.fixel_container.into(),
+        nifti2: args.nifti2,
+        sh_lmax: None,
+    };
+    write_dataset(&corrected, &args.output, output_format, &write_opts)?;
+
+    if args.json {
+        let summary = serde_json::json!({
+            "input_format": input_format.as_str(),
+            "output_format": output_format.as_str(),
+            "output": args.output.display().to_string(),
+            "out_sh": args.out_sh.as_ref().map(|p| p.display().to_string()),
+            "graddev": args.graddev.display().to_string(),
+            "report": report,
+        });
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else if !args.quiet {
+        println!(
+            "wrote {} ({} -> {})",
+            args.output.display(),
+            input_format.as_str(),
+            output_format.as_str()
+        );
+        println!(
+            "graddev: {} (identity {})",
+            args.graddev.display(),
+            if report.identity_added { "added" } else { "included" }
+        );
+        println!(
+            "voxels: {} corrected of {} in mask ({} outside field, {} singular)",
+            report.nb_corrected, report.nb_voxels, report.nb_outside_field, report.nb_singular
+        );
+        println!(
+            "rotation: median {:.3} deg, max {:.3} deg; max |ln det T| = {:.4}",
+            report.median_rotation_deg, report.max_rotation_deg, report.max_abs_log_det
+        );
+        println!(
+            "arrays: sh {:?}, odf {:?}{}, peaks {}{}",
+            report.sh_arrays,
+            report.odf_arrays,
+            report
+                .odf_lmax
+                .map(|l| format!(" (lmax {l})"))
+                .unwrap_or_default(),
+            report.nb_peaks,
+            if report.dropped_dpf.is_empty() {
+                String::new()
+            } else {
+                format!("; dropped dpf {:?}", report.dropped_dpf)
+            }
+        );
+    }
+    Ok(())
+}
+
+fn run_afd(args: AfdArgs) -> odx_rs::Result<()> {
+    use odx_rs::fmls::{afd_dataset, AfdOptions, FmlsConfig};
+
+    ensure_output_path(&args.output, args.overwrite)?;
+    let input = OdxDataset::load(&args.input)?;
+    let opts = AfdOptions {
+        ico_level: args.ico_level,
+        fmls: FmlsConfig {
+            integral_threshold: args.fmls_integral,
+            peak_value_threshold: args.fmls_peak_value,
+            ..FmlsConfig::default()
+        },
+        max_per_voxel: args.maxnum,
+        dir_from_peak: args.dirpeak,
+        keep_sh: !args.no_sh,
+    };
+    let (out, report) = afd_dataset(&input, &opts)?;
+    let policy = OdxWritePolicy::default();
+    match args.odx_layout {
+        OdxLayoutArg::Directory => out.save_directory_with_policy(&args.output, policy)?,
+        OdxLayoutArg::Archive => out.save_archive_with_policy(&args.output, policy)?,
+    }
+    if !args.quiet {
+        eprintln!(
+            "afd: {} directions (ico level {}), {} fixels over {}/{} voxels -> {}",
+            report.n_directions,
+            args.ico_level,
+            report.n_fixels,
+            report.n_voxels_with_fixels,
+            report.n_voxels,
+            args.output.display()
+        );
+    }
     Ok(())
 }
 
@@ -1658,6 +2169,7 @@ fn run_transform(args: TransformArgs) -> odx_rs::Result<()> {
         // (cardinality already preserved).
         modulate_fixel: false,
         apsf_dirs: args.apsf_dirs,
+        fc_dpf_name: args.fc.clone(),
         ..Default::default()
     };
 

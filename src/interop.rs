@@ -67,6 +67,11 @@ pub struct MrtrixToDsistudioOptions {
     pub peak_source: PeakSource,
     pub amplitude_key: Option<String>,
     pub write_z0: Z0Policy,
+    /// Also write exact float32 `dir{p}` records next to the sphere-quantized
+    /// `index{p}` ones. DSI Studio's tracker prefers `dir{p}` whenever they
+    /// are present, so peak directions survive without being snapped to the
+    /// ~8°-spaced ODF sphere.
+    pub write_float_directions: bool,
 }
 
 impl Default for MrtrixToDsistudioOptions {
@@ -77,6 +82,7 @@ impl Default for MrtrixToDsistudioOptions {
             peak_source: PeakSource::Fixels,
             amplitude_key: None,
             write_z0: Z0Policy::Auto,
+            write_float_directions: false,
         }
     }
 }
@@ -410,6 +416,12 @@ fn prepare_dsistudio_dataset(
         serde_json::Value::String("reorient_to_lps_fortran".into()),
     );
     install_builtin_dsistudio_sphere(&mut parts);
+    if options.write_float_directions {
+        parts.header.extra.insert(
+            dsistudio::WRITE_DIR_RECORDS_KEY.into(),
+            serde_json::Value::Bool(true),
+        );
+    }
 
     let amplitude = resolve_amplitude_values(odx, options.amplitude_key.as_deref())?;
     let sampled_odf = if options.dense_odf_mode == DenseOdfMode::FromSh {
@@ -432,7 +444,33 @@ fn prepare_dsistudio_dataset(
     }
 
     let (offsets, directions, amplitudes) = match options.peak_source {
-        PeakSource::Fixels => sort_fixels_by_amplitude(odx, &amplitude)?,
+        PeakSource::Fixels => {
+            let fixels = sort_fixels_by_amplitude(odx, &amplitude)?;
+            if fixels.1.is_empty() {
+                // A DSI Studio fz/fib is a peak/ODF format and cannot be valid without
+                // peaks. When the source carries no fixels (e.g. a bare-SH MRtrix
+                // population_template), derive peaks from the SH-sampled ODF instead of
+                // writing an empty peak set — which previously surfaced as a confusing
+                // `cast_slice` alignment panic in the fz writer.
+                let fallback_dense;
+                let dense = match sampled_odf.as_ref() {
+                    Some(dense) => dense,
+                    None => {
+                        fallback_dense = sample_dense_odf_from_sh(odx)?;
+                        fallback_dense.as_ref().ok_or_else(|| {
+                            OdxError::Argument(
+                                "cannot export DSI Studio peaks: the input has no fixels and no \
+                                 SH coefficients to derive them from"
+                                    .into(),
+                            )
+                        })?
+                    }
+                };
+                peaks_from_sampled_odf(odx, dense)
+            } else {
+                fixels
+            }
+        }
         PeakSource::SampledOdf => {
             let dense = sampled_odf.as_ref().ok_or_else(|| {
                 OdxError::Argument(
@@ -449,7 +487,7 @@ fn prepare_dsistudio_dataset(
     Ok(OdxDataset::from_parts(parts))
 }
 
-fn dsistudio_sampling_dirs(odx: &OdxDataset, ncols: usize) -> Result<Vec<[f32; 3]>> {
+pub(crate) fn dsistudio_sampling_dirs(odx: &OdxDataset, ncols: usize) -> Result<Vec<[f32; 3]>> {
     if let Some(vertices) = odx.sphere_vertices() {
         if vertices.len() >= ncols {
             return Ok(vertices[..ncols].to_vec());

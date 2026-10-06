@@ -7,8 +7,11 @@ pub mod descoteaux_sh;
 pub mod dtype;
 pub mod error;
 pub(crate) mod fixel_match;
+pub mod fmls;
 pub mod formats;
+pub mod graddev;
 pub mod header;
+pub mod icosphere;
 pub mod interop;
 pub mod io;
 pub mod mmap_backing;
@@ -23,6 +26,7 @@ pub mod densify;
 pub mod sh_basis_evaluator;
 pub mod sphere_lookup;
 pub mod stream;
+pub mod template;
 pub mod transform;
 pub mod typed_view;
 pub mod validate;
@@ -31,15 +35,20 @@ pub use data_array::{DataArray, DataArrayInfo};
 pub use dtype::{DType, OdxScalar};
 pub use error::{OdxError, Result};
 pub use combine::{
-    combine_odx, CombineInput, CombineOptions, CombineOutputs, CombineReport, MaskCombine,
-    NormalizeFod, TemplateMethod,
+    combine_odx, CombineInput, CombineOptions, CombineOutputs, CombineReport, CombineSubjectRow,
+    MaskCombine, NormalizeFod, TemplateMethod,
 };
+pub use template::{AggregateOptions, LmaxPolicy, LooMode, ScaleMode, ShTarget};
 pub use compare::{compare_odx, CompareOptions, CompareReport};
 pub use formats::dsistudio;
 pub use formats::mif;
 pub use formats::mrtrix;
 pub use formats::pam;
 pub use formats::tortoise_mapmri;
+pub use graddev::{
+    apply_graddev, GradDevField, GradDevOptions, GradDevReport, IdentityPolicy,
+    GRADDEV_APPLIED_KEY,
+};
 pub use header::{CanonicalDenseRepresentation, Header, QuantizationSpec};
 pub use interop::{
     convert_sh_basis, dsistudio_to_mrtrix, mrtrix_to_dsistudio, DenseOdfMode, DsistudioFormat,
@@ -68,4 +77,5 @@ pub use validate::{
 pub use transform::{
     apply_transform, apply_transform_h5, TransformMode, TransformOptions,
 };
+pub use transform::source_volume::{SourceLookup, TriCorner, TrilinearWeights};
 pub use transform::upsample::{upsample, UpsampleOptions};

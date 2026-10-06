@@ -7,7 +7,7 @@ spherical-harmonic coefficients from diffusion MRI.
 ## Install
 
 ```bash
-pip install odx           # core package (numpy only)
+pip install odx           # core package (numpy + nibabel)
 pip install odx[dipy]     # with the dipy adapter for PeaksAndMetrics interop
 ```
 
@@ -42,11 +42,32 @@ pam = odx.to_peaks_and_metrics(peaked)
   Gauss-Newton sub-vertex refinement on the SH series itself.
 - **Foreign format converters** — load and save DSI Studio (`.fz`, `.fib.gz`),
   MRtrix (fixel directories + `.mif`), Tortoise MAP-MRI, pyAFQ asymmetric ODFs.
+- **nibabel adapter** — DPVs to/from `Nifti1Image`; nibabel is a required
+  dependency so NIfTI orientation and affines are always handled the same way.
 - **dipy adapter** (optional) — bidirectional conversion between
   `odx.Odx` and dipy's `PeaksAndMetrics`. Lazy-imported so dipy isn't required
   for the core package.
 - **SH basis conversion** — descoteaux07 ↔ tournier07 round-trips via
   amplitudes, including legacy/modern variants.
+- **Gradient-nonlinearity correction** — `odx.apply_graddev` (or
+  `Odx.apply_graddev`) reorients SH/FODs, dense ODFs and fixels with a
+  per-voxel deviation field, as the `odx graddev` CLI does:
+
+  ```python
+  img = nib.load("sub-01_space-ACPC_graddev.nii.gz")
+  corrected, report = ds.apply_graddev(img)          # brings its own affine
+  # also accepted: a path, or an (X,Y,Z,9) array with affine=
+  ```
+
+  Never reorient the field first (e.g. `nib.as_closest_canonical`): its
+  components live in its own voxel axes.
+
+  The field holds row-major `T` per voxel with `g_eff = Tᵀ g` (qsiprep /
+  TORTOISE, `identity="included"`; HCP/FSL `grad_dev` stores `T − I`,
+  `identity="absent"`; `"auto"` decides). This is a post-hoc correction of
+  fitted data: it fixes orientation, not the per-voxel b-value change. On a
+  Prisma-class whole-body coil the orientation effect is a fraction of a
+  degree.
 
 ## License
 
