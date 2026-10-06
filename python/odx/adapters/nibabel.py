@@ -16,36 +16,22 @@ Round-trip per-voxel scalars (DPVs) between an `odx.Odx` and nibabel's
   spatial image with ``.get_fdata()`` + ``.affine`` (e.g. nilearn images),
   validates the grid against the ODX, and appends a DPV in place.
 
-Lazy-imports nibabel so the main `odx` package stays usable without it
-installed; for installation, ``pip install odx[nibabel]``.
+nibabel is a required dependency of `odx`: every NIfTI crossing between odx and
+Python goes through it, so its axis-order and affine conventions are handled in
+one place rather than re-derived by each caller.
 """
 
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Optional, Union
+from typing import Optional, Union
 
+import nibabel as nib
 import numpy as np
 
 from .. import _odx
 
-if TYPE_CHECKING:
-    import nibabel as nib
-
-    NiftiLike = Union[nib.Nifti1Image, nib.Nifti2Image, "os.PathLike[str]", str]
-else:
-    NiftiLike = object  # purely a type-hint sentinel at runtime
-
-
-def _require_nibabel():
-    try:
-        import nibabel as nib  # noqa: F401
-    except ImportError as e:
-        raise ImportError(
-            "odx.adapters.nibabel requires nibabel. "
-            "Install with `pip install odx[nibabel]`."
-        ) from e
-    return nib
+NiftiLike = Union[nib.Nifti1Image, nib.Nifti2Image, "os.PathLike[str]", str]
 
 
 # ─── export: DPV → Nifti1Image ─────────────────────────────────────────────
@@ -77,7 +63,6 @@ def to_nifti1_image(
         rationale. The affine in both slots is the ODX's ``voxel_to_rasmm``
         unchanged.
     """
-    nib = _require_nibabel()
 
     available = list(odx.dpv_names())
     if dpv_name not in available:
@@ -161,7 +146,6 @@ def attach_dpv(
         If the input grid (dimensions or affine) does not match the ODX
         within 1e-3 mm. Resample the input onto the ODX grid first.
     """
-    nib = _require_nibabel()
 
     # Resolve the image: path → nibabel.load(...); image-like → use as-is.
     if isinstance(image, (str, os.PathLike)):

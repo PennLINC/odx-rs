@@ -1,9 +1,8 @@
-"""Optional adapters between ODX and external libraries (dipy, nibabel, …).
+"""Adapters between ODX and external libraries.
 
-Importing `odx.adapters` is cheap; individual adapters lazy-import their
-external deps so the package stays usable without them installed.
+nibabel is a required dependency of `odx` and imported eagerly; dipy stays
+optional (its adapter lazy-imports it).
 """
 
 from . import dipy as dipy  # re-export
-from . import nibabel as nibabel  # re-export — module import is cheap;
-# the actual `import nibabel` only fires when an adapter function is called.
+from . import nibabel as nibabel  # re-export

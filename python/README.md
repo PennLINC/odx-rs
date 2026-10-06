@@ -7,7 +7,7 @@ spherical-harmonic coefficients from diffusion MRI.
 ## Install
 
 ```bash
-pip install odx           # core package (numpy only)
+pip install odx           # core package (numpy + nibabel)
 pip install odx[dipy]     # with the dipy adapter for PeaksAndMetrics interop
 ```
 
@@ -42,6 +42,8 @@ pam = odx.to_peaks_and_metrics(peaked)
   Gauss-Newton sub-vertex refinement on the SH series itself.
 - **Foreign format converters** — load and save DSI Studio (`.fz`, `.fib.gz`),
   MRtrix (fixel directories + `.mif`), Tortoise MAP-MRI, pyAFQ asymmetric ODFs.
+- **nibabel adapter** — DPVs to/from `Nifti1Image`; nibabel is a required
+  dependency so NIfTI orientation and affines are always handled the same way.
 - **dipy adapter** (optional) — bidirectional conversion between
   `odx.Odx` and dipy's `PeaksAndMetrics`. Lazy-imported so dipy isn't required
   for the core package.
