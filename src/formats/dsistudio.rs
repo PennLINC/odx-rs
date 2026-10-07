@@ -24,7 +24,7 @@ use crate::formats::mat4::{
 use crate::header::CanonicalDenseRepresentation;
 use crate::mmap_backing::{vec_to_bytes, MmapBacking};
 use crate::nifti_canon::{affine_column_norms, nibabel_io_orientation, nibabel_ornt_transform};
-use crate::odx_file::{OdxDataset, OdxParts};
+use crate::odx_file::{LoadOptions, OdxDataset, OdxParts};
 
 /// Header-extra flag telling the writer to emit exact float32 `dir{p}`
 /// records next to the sphere-quantized `index{p}` ones. DSI Studio's tracker
@@ -33,11 +33,29 @@ use crate::odx_file::{OdxDataset, OdxParts};
 pub const WRITE_DIR_RECORDS_KEY: &str = "_ODX_DSISTUDIO_WRITE_DIR_RECORDS";
 
 pub fn load_fibgz(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxDataset> {
-    load_dsistudio_mat(path, affine)
+    load_dsistudio_mat(path, affine, &LoadOptions::default())
 }
 
 pub fn load_fz(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxDataset> {
-    load_dsistudio_mat(path, affine)
+    load_dsistudio_mat(path, affine, &LoadOptions::default())
+}
+
+/// `load_fibgz` / `load_fz` reading only what `options` needs. With
+/// `skip_odf`, the dense `odfN` records are decompressed and discarded
+/// without being stored.
+pub fn load_dsistudio_with(
+    path: &Path,
+    affine: Option<[[f64; 4]; 4]>,
+    options: &LoadOptions,
+) -> Result<OdxDataset> {
+    load_dsistudio_mat(path, affine, options)
+}
+
+/// DSI Studio stores dense ODFs as `odf0`, `odf1`, ... (not `odf_vertices`
+/// or `odf_faces`).
+fn is_odf_chunk(name: &str) -> bool {
+    name.strip_prefix("odf")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 pub fn save_fibgz(odx: &OdxDataset, path: &Path) -> Result<()> {
@@ -55,8 +73,13 @@ fn get_required<'a>(mat: &'a MatCatalog, key: &str) -> Result<MatRecord<'a>> {
         .ok_or_else(|| OdxError::Format(format!("missing required key '{key}' in dsistudio file")))
 }
 
-fn load_dsistudio_mat(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxDataset> {
-    let mat = mat4::read_mat4_gz(path)?;
+fn load_dsistudio_mat(
+    path: &Path,
+    affine: Option<[[f64; 4]; 4]>,
+    options: &LoadOptions,
+) -> Result<OdxDataset> {
+    let skip_odf = options.skip_odf;
+    let mat = mat4::read_mat4_gz_filtered(path, |name| !(skip_odf && is_odf_chunk(name)))?;
 
     let dim_arr = get_required(&mat, "dimension")?;
     let dim_vals = dim_arr.as_i32_vec();

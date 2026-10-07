@@ -10,7 +10,9 @@ pub fn read_reference_affine(path: &Path) -> Result<[[f64; 4]; 4]> {
         .and_then(|s| s.to_str())
         .unwrap_or_default();
     if name.ends_with(".mif") || name.ends_with(".mif.gz") {
-        return Ok(mif::read_mif(path)?.affine_4x4());
+        // The text header ends within the first MiB (where the parser looks).
+        let prefix = read_prefix(path, MIF_HEADER_SEARCH_BYTES)?;
+        return Ok(mif::parse_mif_header(&prefix)?.affine_4x4());
     }
     if name.ends_with(".nii") || name.ends_with(".nii.gz") {
         return read_nifti_affine(path);
@@ -22,7 +24,7 @@ pub fn read_reference_affine(path: &Path) -> Result<[[f64; 4]; 4]> {
 }
 
 fn read_nifti_affine(path: &Path) -> Result<[[f64; 4]; 4]> {
-    let bytes = read_image_bytes(path)?;
+    let bytes = read_prefix(path, NIFTI2_HEADER_BYTES)?;
     if bytes.len() < 540 {
         return Err(OdxError::Format(format!(
             "NIfTI file '{}' is too small to contain a valid header",
@@ -39,20 +41,27 @@ fn read_nifti_affine(path: &Path) -> Result<[[f64; 4]; 4]> {
     }
 }
 
-fn read_image_bytes(path: &Path) -> Result<Vec<u8>> {
+const NIFTI2_HEADER_BYTES: usize = 540;
+const MIF_HEADER_SEARCH_BYTES: usize = 1024 * 1024;
+
+/// The first `limit` bytes of a (possibly gzipped) image: enough for its
+/// header, without decompressing or reading the voxel data. Reading the whole
+/// file here once cost a full extra copy of a 4D DWI per affine lookup.
+fn read_prefix(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
     if path
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext == "gz")
     {
-        let file = std::fs::File::open(path)?;
-        let mut decoder = flate2::read::MultiGzDecoder::new(file);
-        let mut bytes = Vec::new();
-        decoder.read_to_end(&mut bytes)?;
-        Ok(bytes)
+        flate2::read::MultiGzDecoder::new(file)
+            .take(limit as u64)
+            .read_to_end(&mut bytes)?;
     } else {
-        Ok(std::fs::read(path)?)
+        file.take(limit as u64).read_to_end(&mut bytes)?;
     }
+    Ok(bytes)
 }
 
 fn parse_nifti1_affine(bytes: &[u8]) -> Result<[[f64; 4]; 4]> {

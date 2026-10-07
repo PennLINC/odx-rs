@@ -37,7 +37,9 @@ pam = odx.to_peaks_and_metrics(peaked)
 ## Features
 
 - **Native ODX I/O** — read/write `.odx` archives or directories, mmap-backed
-  for zero-copy NumPy views.
+  for zero-copy NumPy views. `odx.load(path, skip_odf=True, skip_sh=True)`
+  (and `skip_odf=` on `from_fibgz` / `from_fz`) never reads dense arrays you
+  don't need.
 - **Peak finder** — sphere-mesh local-maxima detection with MRtrix-style
   Gauss-Newton sub-vertex refinement on the SH series itself.
 - **Foreign format converters** — load and save DSI Studio (`.fz`, `.fib.gz`),
@@ -47,6 +49,10 @@ pam = odx.to_peaks_and_metrics(peaked)
 - **dipy adapter** (optional) — bidirectional conversion between
   `odx.Odx` and dipy's `PeaksAndMetrics`. Lazy-imported so dipy isn't required
   for the core package.
+- **Coherence QC** — `ds.coherence()` gives current DSI Studio's fib-QC
+  coherence index (or `"fixel"` mode's per-fixel summaries);
+  `check_btable=True` scores all 24 gradient-table permutations/flips without
+  refitting.
 - **SH basis conversion** — descoteaux07 ↔ tournier07 round-trips via
   amplitudes, including legacy/modern variants.
 - **Gradient-nonlinearity correction** — `odx.apply_graddev` (or

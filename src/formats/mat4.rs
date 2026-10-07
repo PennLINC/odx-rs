@@ -26,7 +26,7 @@ struct MatRecordMeta {
 
 #[derive(Debug, Clone)]
 pub struct MatCatalog {
-    bytes: Arc<[u8]>,
+    bytes: Arc<Vec<u8>>,
     records: Vec<MatRecordMeta>,
     name_to_index: HashMap<String, usize>,
 }
@@ -217,37 +217,49 @@ impl<'a> MatRecord<'a> {
 }
 
 pub fn read_mat4_gz(path: &std::path::Path) -> Result<MatCatalog> {
-    let file = std::fs::File::open(path)?;
-    let mut decoder = flate2::read::MultiGzDecoder::new(file);
-    let mut bytes = Vec::new();
-    decoder.read_to_end(&mut bytes)?;
-    read_mat4(&bytes)
+    read_mat4_gz_filtered(path, |_| true)
+}
+
+/// Read a gzipped MAT4 file, keeping only the records `keep` accepts.
+///
+/// Records are parsed straight from the decompression stream, so a skipped
+/// record's payload is decompressed and discarded without ever being held,
+/// and the kept records are stored once.
+pub fn read_mat4_gz_filtered(
+    path: &std::path::Path,
+    keep: impl Fn(&str) -> bool,
+) -> Result<MatCatalog> {
+    let file = std::io::BufReader::new(std::fs::File::open(path)?);
+    read_mat4_stream(flate2::read::MultiGzDecoder::new(file), keep)
 }
 
 pub fn read_mat4(bytes: &[u8]) -> Result<MatCatalog> {
-    let bytes: Arc<[u8]> = bytes.to_vec().into();
+    read_mat4_stream(bytes, |_| true)
+}
+
+fn read_mat4_stream<R: Read>(mut reader: R, keep: impl Fn(&str) -> bool) -> Result<MatCatalog> {
+    let mut bytes = Vec::new();
     let mut records = Vec::new();
     let mut name_to_index = HashMap::new();
-    let mut cursor = 0usize;
 
-    while cursor < bytes.len() {
-        if cursor + 20 > bytes.len() {
+    loop {
+        // A short or empty tail after the last record is ignored.
+        let mut head = [0u8; 20];
+        if read_up_to(&mut reader, &mut head)? < head.len() {
             break;
         }
+        let word = |i: usize| u32::from_le_bytes(head[i..i + 4].try_into().unwrap());
+        let (type_flag, mrows, ncols, namlen) = (
+            word(0),
+            word(4) as usize,
+            word(8) as usize,
+            word(16) as usize,
+        );
 
-        let type_flag = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-        let mrows = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
-        let ncols = u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap()) as usize;
-        let _imagf = u32::from_le_bytes(bytes[cursor + 12..cursor + 16].try_into().unwrap());
-        let namlen =
-            u32::from_le_bytes(bytes[cursor + 16..cursor + 20].try_into().unwrap()) as usize;
-        cursor += 20;
-
-        if cursor + namlen > bytes.len() {
+        let mut name_bytes = vec![0u8; namlen];
+        if read_up_to(&mut reader, &mut name_bytes)? < namlen {
             return Err(OdxError::Format("truncated MAT4 record name".into()));
         }
-        let name_bytes = &bytes[cursor..cursor + namlen];
-        cursor += namlen;
         let name = name_bytes.split(|b| *b == 0).next().unwrap_or_default();
         let name = std::str::from_utf8(name)
             .map_err(|_| OdxError::Format("MAT4 record name is not valid UTF-8".into()))?
@@ -258,31 +270,54 @@ pub fn read_mat4(bytes: &[u8]) -> Result<MatCatalog> {
             .checked_mul(ncols)
             .and_then(|n| n.checked_mul(elem_size))
             .ok_or_else(|| OdxError::Format(format!("MAT4 record '{name}' overflow")))?;
+        let truncated = || OdxError::Format(format!("truncated MAT4 payload for '{name}'"));
 
-        if cursor + payload_len > bytes.len() {
-            return Err(OdxError::Format(format!(
-                "truncated MAT4 payload for '{name}'"
-            )));
+        if !keep(&name) {
+            let skipped = std::io::copy(
+                &mut (&mut reader).take(payload_len as u64),
+                &mut std::io::sink(),
+            )?;
+            if skipped < payload_len as u64 {
+                return Err(truncated());
+            }
+            continue;
         }
-        let data_range = cursor..cursor + payload_len;
-        cursor += payload_len;
 
+        let start = bytes.len();
+        bytes.resize(start + payload_len, 0);
+        if read_up_to(&mut reader, &mut bytes[start..])? < payload_len {
+            return Err(truncated());
+        }
         let idx = records.len();
         records.push(MatRecordMeta {
             name: name.clone(),
             mrows,
             ncols,
             type_flag,
-            data_range,
+            data_range: start..start + payload_len,
         });
         name_to_index.insert(name, idx);
     }
 
     Ok(MatCatalog {
-        bytes,
+        bytes: Arc::new(bytes),
         records,
         name_to_index,
     })
+}
+
+/// Fill `buf` as far as the reader allows; returns the number of bytes read.
+fn read_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(filled)
 }
 
 #[derive(Debug, Clone)]

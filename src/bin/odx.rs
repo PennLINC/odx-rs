@@ -17,11 +17,13 @@ use odx_rs::mrtrix::{
 };
 use odx_rs::pam::{self, PamWriteOptions};
 use odx_rs::{
-    apply_graddev, combine_odx, compare_odx, compute_fixel_qc, convert_sh_basis,
-    write_qc_class_dpf, CombineInput, CombineOptions, CombineOutputs, CombineReport,
-    CompareOptions, CompareReport, FixelQcOptions, FixelQcReport, GradDevField, GradDevOptions,
-    IdentityPolicy, LmaxPolicy, LooMode, MaskCombine, NormalizeFod, OdxDataset, OdxError,
-    OdxWritePolicy, PeakFinderConfig, ShBasisTarget, TemplateMethod, ThresholdMode,
+    apply_graddev, check_btable, coherence_threshold_elasticity, combine_odx, compare_odx,
+    compute_fixel_chains, compute_fixel_qc, compute_primary_coherence, convert_sh_basis, write_qc_class_dpf,
+    BTableCheck, CoherenceMode, CombineInput, CombineOptions, CombineOutputs, CombineReport,
+    CompareOptions, CompareReport, FixelChainReport, FixelQcOptions, FixelQcReport, GradDevField, GradDevOptions,
+    IdentityPolicy, LmaxPolicy, LoadOptions, LooMode, MaskCombine, NormalizeFod, OdxDataset,
+    OdxError, OdxWritePolicy, PeakFinderConfig, PrimaryCoherenceReport, ShBasisTarget,
+    TemplateMethod, ThresholdMode, DEFAULT_BTABLE_QUANTILE, DEFAULT_QC_QUANTILE,
 };
 
 #[derive(Parser, Debug)]
@@ -40,7 +42,8 @@ enum Command {
     Convert(ConvertArgs),
     /// Validate internal consistency after normalizing into an ODX dataset.
     Validate(ValidateArgs),
-    /// Compute fixel coherence QC metrics and connected/disconnected summaries.
+    /// Compute coherence QC: per-fixel connected/disconnected summaries, or
+    /// the primary-fibre coherence index, optionally with a b-table check.
     Qc(QcArgs),
     /// Pairwise fixel comparison between two ODX files (matching, DPF diffs).
     Compare(CompareArgs),
@@ -570,12 +573,40 @@ struct QcArgs {
     input_format: Option<InputFormatOverride>,
     #[arg(long = "primary-dpf")]
     primary_dpf: Option<String>,
-    #[arg(long = "threshold", value_enum, default_value = "otsu")]
+    /// Which fixels/voxels are scored. `quantile` (default) drops the lowest
+    /// `--threshold-quantile` fraction of the primary metric, so every
+    /// dataset is scored on the same share of its brain.
+    #[arg(long = "threshold", value_enum, default_value = "quantile")]
     threshold: QcThresholdArg,
     #[arg(long = "threshold-value")]
     threshold_value: Option<f32>,
+    /// Fraction dropped by `--threshold quantile`.
+    #[arg(long = "threshold-quantile")]
+    threshold_quantile: Option<f32>,
     #[arg(long = "angle-deg", default_value_t = 15.0)]
     angle_deg: f32,
+    /// `fixel`: every fixel against its 26-neighbourhood, with per-DPF
+    /// connected/disconnected summaries. `primary`: each voxel's strongest
+    /// fixel against the voxel one rounded lattice step along it (DSI Studio's
+    /// fib-QC coherence index; Otsu is taken over the whole grid). `chain`:
+    /// link fixels into chains by mutual best continuation and report chain
+    /// lengths in mm.
+    #[arg(long, value_enum, default_value = "fixel")]
+    mode: QcModeArg,
+    /// Also score the 24 gradient-table axis permutations/flips (in voxel
+    /// axes, the frame of FSL/dipy bvecs) by primary-fibre coherence and
+    /// report the most coherent. A label is the fix to apply to the bvecs.
+    #[arg(long = "check-btable")]
+    check_btable: bool,
+    /// Rule used to score b-table candidates. `chain` (default): fibre-weighted
+    /// mean chain length, which a wrong table breaks almost at once.
+    #[arg(long = "btable-scoring", value_enum, default_value = "chain")]
+    btable_scoring: QcModeArg,
+    /// The b-table check scores only values at or above this quantile of the
+    /// primary metric (default 0.9: the top 10%), independent of
+    /// `--threshold`, which sets the cut for the coherence index.
+    #[arg(long = "btable-quantile", default_value_t = DEFAULT_BTABLE_QUANTILE)]
+    btable_quantile: f32,
     #[arg(long = "write-qc-class")]
     write_qc_class: bool,
     #[arg(long = "overwrite-qc-class")]
@@ -602,6 +633,9 @@ struct CompareArgs {
     threshold: QcThresholdArg,
     #[arg(long = "threshold-value")]
     threshold_value: Option<f32>,
+    /// Fraction dropped by `--threshold quantile`.
+    #[arg(long = "threshold-quantile")]
+    threshold_quantile: Option<f32>,
     /// Coherence trajectory/match angle (degrees) passed to the QC pass.
     #[arg(long = "coherence-angle-deg", default_value_t = 15.0)]
     coherence_angle_deg: f32,
@@ -907,11 +941,57 @@ impl From<IdentityArg> for IdentityPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum QcModeArg {
+    Fixel,
+    Primary,
+    Chain,
+}
+
+impl From<QcModeArg> for CoherenceMode {
+    fn from(value: QcModeArg) -> Self {
+        match value {
+            QcModeArg::Fixel => CoherenceMode::Fixel,
+            QcModeArg::Primary => CoherenceMode::Primary,
+            QcModeArg::Chain => CoherenceMode::Chain,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum QcThresholdArg {
     Otsu,
     Positive,
     All,
     Value,
+    Quantile,
+}
+
+fn threshold_mode(
+    arg: QcThresholdArg,
+    value: Option<f32>,
+    quantile: Option<f32>,
+) -> odx_rs::Result<ThresholdMode> {
+    if value.is_some() && arg != QcThresholdArg::Value {
+        return Err(OdxError::Argument(
+            "--threshold-value is only valid with --threshold value".into(),
+        ));
+    }
+    if quantile.is_some() && arg != QcThresholdArg::Quantile {
+        return Err(OdxError::Argument(
+            "--threshold-quantile is only valid with --threshold quantile".into(),
+        ));
+    }
+    Ok(match arg {
+        QcThresholdArg::Otsu => ThresholdMode::Otsu,
+        QcThresholdArg::Positive => ThresholdMode::Positive,
+        QcThresholdArg::All => ThresholdMode::All,
+        QcThresholdArg::Value => ThresholdMode::Value(value.ok_or_else(|| {
+            OdxError::Argument("--threshold value requires --threshold-value <f32>".into())
+        })?),
+        QcThresholdArg::Quantile => {
+            ThresholdMode::Quantile(quantile.unwrap_or(DEFAULT_QC_QUANTILE))
+        }
+    })
 }
 
 impl From<InputFormatOverride> for DetectedFormat {
@@ -1070,7 +1150,8 @@ fn run_validate(args: ValidateArgs) -> odx_rs::Result<()> {
 }
 
 fn run_qc(args: QcArgs) -> odx_rs::Result<()> {
-    let (odx, detected) = load_from_args(
+    // QC reads fixels and scalars only; never decode dense ODFs or SH.
+    let (odx, detected) = load_from_args_with(
         &args.input,
         args.sh.as_deref(),
         args.fixel_dir.as_deref(),
@@ -1079,50 +1160,81 @@ fn run_qc(args: QcArgs) -> odx_rs::Result<()> {
         args.reference_affine.as_deref(),
         args.input_format,
         false,
+        LoadOptions::fixels_only(),
     )?;
     if args.overwrite_qc_class && !args.write_qc_class {
         return Err(OdxError::Argument(
             "--overwrite-qc-class requires --write-qc-class".into(),
         ));
     }
-    let threshold = match args.threshold {
-        QcThresholdArg::Otsu => {
-            if args.threshold_value.is_some() {
-                return Err(OdxError::Argument(
-                    "--threshold-value is only valid with --threshold value".into(),
-                ));
-            }
-            ThresholdMode::Otsu
-        }
-        QcThresholdArg::Positive => {
-            if args.threshold_value.is_some() {
-                return Err(OdxError::Argument(
-                    "--threshold-value is only valid with --threshold value".into(),
-                ));
-            }
-            ThresholdMode::Positive
-        }
-        QcThresholdArg::All => {
-            if args.threshold_value.is_some() {
-                return Err(OdxError::Argument(
-                    "--threshold-value is only valid with --threshold value".into(),
-                ));
-            }
-            ThresholdMode::All
-        }
-        QcThresholdArg::Value => ThresholdMode::Value(args.threshold_value.ok_or_else(|| {
-            OdxError::Argument("--threshold value requires --threshold-value <f32>".into())
-        })?),
+    let threshold = threshold_mode(args.threshold, args.threshold_value, args.threshold_quantile)?;
+
+    if args.write_qc_class && args.mode != QcModeArg::Fixel {
+        return Err(OdxError::Argument(
+            "--write-qc-class requires --mode fixel".into(),
+        ));
+    }
+    let options = FixelQcOptions {
+        primary_metric: args.primary_dpf,
+        threshold,
+        angle_degrees: args.angle_deg,
+    };
+    let btable = if args.check_btable {
+        Some(check_btable(
+            &odx,
+            &FixelQcOptions {
+                threshold: ThresholdMode::Quantile(args.btable_quantile),
+                ..options.clone()
+            },
+            args.btable_scoring.into(),
+        )?)
+    } else {
+        None
     };
 
-    let computation = compute_fixel_qc(
-        &odx,
-        &FixelQcOptions {
-            primary_metric: args.primary_dpf,
-            threshold,
-            angle_degrees: args.angle_deg,
-        },
-    )?;
+    let elasticity = coherence_threshold_elasticity(&odx, &options, args.mode.into())?;
+
+    if args.mode == QcModeArg::Chain {
+        let report = compute_fixel_chains(&odx, &options)?;
+        if args.json {
+            let mut value = serde_json::to_value(&report)?;
+            value["mode"] = "chain".into();
+            value["threshold_elasticity"] = serde_json::to_value(elasticity)?;
+            if let Some(btable) = &btable {
+                value["btable"] = serde_json::to_value(btable)?;
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            print!("{}", render_fixel_chains(&report));
+            println!("threshold_elasticity: {}", fmt_opt(elasticity));
+            if let Some(btable) = &btable {
+                print!("{}", render_btable_check(btable));
+            }
+        }
+        return Ok(());
+    }
+
+    if args.mode == QcModeArg::Primary {
+        let report = compute_primary_coherence(&odx, &options)?;
+        if args.json {
+            let mut value = serde_json::to_value(&report)?;
+            value["mode"] = "primary".into();
+            value["threshold_elasticity"] = serde_json::to_value(elasticity)?;
+            if let Some(btable) = &btable {
+                value["btable"] = serde_json::to_value(btable)?;
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            print!("{}", render_primary_coherence(&report));
+            println!("threshold_elasticity: {}", fmt_opt(elasticity));
+            if let Some(btable) = &btable {
+                print!("{}", render_btable_check(btable));
+            }
+        }
+        return Ok(());
+    }
+
+    let computation = compute_fixel_qc(&odx, &options)?;
     if args.write_qc_class {
         match detected {
             DetectedFormat::OdxDirectory | DetectedFormat::OdxArchive => {
@@ -1138,43 +1250,25 @@ fn run_qc(args: QcArgs) -> odx_rs::Result<()> {
     let report = &computation.report;
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        let mut value = serde_json::to_value(report)?;
+        value["mode"] = "fixel".into();
+        value["threshold_elasticity"] = serde_json::to_value(elasticity)?;
+        if let Some(btable) = &btable {
+            value["btable"] = serde_json::to_value(btable)?;
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         print!("{}", render_fixel_qc(report));
+        println!("threshold_elasticity: {}", fmt_opt(elasticity));
+        if let Some(btable) = &btable {
+            print!("{}", render_btable_check(btable));
+        }
     }
     Ok(())
 }
 
 fn run_compare(args: CompareArgs) -> odx_rs::Result<()> {
-    let threshold = match args.threshold {
-        QcThresholdArg::Otsu => {
-            if args.threshold_value.is_some() {
-                return Err(OdxError::Argument(
-                    "--threshold-value is only valid with --threshold value".into(),
-                ));
-            }
-            ThresholdMode::Otsu
-        }
-        QcThresholdArg::Positive => {
-            if args.threshold_value.is_some() {
-                return Err(OdxError::Argument(
-                    "--threshold-value is only valid with --threshold value".into(),
-                ));
-            }
-            ThresholdMode::Positive
-        }
-        QcThresholdArg::All => {
-            if args.threshold_value.is_some() {
-                return Err(OdxError::Argument(
-                    "--threshold-value is only valid with --threshold value".into(),
-                ));
-            }
-            ThresholdMode::All
-        }
-        QcThresholdArg::Value => ThresholdMode::Value(args.threshold_value.ok_or_else(|| {
-            OdxError::Argument("--threshold value requires --threshold-value <f32>".into())
-        })?),
-    };
+    let threshold = threshold_mode(args.threshold, args.threshold_value, args.threshold_quantile)?;
 
     let a = OdxDataset::open(&args.a)?;
     let b = OdxDataset::open(&args.b)?;
@@ -2275,6 +2369,32 @@ fn load_from_args(
     input_override: Option<InputFormatOverride>,
     preserve_nifti_affine: bool,
 ) -> odx_rs::Result<(OdxDataset, DetectedFormat)> {
+    load_from_args_with(
+        input,
+        sh,
+        fixel_dir,
+        mapmri_tensor,
+        mapmri_uvec,
+        reference_affine,
+        input_override,
+        preserve_nifti_affine,
+        LoadOptions::default(),
+    )
+}
+
+/// `load_from_args` reading only the arrays `load` asks for.
+#[allow(clippy::too_many_arguments)]
+fn load_from_args_with(
+    input: &Path,
+    sh: Option<&Path>,
+    fixel_dir: Option<&Path>,
+    mapmri_tensor: Option<&Path>,
+    mapmri_uvec: Option<&Path>,
+    reference_affine: Option<&Path>,
+    input_override: Option<InputFormatOverride>,
+    preserve_nifti_affine: bool,
+    load: LoadOptions,
+) -> odx_rs::Result<(OdxDataset, DetectedFormat)> {
     let opts = LoadDatasetOptions {
         sh_path: sh,
         fixel_dir,
@@ -2282,6 +2402,7 @@ fn load_from_args(
         mapmri_uvec_path: mapmri_uvec,
         reference_affine,
         preserve_nifti_affine,
+        load,
     };
     if let Some(format) = input_override {
         let detected: DetectedFormat = format.into();
@@ -2318,6 +2439,66 @@ fn infer_sh_gzip(path: &Path) -> bool {
     path.to_string_lossy()
         .to_lowercase()
         .ends_with(".gz")
+}
+
+fn fmt_opt<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "none".into(), |v| format!("{v:.6}"))
+}
+
+fn render_primary_coherence(report: &PrimaryCoherenceReport) -> String {
+    let mut out = String::new();
+    out.push_str("mode: primary\n");
+    out.push_str(&format!("primary_metric: {}\n", report.primary_metric));
+    out.push_str(&format!("threshold_value: {}\n", fmt_opt(report.threshold_value)));
+    out.push_str(&format!("angle_degrees: {}\n", report.angle_degrees));
+    out.push_str(&format!("voxels_with_fixels: {}\n", report.voxels_with_fixels));
+    out.push_str(&format!("evaluated_voxels: {}\n", report.evaluated_voxels));
+    out.push_str(&format!("connected_voxels: {}\n", report.connected_voxels));
+    out.push_str(&format!("coherence_index: {}\n", fmt_opt(report.coherence_index)));
+    out
+}
+
+fn render_fixel_chains(report: &FixelChainReport) -> String {
+    let mut out = String::new();
+    out.push_str("mode: chain\n");
+    out.push_str(&format!("primary_metric: {}\n", report.primary_metric));
+    out.push_str(&format!("threshold_value: {}\n", fmt_opt(report.threshold_value)));
+    out.push_str(&format!("angle_degrees: {}\n", report.angle_degrees));
+    out.push_str(&format!("evaluated_fixels: {}\n", report.evaluated_fixels));
+    out.push_str(&format!("chains: {}\n", report.chains));
+    out.push_str(&format!("loops: {}\n", report.loops));
+    for (name, value) in [
+        ("weighted_mean_length_mm", report.weighted_mean_length_mm),
+        ("max_chain_length_mm", report.max_chain_length_mm),
+        ("weight_in_chains_over_20mm", report.weight_in_chains_over_20mm),
+        ("weight_in_chains_over_40mm", report.weight_in_chains_over_40mm),
+    ] {
+        out.push_str(&format!("{name}: {}\n", fmt_opt(value)));
+    }
+    out
+}
+
+fn render_btable_check(check: &BTableCheck) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("btable_best: {}\n", check.best));
+    out.push_str(&format!("btable_current_is_best: {}\n", check.current_is_best));
+    out.push_str(&format!(
+        "btable_current_coherence_index: {}\n",
+        fmt_opt(check.current_coherence_index)
+    ));
+    out.push_str(&format!(
+        "btable_best_coherence_index: {}\n",
+        fmt_opt(check.best_coherence_index)
+    ));
+    out.push_str("btable_candidates:\n");
+    for candidate in &check.candidates {
+        out.push_str(&format!(
+            "  {}: {}\n",
+            candidate.label,
+            fmt_opt(candidate.coherence_index)
+        ));
+    }
+    out
 }
 
 fn render_fixel_qc(report: &FixelQcReport) -> String {

@@ -176,6 +176,17 @@ In brief:
 - report weighted coherence/incoherence plus connected/disconnected counts and
   per-scalar-DPF summaries
 
+`--mode primary` instead reports current DSI Studio's fib-QC coherence index
+(each voxel's strongest fixel against the voxel one rounded lattice step along
+it). `--check-btable` adds coherence under all 24 gradient-table axis
+permutations/flips and names the best; `--btable-scoring` (default `chain`,
+scoring fibre-weighted mean chain length) picks the rule. `--mode chain` links fixels into chains by mutual
+best continuation and reports chain lengths in mm. Reports include
+`threshold_elasticity`, how much the
+index moves with the threshold. See [fixel_qc.md](./fixel_qc.md#thresholds-for-qc)
+for why the coherence index and the b-table check use different cuts. Both modes step through the
+affine, so LPS, oblique and anisotropic grids are scored physically.
+
 Useful options:
 
 - `--sh <path>`
@@ -183,10 +194,15 @@ Useful options:
 - `--mapmri-tensor <path>` / `--mapmri-uvec <path>` (TORTOISE MAP-MRI input)
 - `--reference-affine <path>`
 - `--primary-dpf <name>`
-- `--threshold otsu|positive|all|value`
+- `--threshold quantile|otsu|positive|all|value` (default `quantile`)
 - `--threshold-value <f32>`
+- `--threshold-quantile <f32>` (default 0.1: score the top 90%)
 - `--angle-deg <f32>`
-- `--write-qc-class`
+- `--mode fixel|primary|chain`
+- `--check-btable`
+- `--btable-scoring fixel|primary|chain`
+- `--btable-quantile <f32>` (default 0.9: the check scores the top 10%)
+- `--write-qc-class` (fixel mode only)
 - `--overwrite-qc-class`
 - `--json`
 

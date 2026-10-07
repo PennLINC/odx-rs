@@ -36,8 +36,11 @@ use odx_rs::sh_basis_evaluator::{
 };
 use odx_rs::sphere_lookup::{median_nearest_vertex_angle_deg, nearest_vertex_indices};
 use odx_rs::{
-    apply_graddev as core_apply_graddev, GradDevField, GradDevOptions, IdentityPolicy, OdxBuilder,
-    OdxDataset,
+    apply_graddev as core_apply_graddev, check_btable as core_check_btable,
+    coherence_threshold_elasticity, compute_fixel_chains, compute_fixel_qc,
+    compute_primary_coherence, CoherenceMode,
+    FixelQcOptions, GradDevField, GradDevOptions, IdentityPolicy, LoadOptions, OdxBuilder,
+    OdxDataset, ThresholdMode, DEFAULT_BTABLE_QUANTILE, DEFAULT_QC_QUANTILE,
 };
 
 // ─── Error helpers ───────────────────────────────────────────────────────────
@@ -797,6 +800,91 @@ impl PyOdx {
         Ok((PyOdx::from_dataset(corrected), json_to_py(py, &report)))
     }
 
+    /// Coherence QC of the stored fixels; returns a report dict.
+    ///
+    /// `mode="chain"` links fixels into chains by mutual best continuation and
+    /// reports chain lengths in mm (see `compute_fixel_chains`).
+    ///
+    /// `mode="primary"` (default) is DSI Studio's fib-QC coherence index:
+    /// each voxel's strongest fixel is connected when the strongest fixel one
+    /// rounded lattice step along it lies within `angle_deg`; Otsu is taken
+    /// over the whole grid. `mode="fixel"` tests every fixel against its
+    /// 26-neighbourhood and adds per-DPF connected/disconnected summaries.
+    ///
+    /// `metric` names the scalar DPF used for weighting and thresholding
+    /// (default: `amplitude`, then `afd`, then `qa`). `threshold` is
+    /// `"quantile"` (default: drop the lowest `quantile` fraction, so every
+    /// dataset is scored on the same share of its brain), `"otsu"`,
+    /// `"positive"`, `"all"` or a number. The dict's `threshold_elasticity`
+    /// is d ln(coherence) / d ln(threshold): how much the index depends on
+    /// where the cut fell.
+    ///
+    /// `check_btable=True` adds a `"btable"` entry: coherence under each of
+    /// the 24 gradient-table axis permutations/flips (voxel axes, the frame
+    /// of FSL/dipy bvecs), with the best label as the fix to apply to the
+    /// bvecs. `btable_scoring` picks the rule: the default `"chain"` scores
+    /// fibre-weighted mean chain length, which a wrong table breaks almost at
+    /// once; `"fixel"` scores coherence. The check scores
+    /// only values at or above the `btable_quantile` quantile (default 0.9,
+    /// the top 10%), whatever `threshold` says.
+    #[pyo3(signature = (mode="primary", *, metric=None, threshold=None, quantile=DEFAULT_QC_QUANTILE, angle_deg=15.0, check_btable=false, btable_scoring="chain", btable_quantile=DEFAULT_BTABLE_QUANTILE))]
+    #[allow(clippy::too_many_arguments)]
+    fn coherence(
+        &self,
+        py: Python<'_>,
+        mode: &str,
+        metric: Option<String>,
+        threshold: Option<&Bound<'_, PyAny>>,
+        quantile: f32,
+        angle_deg: f32,
+        check_btable: bool,
+        btable_scoring: &str,
+        btable_quantile: f32,
+    ) -> PyResult<PyObject> {
+        let mode = parse_coherence_mode("mode", mode)?;
+        let scoring = parse_coherence_mode("btable_scoring", btable_scoring)?;
+        let options = FixelQcOptions {
+            primary_metric: metric,
+            threshold: parse_threshold(threshold, quantile)?,
+            angle_degrees: angle_deg,
+        };
+        let inner = Arc::clone(&self.inner);
+        let report = py
+            .allow_threads(move || -> odx_rs::Result<serde_json::Value> {
+                let (mut report, name) = match mode {
+                    CoherenceMode::Primary => (
+                        serde_json::to_value(compute_primary_coherence(&inner, &options)?)?,
+                        "primary",
+                    ),
+                    CoherenceMode::Fixel => (
+                        serde_json::to_value(compute_fixel_qc(&inner, &options)?.report)?,
+                        "fixel",
+                    ),
+                    CoherenceMode::Chain => (
+                        serde_json::to_value(compute_fixel_chains(&inner, &options)?)?,
+                        "chain",
+                    ),
+                };
+                report["mode"] = name.into();
+                report["threshold_elasticity"] =
+                    serde_json::to_value(coherence_threshold_elasticity(&inner, &options, mode)?)?;
+                if check_btable {
+                    report["btable"] =
+                        serde_json::to_value(core_check_btable(
+                        &inner,
+                        &FixelQcOptions {
+                            threshold: ThresholdMode::Quantile(btable_quantile),
+                            ..options.clone()
+                        },
+                        scoring,
+                    )?)?;
+                }
+                Ok(report)
+            })
+            .map_err(map_err)?;
+        Ok(json_to_py(py, &report))
+    }
+
     /// Run the Rust peak finder on this dataset's SH coefficients and return
     /// a *new* Odx with `directions` and `dpf/amplitude` populated. Niche path
     /// — prefer `OdxBuilder.compute_peaks` or `from_sh_coefficients`.
@@ -1138,9 +1226,14 @@ impl PyOdxBuilder {
 // ─── module-level functions ─────────────────────────────────────────────────
 
 /// Load a `.odx` file or directory.
+///
+/// `skip_odf` / `skip_sh` leave out dense ODF / SH arrays (never extracted or
+/// read), for work that only needs fixels and scalars, such as `coherence`.
 #[pyfunction]
-fn load(path: PathBuf) -> PyResult<PyOdx> {
-    let dataset = OdxDataset::load(&path).map_err(map_io)?;
+#[pyo3(signature = (path, *, skip_odf=false, skip_sh=false))]
+fn load(path: PathBuf, skip_odf: bool, skip_sh: bool) -> PyResult<PyOdx> {
+    let options = LoadOptions { skip_odf, skip_sh };
+    let dataset = OdxDataset::load_with(&path, &options).map_err(map_io)?;
     Ok(PyOdx::from_dataset(dataset))
 }
 
@@ -1419,6 +1512,67 @@ fn apply_graddev(
     odx.apply_graddev(py, graddev, identity, affine, apsf_dirs, odf_lmax)
 }
 
+/// Coherence QC of an Odx; see `Odx.coherence`.
+#[pyfunction]
+#[pyo3(signature = (odx, mode="primary", *, metric=None, threshold=None, quantile=DEFAULT_QC_QUANTILE, angle_deg=15.0, check_btable=false, btable_scoring="chain", btable_quantile=DEFAULT_BTABLE_QUANTILE))]
+#[allow(clippy::too_many_arguments)]
+fn coherence(
+    py: Python<'_>,
+    odx: &PyOdx,
+    mode: &str,
+    metric: Option<String>,
+    threshold: Option<&Bound<'_, PyAny>>,
+    quantile: f32,
+    angle_deg: f32,
+    check_btable: bool,
+    btable_scoring: &str,
+    btable_quantile: f32,
+) -> PyResult<PyObject> {
+    odx.coherence(
+        py,
+        mode,
+        metric,
+        threshold,
+        quantile,
+        angle_deg,
+        check_btable,
+        btable_scoring,
+        btable_quantile,
+    )
+}
+
+fn parse_coherence_mode(arg: &str, value: &str) -> PyResult<CoherenceMode> {
+    match value {
+        "primary" => Ok(CoherenceMode::Primary),
+        "fixel" => Ok(CoherenceMode::Fixel),
+        "chain" => Ok(CoherenceMode::Chain),
+        other => Err(PyValueError::new_err(format!(
+            "{arg} must be 'primary', 'fixel' or 'chain'; got {other:?}"
+        ))),
+    }
+}
+
+fn parse_threshold(threshold: Option<&Bound<'_, PyAny>>, quantile: f32) -> PyResult<ThresholdMode> {
+    let Some(threshold) = threshold else {
+        return Ok(ThresholdMode::Quantile(quantile));
+    };
+    if let Ok(name) = threshold.extract::<String>() {
+        return match name.as_str() {
+            "quantile" => Ok(ThresholdMode::Quantile(quantile)),
+            "otsu" => Ok(ThresholdMode::Otsu),
+            "positive" => Ok(ThresholdMode::Positive),
+            "all" => Ok(ThresholdMode::All),
+            other => Err(PyValueError::new_err(format!(
+                "threshold must be 'quantile', 'otsu', 'positive', 'all' or a number; got {other:?}"
+            ))),
+        };
+    }
+    let value: f32 = threshold.extract().map_err(|_| {
+        PyValueError::new_err("threshold must be 'quantile', 'otsu', 'positive', 'all' or a number")
+    })?;
+    Ok(ThresholdMode::Value(value))
+}
+
 fn parse_identity_policy(identity: &str) -> PyResult<IdentityPolicy> {
     match identity {
         "auto" => Ok(IdentityPolicy::Auto),
@@ -1554,17 +1708,28 @@ fn dsistudio_odf8_full_sphere<'py>(py: Python<'py>) -> Bound<'py, PyArray2<f32>>
 
 // Foreign-format loaders
 
+/// Load a DSI Studio `.fz`. `skip_odf=True` discards the dense ODFs while
+/// decompressing, for fixel-only work.
 #[pyfunction]
-fn from_fz(path: PathBuf) -> PyResult<PyOdx> {
-    let dataset = odx_rs::dsistudio::load_fz(&path, None).map_err(map_io)?;
+#[pyo3(signature = (path, *, skip_odf=false))]
+fn from_fz(path: PathBuf, skip_odf: bool) -> PyResult<PyOdx> {
+    let options = LoadOptions { skip_odf, skip_sh: false };
+    let dataset = odx_rs::dsistudio::load_dsistudio_with(&path, None, &options).map_err(map_io)?;
     Ok(PyOdx::from_dataset(dataset))
 }
 
+/// Load a DSI Studio `.fib.gz`. `skip_odf=True` discards the dense ODFs
+/// while decompressing, for fixel-only work.
 #[pyfunction]
-#[pyo3(signature = (path, affine=None))]
-fn from_fibgz(path: PathBuf, affine: Option<PyReadonlyArray2<'_, f64>>) -> PyResult<PyOdx> {
+#[pyo3(signature = (path, affine=None, *, skip_odf=false))]
+fn from_fibgz(
+    path: PathBuf,
+    affine: Option<PyReadonlyArray2<'_, f64>>,
+    skip_odf: bool,
+) -> PyResult<PyOdx> {
     let aff = affine.map(|a| read_4x4_affine(&a)).transpose()?;
-    let dataset = odx_rs::dsistudio::load_fibgz(&path, aff).map_err(map_io)?;
+    let options = LoadOptions { skip_odf, skip_sh: false };
+    let dataset = odx_rs::dsistudio::load_dsistudio_with(&path, aff, &options).map_err(map_io)?;
     Ok(PyOdx::from_dataset(dataset))
 }
 
@@ -1816,5 +1981,6 @@ fn _odx(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dsistudio_odf8_hemisphere, m)?)?;
     m.add_function(wrap_pyfunction!(dsistudio_odf8_full_sphere, m)?)?;
     m.add_function(wrap_pyfunction!(compute_b_matrix, m)?)?;
+    m.add_function(wrap_pyfunction!(coherence, m)?)?;
     Ok(())
 }

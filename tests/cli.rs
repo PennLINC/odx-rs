@@ -623,6 +623,51 @@ fn qc_json_output_serializes_report() {
 }
 
 #[test]
+fn qc_primary_mode_with_btable_check_serializes_both() {
+    let tmp = tempfile::tempdir().unwrap();
+    let odx_dir = tmp.path().join("qc_fixture.odx");
+    create_qc_fixture_odx_dir(&odx_dir);
+
+    let output = Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "qc",
+            odx_dir.to_str().unwrap(),
+            "--mode",
+            "primary",
+            "--threshold",
+            "all",
+            "--check-btable",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["mode"], "primary");
+    assert_eq!(json["primary_metric"], "amplitude");
+    assert!(json["coherence_index"].is_number());
+    assert_eq!(json["btable"]["candidates"].as_array().unwrap().len(), 24);
+    assert_eq!(json["btable"]["candidates"][0]["label"], "012");
+    assert_eq!(json["btable"]["scoring"], "chain");
+    assert!(json["btable"]["current_coherence_index"].is_number());
+
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args([
+            "qc",
+            odx_dir.to_str().unwrap(),
+            "--mode",
+            "primary",
+            "--write-qc-class",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--write-qc-class requires --mode fixel"));
+}
+
+#[test]
 fn qc_reports_missing_primary_metric_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let odx_dir = tmp.path().join("no_primary.odx");

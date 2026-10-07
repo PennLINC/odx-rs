@@ -11,7 +11,7 @@ use crate::header::Header;
 use crate::io::filename::OdxFilename;
 use crate::io::{dequantize_array, maybe_quantize_array, normalize_float_array};
 use crate::mmap_backing::{vec_to_bytes, MmapBacking};
-use crate::odx_file::{OdxDataset, OdxParts, OdxWritePolicy};
+use crate::odx_file::{LoadOptions, OdxDataset, OdxParts, OdxWritePolicy};
 
 fn mmap_file(path: &Path) -> Result<Mmap> {
     let file = fs::File::open(path)?;
@@ -145,12 +145,16 @@ fn convert_offsets_to_u32(
     }
 }
 
-pub fn open_directory(dir: &Path, tempdir: Option<tempfile::TempDir>) -> Result<OdxDataset> {
+pub fn open_directory(
+    dir: &Path,
+    tempdir: Option<tempfile::TempDir>,
+    options: &LoadOptions,
+) -> Result<OdxDataset> {
     if !dir.is_dir() {
         return Err(OdxError::FileNotFound(dir.to_path_buf()));
     }
 
-    let header = Header::from_file(&dir.join("header.json"))?;
+    let mut header = Header::from_file(&dir.join("header.json"))?;
 
     let mask_path = find_file_with_prefix(dir, "mask")?;
     let mask_backing = MmapBacking::ReadOnly(mmap_file(&mask_path)?);
@@ -212,8 +216,17 @@ pub fn open_directory(dir: &Path, tempdir: Option<tempfile::TempDir>) -> Result<
         None
     };
 
-    let odf = load_float_data_dir(&dir.join("odf"), &header, "odf")?;
-    let sh = load_float_data_dir(&dir.join("sh"), &header, "sh")?;
+    let odf = if options.skip_odf {
+        HashMap::new()
+    } else {
+        load_float_data_dir(&dir.join("odf"), &header, "odf")?
+    };
+    let sh = if options.skip_sh {
+        HashMap::new()
+    } else {
+        load_float_data_dir(&dir.join("sh"), &header, "sh")?
+    };
+    options.apply_to_header(&mut header);
     let dpv = load_float_data_dir(&dir.join("dpv"), &header, "dpv")?;
     let dpf = load_float_data_dir(&dir.join("dpf"), &header, "dpf")?;
     let groups = load_raw_data_dir(&dir.join("groups"))?;
