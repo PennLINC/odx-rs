@@ -21,7 +21,7 @@ Subcommands:
 - `info` — print a concise summary of a dataset or supported foreign input
 - `convert` — convert between ODX, DSI Studio, and MRtrix representations
 - `validate` — check internal consistency after normalizing into an ODX dataset
-- `qc` — compute fixel coherence QC metrics
+- `qc` — compute fixel or primary-fibre (DSI Studio) coherence QC, with an optional b-table check
 - `compare` — pairwise fixel comparison between two ODX files
   (`--a <odx> --b <odx> --out-dir <dir>`)
 - `combine` — build group fixels from many template-space ODX and write per-subject

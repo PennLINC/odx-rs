@@ -7,7 +7,9 @@ use crate::error::{OdxError, Result};
 use crate::formats::{dsistudio, mrtrix, pam, tortoise_mapmri};
 use crate::header::CanonicalDenseRepresentation;
 use crate::reference_affine::read_reference_affine;
-use crate::{validate_dataset_detailed, OdxDataset, ValidationIssue, ValidationSeverity};
+use crate::{
+    validate_dataset_detailed, LoadOptions, OdxDataset, ValidationIssue, ValidationSeverity,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +52,9 @@ pub struct LoadDatasetOptions<'a> {
     /// nibabel without reorienting (e.g. cs-odf), since nibabel reads the
     /// sform/qform untouched.
     pub preserve_nifti_affine: bool,
+    /// Arrays the caller does not need. Honoured by ODX directories and
+    /// archives and by DSI Studio files; other formats load in full.
+    pub load: LoadOptions,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -193,7 +198,7 @@ pub fn load_dataset_with_format(
                 options.mapmri_tensor_path,
                 options.mapmri_uvec_path,
             )?;
-            OdxDataset::load(path)?
+            OdxDataset::load_with(path, &options.load)?
         }
         DetectedFormat::DsistudioFibGz | DetectedFormat::DsistudioFz => {
             reject_mrtrix_companions(
@@ -207,11 +212,7 @@ pub fn load_dataset_with_format(
                 .reference_affine
                 .map(read_reference_affine)
                 .transpose()?;
-            match detected {
-                DetectedFormat::DsistudioFibGz => dsistudio::load_fibgz(path, affine)?,
-                DetectedFormat::DsistudioFz => dsistudio::load_fz(path, affine)?,
-                _ => unreachable!(),
-            }
+            dsistudio::load_dsistudio_with(path, affine, &options.load)?
         }
         DetectedFormat::DipyPam5 => {
             reject_companion_inputs(

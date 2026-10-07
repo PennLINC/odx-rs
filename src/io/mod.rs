@@ -11,17 +11,21 @@ use crate::dtype::DType;
 use crate::error::Result;
 use crate::header::QuantizationSpec;
 use crate::mmap_backing::vec_to_bytes;
-use crate::odx_file::{OdxDataset, OdxWritePolicy};
+use crate::odx_file::{LoadOptions, OdxDataset, OdxWritePolicy};
 
 pub fn load(path: &Path) -> Result<OdxDataset> {
+    load_with(path, &LoadOptions::default())
+}
+
+pub fn load_with(path: &Path, options: &LoadOptions) -> Result<OdxDataset> {
     if path.is_dir() {
-        directory::open_directory(path, None)
+        directory::open_directory(path, None, options)
     } else if path
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e == "odx")
     {
-        zip::open_archive(path)
+        zip::open_archive(path, options)
     } else {
         Err(crate::error::OdxError::Format(format!(
             "unrecognized ODX path: {}",

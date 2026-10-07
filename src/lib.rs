@@ -61,10 +61,14 @@ pub use nifti_export::{
     write_voxel_scalar_nifti_f32, write_voxel_scalar_nifti_u16, write_voxel_scalar_nifti_u32,
     write_voxel_scalar_nifti_u8, DpvAttachReport, DpvDtype, ATTACH_AFFINE_TOLERANCE_MM,
 };
-pub use odx_file::{OdxDataset, OdxFile, OdxWritePolicy};
+pub use odx_file::{LoadOptions, OdxDataset, OdxFile, OdxWritePolicy};
 pub use qc::{
-    compute_fixel_qc, write_qc_class_dpf, FixelQcClass, FixelQcComputation, FixelQcOptions,
-    FixelQcReport, PartitionStats, PartitionValueStats, ThresholdMode, QC_CLASS_DPF_NAME,
+    check_btable, coherence_threshold_elasticity, compute_fixel_chains, compute_fixel_qc,
+    compute_primary_coherence,
+    write_qc_class_dpf,
+    BTableCandidate, BTableCheck, CoherenceMode, FixelChainReport, FixelQcClass, FixelQcComputation, FixelQcOptions,
+    FixelQcReport, PartitionStats, PartitionValueStats, PrimaryCoherenceReport, ThresholdMode,
+    BTABLE_CANDIDATE_LABELS, DEFAULT_BTABLE_QUANTILE, DEFAULT_QC_QUANTILE, QC_CLASS_DPF_NAME,
 };
 pub use peak_finder::{peaks_from_sh_rows, PeakFinderConfig, SpherePeakFinder};
 pub use reference_affine::read_reference_affine;

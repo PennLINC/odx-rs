@@ -25,6 +25,55 @@ pub(crate) struct OdxParts {
     pub tempdir: Option<tempfile::TempDir>,
 }
 
+/// Which bulk arrays a caller needs. Arrays it does not need are never read:
+/// not extracted from an archive, not decoded from a DSI Studio file.
+///
+/// A dataset loaded with a skip is a consistent fixel-only (or SH-only)
+/// dataset: the header's SH and dense-ODF fields are cleared to match.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LoadOptions {
+    /// Skip dense ODF arrays (`odf/`, DSI Studio `odfN`).
+    pub skip_odf: bool,
+    /// Skip SH coefficient arrays (`sh/`).
+    pub skip_sh: bool,
+}
+
+impl LoadOptions {
+    /// Fixels, scalars and the grid only, e.g. for coherence QC.
+    pub fn fixels_only() -> Self {
+        Self {
+            skip_odf: true,
+            skip_sh: true,
+        }
+    }
+
+    /// Clear header fields that describe arrays this load skipped.
+    pub(crate) fn apply_to_header(&self, header: &mut crate::Header) {
+        use crate::header::CanonicalDenseRepresentation as Dense;
+        if self.skip_odf {
+            header.odf_sample_domain = None;
+            header
+                .array_quantization
+                .retain(|k, _| !k.starts_with("odf/"));
+            if header.canonical_dense_representation == Some(Dense::Odf) {
+                header.canonical_dense_representation = None;
+            }
+        }
+        if self.skip_sh {
+            header.sh_order = None;
+            header.sh_basis = None;
+            header.sh_full_basis = None;
+            header.sh_legacy = None;
+            header
+                .array_quantization
+                .retain(|k, _| !k.starts_with("sh/"));
+            if header.canonical_dense_representation == Some(Dense::Sh) {
+                header.canonical_dense_representation = None;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct OdxWritePolicy {
     pub quantize_dense: bool,
@@ -361,8 +410,13 @@ impl OdxDataset {
         Self::open(path)
     }
 
+    /// Open an ODX directory or archive, reading only what `options` needs.
+    pub fn load_with(path: &Path, options: &LoadOptions) -> Result<Self> {
+        crate::io::load_with(path, options)
+    }
+
     pub fn open_directory(path: &Path) -> Result<Self> {
-        crate::io::directory::open_directory(path, None)
+        crate::io::directory::open_directory(path, None, &LoadOptions::default())
     }
 
     pub fn save_directory(&self, path: &Path) -> Result<()> {

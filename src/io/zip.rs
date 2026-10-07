@@ -9,7 +9,7 @@ use crate::data_array::{DataArray, DataPerGroup};
 use crate::error::{OdxError, Result};
 use crate::header::Header;
 use crate::io::filename::OdxFilename;
-use crate::odx_file::{OdxDataset, OdxWritePolicy};
+use crate::odx_file::{LoadOptions, OdxDataset, OdxWritePolicy};
 
 #[derive(Debug, Default)]
 struct OdxArchiveIndex {
@@ -19,7 +19,7 @@ struct OdxArchiveIndex {
     dpg: HashMap<String, HashMap<String, String>>,
 }
 
-pub fn open_archive(path: &Path) -> Result<OdxDataset> {
+pub fn open_archive(path: &Path, options: &LoadOptions) -> Result<OdxDataset> {
     let file = fs::File::open(path)?;
     let mut archive = zip::ZipArchive::new(file)?;
 
@@ -28,7 +28,14 @@ pub fn open_archive(path: &Path) -> Result<OdxDataset> {
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
-        let entry_path = temp_path.join(entry.name());
+        let name = entry.name();
+        // Skipped arrays are never inflated.
+        if (options.skip_odf && name.starts_with("odf/"))
+            || (options.skip_sh && name.starts_with("sh/"))
+        {
+            continue;
+        }
+        let entry_path = temp_path.join(name);
 
         if entry.is_dir() {
             fs::create_dir_all(&entry_path)?;
@@ -41,7 +48,7 @@ pub fn open_archive(path: &Path) -> Result<OdxDataset> {
         }
     }
 
-    crate::io::directory::open_directory(&temp_path, Some(tempdir))
+    crate::io::directory::open_directory(&temp_path, Some(tempdir), options)
 }
 
 pub fn save_archive(odx: &OdxDataset, path: &Path, policy: OdxWritePolicy) -> Result<()> {
