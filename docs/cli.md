@@ -128,6 +128,15 @@ DSI Studio options:
 
 - `--dense-odf off|from-sh`
 
+DIPY PAM5:
+
+PAM5 files do not record their SH basis. `shm_coeff` is read and written in
+dipy's default basis, `descoteaux07` with `legacy=True`; SH in any other basis
+(including MRtrix `tournier07`) is converted on output. Peak directions and SH
+are stored in the voxel frame of the PAM affine, as dipy expects, and converted
+to RAS on input. `total_weight` and `ang_thr` are written with dipy's EuDX
+defaults (0.5 and 60) unless the dataset carries its own values.
+
 ### `odx validate`
 
 ```bash

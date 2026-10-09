@@ -12,10 +12,57 @@ use crate::odx_file::{OdxDataset, OdxParts};
 const PAM_VERSION: &str = "0.0.1";
 const PAM_BASIS_ASSUMED: &str = "_ODX_PAM_SH_BASIS_ASSUMED";
 
-#[derive(Debug, Clone, Default)]
-pub struct PamWriteOptions;
+/// dipy EuDX defaults, written when the dataset carries no PAM metadata;
+/// dipy's `load_pam` requires both datasets.
+const DIPY_DEFAULT_TOTAL_WEIGHT: f64 = 0.5;
+const DIPY_DEFAULT_ANG_THR: f64 = 60.0;
 
+/// SH basis of a PAM5 `shm_coeff` dataset. PAM5 files do not record it;
+/// dipy's SH functions default to `legacy=True`, i.e. `descoteaux07_legacy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PamShBasis {
+    #[default]
+    Descoteaux07Legacy,
+    Descoteaux07,
+}
+
+impl PamShBasis {
+    pub fn dipy_name(self) -> &'static str {
+        match self {
+            Self::Descoteaux07Legacy => "descoteaux07_legacy",
+            Self::Descoteaux07 => "descoteaux07",
+        }
+    }
+
+    pub fn legacy(self) -> bool {
+        matches!(self, Self::Descoteaux07Legacy)
+    }
+}
+
+/// Options for [`save_pam5`].
+#[derive(Debug, Clone, Default)]
+pub struct PamWriteOptions {
+    /// Basis of the written `shm_coeff`. SH in any other basis (including
+    /// MRtrix `tournier07`) is converted.
+    pub sh_basis: PamShBasis,
+}
+
+/// Options for [`load_pam5_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct PamReadOptions {
+    /// Basis assumed for `shm_coeff`.
+    pub sh_basis: PamShBasis,
+}
+
+/// Load a dipy PAM5 file, assuming `shm_coeff` uses dipy's default basis
+/// (`descoteaux07_legacy`).
 pub fn load_pam5(path: &Path) -> Result<OdxDataset> {
+    load_pam5_with_options(path, &PamReadOptions::default())
+}
+
+/// Load a dipy PAM5 file. Peak directions and SH coefficients are rotated
+/// from the PAM voxel frame to RAS.
+pub fn load_pam5_with_options(path: &Path, options: &PamReadOptions) -> Result<OdxDataset> {
     use hdf5_metno::types::VarLenUnicode;
     use hdf5_metno::File;
     use serde_json::{Number, Value};
@@ -305,25 +352,37 @@ pub fn load_pam5(path: &Path) -> Result<OdxDataset> {
     let mut sh = HashMap::new();
     let mut sh_order = None;
     let mut sh_basis = None;
+    let mut sh_legacy = None;
     let mut canonical_dense = None;
     let mut extra = HashMap::new();
 
     if let Some((coeffs, ncols)) = shm_coeff {
-        let masked = sparse_from_dense_rows(&coeffs, &mask, ncols)
+        let mut masked = sparse_from_dense_rows(&coeffs, &mask, ncols)
             .into_iter()
             .map(|v| v as f32)
             .collect::<Vec<_>>();
+        sh_order = infer_sh_order(ncols);
+        let basis = options.sh_basis.dipy_name();
+        // f_ras(u) = f_pam(Rᵀ u), matching the peak directions.
+        let to_pam = transpose3(&orientation_matrix_f64(&affine));
+        if let Some(lmax) = sh_order.filter(|_| !is_identity3(&to_pam)) {
+            let t = crate::sh_basis_evaluator::sh_reorient_matrix(
+                lmax as usize,
+                basis,
+                basis,
+                false,
+                &to_pam,
+            )?;
+            crate::sh_basis_evaluator::apply_sh_matrix_rows(&t, ncols, &mut masked);
+        }
         sh.insert(
             "coefficients".into(),
             DataArray::owned_bytes(vec_to_bytes(masked), ncols, DType::Float32),
         );
-        sh_order = infer_sh_order(ncols);
         sh_basis = Some("descoteaux07".into());
+        sh_legacy = Some(options.sh_basis.legacy());
         canonical_dense = Some(CanonicalDenseRepresentation::Sh);
-        extra.insert(
-            PAM_BASIS_ASSUMED.into(),
-            Value::String("descoteaux07".into()),
-        );
+        extra.insert(PAM_BASIS_ASSUMED.into(), Value::String(basis.into()));
     }
 
     let mut odf_arrays = HashMap::new();
@@ -371,7 +430,7 @@ pub fn load_pam5(path: &Path) -> Result<OdxDataset> {
         sh_order,
         sh_basis,
         sh_full_basis: None,
-        sh_legacy: None,
+        sh_legacy,
         canonical_dense_representation: canonical_dense,
         sphere_id: None,
         odf_sample_domain,
@@ -397,7 +456,10 @@ pub fn load_pam5(path: &Path) -> Result<OdxDataset> {
     }))
 }
 
-pub fn save_pam5(odx: &OdxDataset, path: &Path, _options: &PamWriteOptions) -> Result<()> {
+/// Write a dipy PAM5 file. Peak directions and SH coefficients are rotated
+/// from RAS to the PAM voxel frame, and SH is converted to
+/// `options.sh_basis`.
+pub fn save_pam5(odx: &OdxDataset, path: &Path, options: &PamWriteOptions) -> Result<()> {
     use hdf5_metno::types::VarLenUnicode;
     use hdf5_metno::File;
 
@@ -566,24 +628,13 @@ pub fn save_pam5(odx: &OdxDataset, path: &Path, _options: &PamWriteOptions) -> R
         write_dataset_f32_3d(&pam, &name, &values, dims[0], dims[1], dims[2])?;
     }
 
-    if should_export_sh(odx) {
-        if let Ok(sh) = odx.sh::<f32>("coefficients") {
-            let mut dense = vec![0.0f32; nvoxels_total * sh.ncols()];
-            for (row, &full_idx) in sparse_indices.iter().enumerate() {
-                let src = sh.row(row);
-                let start = full_idx * sh.ncols();
-                dense[start..start + sh.ncols()].copy_from_slice(src);
-            }
-            write_dataset_f32_4d(
-                &pam,
-                "shm_coeff",
-                &dense,
-                dims[0],
-                dims[1],
-                dims[2],
-                sh.ncols(),
-            )?;
+    if let Some((sh, ncols)) = pam_sh_coefficients(odx, options)? {
+        let mut dense = vec![0.0f32; nvoxels_total * ncols];
+        for (row, &full_idx) in sparse_indices.iter().enumerate() {
+            let start = full_idx * ncols;
+            dense[start..start + ncols].copy_from_slice(&sh[row * ncols..(row + 1) * ncols]);
         }
+        write_dataset_f32_4d(&pam, "shm_coeff", &dense, dims[0], dims[1], dims[2], ncols)?;
     }
 
     if let Ok(odf) = odx.odf::<f32>("amplitudes") {
@@ -598,24 +649,59 @@ pub fn save_pam5(odx: &OdxDataset, path: &Path, _options: &PamWriteOptions) -> R
         }
     }
 
-    if let Some(value) = odx
-        .header()
-        .extra
-        .get("_ODX_PAM_TOTAL_WEIGHT")
-        .and_then(|value| value.as_f64())
-    {
-        write_dataset_f64_1d(&pam, "total_weight", &[value])?;
-    }
-    if let Some(value) = odx
-        .header()
-        .extra
-        .get("_ODX_PAM_ANG_THR")
-        .and_then(|value| value.as_f64())
-    {
-        write_dataset_f64_1d(&pam, "ang_thr", &[value])?;
-    }
+    let header = odx.header();
+    let metadata = header.pam_metadata.as_ref();
+    let extra_f64 = |key: &str| header.extra.get(key).and_then(|value| value.as_f64());
+    let total_weight = metadata
+        .and_then(|m| m.total_weight)
+        .or_else(|| extra_f64("_ODX_PAM_TOTAL_WEIGHT"))
+        .unwrap_or(DIPY_DEFAULT_TOTAL_WEIGHT);
+    let ang_thr = metadata
+        .and_then(|m| m.ang_thr)
+        .or_else(|| extra_f64("_ODX_PAM_ANG_THR"))
+        .unwrap_or(DIPY_DEFAULT_ANG_THR);
+    write_dataset_f64_1d(&pam, "total_weight", &[total_weight])?;
+    write_dataset_f64_1d(&pam, "ang_thr", &[ang_thr])?;
 
     Ok(())
+}
+
+/// The dataset's `coefficients` SH in `options.sh_basis` and the PAM voxel
+/// frame, as `(rows, ncols)`; `None` when there is no SH or its basis is
+/// unknown.
+fn pam_sh_coefficients(
+    odx: &OdxDataset,
+    options: &PamWriteOptions,
+) -> Result<Option<(Vec<f32>, usize)>> {
+    let header = odx.header();
+    let Ok(sh) = odx.sh::<f32>("coefficients") else {
+        return Ok(None);
+    };
+    let ncols = sh.ncols();
+    let Some(src) = header.dipy_basis_name() else {
+        return Ok(None);
+    };
+    let full_basis = header.sh_full_basis.unwrap_or(false);
+    let lmax = match header.sh_order {
+        Some(order) => order as usize,
+        None if !full_basis => match infer_sh_order(ncols) {
+            Some(order) => order as usize,
+            None => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+    let dst = options.sh_basis.dipy_name();
+    let mut rows = Vec::with_capacity(odx.nb_voxels() * ncols);
+    for row in 0..odx.nb_voxels() {
+        rows.extend_from_slice(sh.row(row));
+    }
+    // f_pam(v) = f_ras(R v), matching the peak directions.
+    let to_ras = orientation_matrix_f64(&header.voxel_to_rasmm);
+    if src != dst || !is_identity3(&to_ras) {
+        let t = crate::sh_basis_evaluator::sh_reorient_matrix(lmax, src, dst, full_basis, &to_ras)?;
+        crate::sh_basis_evaluator::apply_sh_matrix_rows(&t, ncols, &mut rows);
+    }
+    Ok(Some((rows, ncols)))
 }
 
 fn sparse_from_dense_rows(values: &[f64], mask: &[u8], ncols: usize) -> Vec<f64> {
@@ -736,17 +822,17 @@ fn approx_dir_eq(left: [f32; 3], right: [f32; 3]) -> bool {
         && (left[2] - right[2]).abs() <= 1e-5
 }
 
-fn should_export_sh(odx: &OdxDataset) -> bool {
-    match odx.header().sh_basis.as_deref() {
-        Some("descoteaux07") => true,
-        _ => {
-            odx.header()
-                .extra
-                .get(PAM_BASIS_ASSUMED)
-                .and_then(|value| value.as_str())
-                == Some("descoteaux07")
-        }
-    }
+fn orientation_matrix_f64(affine: &[[f64; 4]; 4]) -> [[f64; 3]; 3] {
+    let o = orientation_matrix(affine);
+    std::array::from_fn(|r| std::array::from_fn(|c| o[r][c] as f64))
+}
+
+fn transpose3(m: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    std::array::from_fn(|r| std::array::from_fn(|c| m[c][r]))
+}
+
+fn is_identity3(m: &[[f64; 3]; 3]) -> bool {
+    (0..3).all(|r| (0..3).all(|c| (m[r][c] - if r == c { 1.0 } else { 0.0 }).abs() < 1e-6))
 }
 
 fn quantize_to_sphere(dir: [f32; 3], sphere: &[[f32; 3]]) -> (usize, [f32; 3]) {
