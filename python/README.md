@@ -32,6 +32,8 @@ peaked.save_mrtrix("mrtrix_out/")   # → MRtrix mif (auto-converts basis)
 
 # Round-trip back to dipy if you want
 pam = odx.to_peaks_and_metrics(peaked)
+
+wmfod = odx.from_mrtrix("wmfod.mif")  # bare SH image (.mif[.gz] or 4-D .nii[.gz])
 ```
 
 ## Features

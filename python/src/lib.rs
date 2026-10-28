@@ -1733,13 +1733,25 @@ fn from_fibgz(
     Ok(PyOdx::from_dataset(dataset))
 }
 
-/// Load an MRtrix dataset from a directory containing a fixel directory and
-/// (optionally) a sibling SH `.mif` file. If `sh_filename` is provided the
-/// SH is loaded from `directory/sh_filename`; otherwise common defaults are
-/// tried (`wmfod.mif`, `WM_FODs.mif`).
+/// Load MRtrix data. `path` is either a bare SH image (`.mif`, `.mif.gz`,
+/// `.nii`, `.nii.gz`; voxel order is canonicalized to RAS+) or a directory
+/// containing a fixel directory and (optionally) a sibling SH `.mif` file.
+/// For a directory, if `sh_filename` is provided the SH is loaded from
+/// `path/sh_filename`; otherwise common defaults are tried (`wmfod.mif`,
+/// `WM_FODs.mif`). `sh_filename` is not accepted with a bare SH image.
 #[pyfunction]
-#[pyo3(signature = (directory, sh_filename=None))]
-fn from_mrtrix(directory: PathBuf, sh_filename: Option<String>) -> PyResult<PyOdx> {
+#[pyo3(signature = (path, sh_filename=None))]
+fn from_mrtrix(path: PathBuf, sh_filename: Option<String>) -> PyResult<PyOdx> {
+    if path.is_file() {
+        if sh_filename.is_some() {
+            return Err(PyValueError::new_err(
+                "from_mrtrix: sh_filename is only valid when path is a directory",
+            ));
+        }
+        let dataset = odx_rs::mrtrix::load_mrtrix_sh(&path).map_err(map_io)?;
+        return Ok(PyOdx::from_dataset(dataset));
+    }
+    let directory = path;
     let candidates: Vec<PathBuf> = match sh_filename {
         Some(name) => vec![directory.join(&name), directory.join(format!("{name}.gz"))],
         None => vec![
