@@ -42,6 +42,43 @@ def test_save_mif_then_from_mrtrix_roundtrips_sh(tmp_path):
     np.testing.assert_allclose(loaded_sh, src_sh, atol=1e-3)
 
 
+def test_from_mrtrix_accepts_a_bare_sh_image(tmp_path):
+    src = _make_dataset()
+    # save_mif gzips by default and writes "fod.mif.gz" even when given "fod.mif".
+    path = tmp_path / "fod.mif.gz"
+    src.save_mif(path, which="sh")
+    assert path.is_file()
+    loaded = odx.from_mrtrix(path)
+    # The bare-image loader derives its own mask from the SH, so compare on
+    # the full grid rather than masked rows.
+    np.testing.assert_allclose(
+        np.asarray(loaded.densify_sh()), np.asarray(src.densify_sh()), atol=1e-3
+    )
+    np.testing.assert_array_equal(np.asarray(loaded.affine), np.asarray(src.affine))
+    assert loaded.dimensions == src.dimensions
+
+
+def test_from_mrtrix_accepts_a_bare_nifti_sh_image(tmp_path):
+    nib = pytest.importorskip("nibabel")
+    src = _make_dataset()
+    dense = np.asarray(src.densify_sh(), dtype=np.float32)
+    path = tmp_path / "fod.nii.gz"
+    nib.save(nib.Nifti1Image(dense, np.eye(4)), path)
+    loaded = odx.from_mrtrix(path)
+    np.testing.assert_allclose(np.asarray(loaded.densify_sh()), dense, atol=1e-3)
+    np.testing.assert_array_equal(np.asarray(loaded.affine), np.eye(4))
+    assert loaded.dimensions == dense.shape[:3]
+
+
+def test_from_mrtrix_rejects_sh_filename_with_a_file_path(tmp_path):
+    src = _make_dataset()
+    path = tmp_path / "fod.mif.gz"
+    src.save_mif(path, which="sh")
+    assert path.is_file()
+    with pytest.raises(ValueError, match="sh_filename"):
+        odx.from_mrtrix(path, sh_filename="wmfod.mif")
+
+
 # ─── DSI Studio FZ ────────────────────────────────────────────────────────────
 
 
