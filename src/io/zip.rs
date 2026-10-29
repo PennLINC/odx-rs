@@ -451,8 +451,11 @@ fn write_dir_to_zip<W: Write + std::io::Seek>(
     options: SimpleFileOptions,
     prefix: &str,
 ) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    // Entries go in name order, not the filesystem's, so archives are
+    // byte-reproducible.
+    let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
         let path = entry.path();
         let name = if prefix.is_empty() {
             entry.file_name().to_string_lossy().to_string()

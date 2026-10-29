@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
+use assert_cmd::prelude::*;
 use hdf5_metno::types::VarLenUnicode;
 use hdf5_metno::File;
 use odx_rs::{pam, sh_basis_evaluator, DType, Header, OdxBuilder};
+use predicates::prelude::*;
 
 const PAM_FIXTURE: &str = "../test_data/pam_fixture.pam5";
 
@@ -266,4 +269,68 @@ fn non_legacy_pam_basis_is_honored() {
     for (a, b) in expected.iter().zip(&got) {
         assert!((a - b).abs() < 1e-4, "{a} vs {b}");
     }
+}
+
+#[test]
+fn pam5_converted_to_odx_loads_without_sphere_faces() {
+    let (odx, _, _) = make_oblique_tournier_odx();
+    let tmp = tempfile::tempdir().unwrap();
+    let pam5 = tmp.path().join("source.pam5");
+    pam::save_pam5(&odx, &pam5, &pam::PamWriteOptions::default()).unwrap();
+    let from_pam = pam::load_pam5(&pam5).unwrap();
+    // A PAM5 sphere is sampling directions only.
+    assert!(from_pam.sphere_vertices().is_some());
+    assert!(from_pam.sphere_faces().is_none());
+    let expected_sh = from_pam.sh::<f32>("coefficients").unwrap().row(0).to_vec();
+
+    let archive = tmp.path().join("converted.odx");
+    let directory = tmp.path().join("converted_dir.odx");
+    from_pam.save_archive(&archive).unwrap();
+    from_pam.save_directory(&directory).unwrap();
+    assert!(directory.join("sphere/vertices.3.float32").exists());
+    assert!(!directory.join("sphere/faces.3.uint32").exists());
+    for path in [&archive, &directory] {
+        let back = odx_rs::OdxDataset::load(path).unwrap();
+        assert_eq!(back.sphere_vertices(), from_pam.sphere_vertices());
+        assert!(back.sphere_faces().is_none());
+        assert_eq!(
+            back.sh::<f32>("coefficients").unwrap().row(0),
+            expected_sh.as_slice()
+        );
+    }
+
+    // The CLI route from the bug report: `odx convert x.pam5 y.odx`, then
+    // `odx info y.odx`.
+    let cli_out = tmp.path().join("cli.odx");
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args(["convert", pam5.to_str().unwrap(), cli_out.to_str().unwrap()])
+        .assert()
+        .success();
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args(["info", cli_out.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("faces=none"));
+}
+
+#[test]
+fn pam5_to_odx_archives_are_byte_reproducible() {
+    let (odx, _, _) = make_oblique_tournier_odx();
+    let tmp = tempfile::tempdir().unwrap();
+    let pam5 = tmp.path().join("source.pam5");
+    pam::save_pam5(&odx, &pam5, &pam::PamWriteOptions::default()).unwrap();
+    // Independent loads give independent HashMap hasher states, so the
+    // `_ODX_PAM_*` header extras would come out in different orders unless
+    // the writer sorts them.
+    let mut archives = Vec::new();
+    for i in 0..4 {
+        let from_pam = pam::load_pam5(&pam5).unwrap();
+        assert!(from_pam.header().extra.len() >= 3);
+        let out = tmp.path().join(format!("run{i}.odx"));
+        from_pam.save_archive(&out).unwrap();
+        archives.push(std::fs::read(&out).unwrap());
+    }
+    assert!(archives.windows(2).all(|w| w[0] == w[1]));
 }

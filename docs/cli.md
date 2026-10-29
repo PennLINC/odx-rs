@@ -474,7 +474,8 @@ can). The loader also reads them back in preference to `index{p}`.
 Useful options:
 
 - `--reference-affine <nifti>`: required for a native-space `.fib.gz`/`.fz`
-  without a `trans` record (e.g. the preprocessed DWI it was built from).
+  without a `trans` record (e.g. the preprocessed DWI it was built from); it
+  is reordered to DSI Studio's LPS voxel order automatically.
 - `--odf-lmax <even-int>`, `--apsf-dirs <N>`: accuracy knobs for the dense-ODF
   and SH paths.
 - `--json`: machine-readable summary including the correction report
@@ -504,7 +505,7 @@ Useful options:
 Some formats are composite:
 
 - MRtrix fixel directories may be accompanied by an SH image.
-- DSI Studio `fib.gz` inputs may need `--reference-affine` when the file does not contain a usable transform.
+- DSI Studio `fib.gz` inputs may need `--reference-affine` when the file does not contain a usable transform (no `trans` record). Pass the DWI NIfTI the file was reconstructed from: DSI Studio reorders voxels to LPS on import, and odx reorders the reference affine the same way (as nibabel's `io_orientation` + `ornt_transform` + `inv_ornt_aff` would), so a LAS or otherwise ordered DWI lands its voxels correctly. An affine that is already LPS-ordered is used as is.
 - ODX may hold sparse fixels, dense ODFs, and SH together in one dataset.
 
 The CLI therefore treats `<input>` as the primary object and accepts companion inputs as flags instead of requiring a manifest format.

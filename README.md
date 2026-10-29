@@ -39,7 +39,9 @@ Some formats are composite:
 
 - MRtrix fixel directories may be paired with `--sh <path>`
 - MRtrix SH images may be paired with `--fixel-dir <path>`
-- DSI Studio `fib.gz` files may use `--reference-affine <mif-or-nifti>`
+- DSI Studio `fib.gz` files may use `--reference-affine <mif-or-nifti>`: the
+  DWI the file was reconstructed from, whose affine odx reorders to DSI
+  Studio's LPS voxel order
 - TORTOISE MAP-MRI input (`--input-format tortoise-mapmri-nifti`) pairs a
   coefficient NIfTI given as `<input>` with `--mapmri-tensor <nifti>` and
   `--mapmri-uvec <nifti>`

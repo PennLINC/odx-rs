@@ -209,9 +209,14 @@ pub fn open_directory(
         None
     };
 
+    // Faces are optional: a sphere given only as sampling directions (e.g. a
+    // PAM5 sphere) has vertices but no triangulation.
     let sphere_faces = if sphere_dir.exists() {
-        let faces_path = find_file_with_prefix(&sphere_dir, "faces")?;
-        Some(MmapBacking::ReadOnly(mmap_file(&faces_path)?))
+        match find_file_with_prefix(&sphere_dir, "faces") {
+            Ok(faces_path) => Some(MmapBacking::ReadOnly(mmap_file(&faces_path)?)),
+            Err(OdxError::FileNotFound(_)) => None,
+            Err(err) => return Err(err),
+        }
     } else {
         None
     };
