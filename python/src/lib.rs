@@ -1720,6 +1720,11 @@ fn from_fz(path: PathBuf, skip_odf: bool) -> PyResult<PyOdx> {
 
 /// Load a DSI Studio `.fib.gz`. `skip_odf=True` discards the dense ODFs
 /// while decompressing, for fixel-only work.
+///
+/// `affine` is only used when the file has no `trans` record: pass the
+/// affine of the DWI NIfTI the file was reconstructed from. DSI Studio
+/// reorders voxels to LPS on import, and the affine is reordered the same
+/// way (a no-op for an affine already in LPS order).
 #[pyfunction]
 #[pyo3(signature = (path, affine=None, *, skip_odf=false))]
 fn from_fibgz(

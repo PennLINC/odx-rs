@@ -1107,3 +1107,63 @@ fn graddev_cli_corrects_and_writes_native_formats() {
         .failure()
         .stderr(predicate::str::contains("pam5"));
 }
+
+/// `odx convert x.pam5 y.odx` used to write a sphere without faces that
+/// `odx info` / `OdxDataset::load` then refused, and repeated conversions
+/// differed byte-wise. Every HDF5 file here is touched only by `odx`
+/// subprocesses: HDF5 holds an flock on the files it opens, and a child
+/// spawned while this process had one open would inherit and keep it.
+#[test]
+fn pam5_to_odx_cli_round_trip_is_readable_and_reproducible() {
+    let tmp = tempfile::tempdir().unwrap();
+    let coeffs: Vec<f32> = (0..15)
+        .map(|i| ((i * 7 % 11) as f32 - 5.0) / 10.0)
+        .collect();
+    let mut affine = Header::identity_affine();
+    affine[0][0] = -2.0;
+    let mut builder = OdxBuilder::new(affine, [1, 1, 1], vec![1u8]);
+    builder.push_voxel_peaks(&[[1.0, 0.0, 0.0]]);
+    builder.set_sh_info(4, "tournier07".into());
+    builder.set_sh_data(
+        "coefficients",
+        bytemuck::cast_slice(&coeffs).to_vec(),
+        15,
+        DType::Float32,
+    );
+    builder.set_dpf_data(
+        "amplitude",
+        bytemuck::cast_slice(&[0.8f32]).to_vec(),
+        1,
+        DType::Float32,
+    );
+    let source = tmp.path().join("source.odx");
+    builder.finalize().unwrap().save_archive(&source).unwrap();
+
+    let pam5 = tmp.path().join("source.pam5");
+    Command::cargo_bin("odx")
+        .unwrap()
+        .args(["convert", source.to_str().unwrap(), pam5.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let mut archives = Vec::new();
+    for i in 0..2 {
+        let out = tmp.path().join(format!("from_pam{i}.odx"));
+        Command::cargo_bin("odx")
+            .unwrap()
+            .args(["convert", pam5.to_str().unwrap(), out.to_str().unwrap()])
+            .assert()
+            .success();
+        Command::cargo_bin("odx")
+            .unwrap()
+            .args(["info", out.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("faces=none"));
+        let back = OdxDataset::load(&out).unwrap();
+        assert!(back.sphere_vertices().is_some());
+        assert!(back.sphere_faces().is_none());
+        archives.push(fs::read(&out).unwrap());
+    }
+    assert_eq!(archives[0], archives[1]);
+}

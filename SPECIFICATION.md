@@ -49,7 +49,7 @@ data.odx/
 
   sphere/                           # ODF sampling sphere (optional)
     vertices.3.{dtype}              #   unit directions (NB_SPHERE_VERTICES x 3)
-    faces.3.uint32                  #   triangle indices (NB_SPHERE_FACES x 3)
+    faces.3.uint32                  #   triangle indices (NB_SPHERE_FACES x 3, optional)
 
   odf/                              # ODF amplitudes (optional)
     amplitudes.{ndirs}.{dtype}      #   (NB_VOXELS x NB_SPHERE_VERTICES)
@@ -104,7 +104,7 @@ data.odx/
 | Field | Present when | Type | Description |
 |-------|-------------|------|-------------|
 | `NB_SPHERE_VERTICES` | `sphere/` exists | `u64` | Number of ODF sampling directions. |
-| `NB_SPHERE_FACES` | `sphere/` exists | `u64` | Number of triangles in the sphere mesh. |
+| `NB_SPHERE_FACES` | `sphere/faces` exists | `u64` | Number of triangles in the sphere mesh. |
 | `SH_ORDER` | `sh/` exists | `u64` | Maximum spherical harmonic order. |
 | `SH_BASIS` | `sh/` exists | `string` | SH basis convention: `"descoteaux07"` (Dipy) or `"tournier07"` (MRtrix). |
 | `SH_FULL_BASIS` | optional | `bool` | When `true`, the SH array uses the full basis with both even and odd ℓ (ncoeffs = `(SH_ORDER + 1)²`); when `false` or absent, the symmetric even-only basis is used (ncoeffs = `(SH_ORDER + 1)(SH_ORDER + 2)/2`). Full basis is required for asymmetric ODFs (e.g. pyAFQ aodf). |
@@ -182,7 +182,9 @@ RAS+mm orientation.
 ### `sphere/faces.3.uint32`
 
 Shape `(NB_SPHERE_FACES, 3)`. Triangle indices into the vertex array, for
-mesh visualization and interpolation.
+mesh visualization and interpolation. Optional: a sphere known only by its
+sampling directions (e.g. one imported from a dipy PAM5 file) has vertices but
+no faces, and readers must accept a `sphere/` without `faces`.
 
 The sphere directory is required when `odf/` data is present on a noncanonical
 sphere. It may be omitted when `SPHERE_ID` identifies a standard sphere. It is
@@ -361,7 +363,7 @@ This applies to:
 
 | Source | Transform |
 |--------|-----------|
-| DSI Studio (LPS+) | Negate x and y components: `x_ras = -x_lps`, `y_ras = -y_lps`, `z_ras = z_lps` |
+| DSI Studio (voxel frame of its LPS+-reordered grid) | `d_ras = R · d_dsi`, with `R` the 3×3 linear part of `trans` with its columns normalized; this is `diag(-1, -1, 1)` (negate x and y) only for a non-oblique image. Applies to `odf_vertices`, `dir{p}` and so to `index{p}`. A `.fib.gz` without `trans` uses the reference DWI affine reordered to LPS+ voxel order. |
 | MRtrix (RAS) | No change needed for directions. Affine from NIfTI header. |
 | Dipy (RAS) | No change needed. Affine from NIfTI header. |
 

@@ -415,7 +415,12 @@ fn prepare_dsistudio_dataset(
         "_ODX_DSISTUDIO_VOXEL_POLICY".into(),
         serde_json::Value::String("reorient_to_lps_fortran".into()),
     );
-    install_builtin_dsistudio_sphere(&mut parts);
+    // The sphere is the built-in `odf8` one in the voxel frame of the grid the
+    // writer will produce, exactly as DSI Studio itself would store it.
+    let frame =
+        dsistudio::VoxelFrame::from_affine(&dsistudio::dsistudio_export_affine(&parts.header))?;
+    let sphere = install_builtin_dsistudio_sphere(&mut parts, &frame);
+    let hemisphere = &sphere[..sphere.len() / 2];
     if options.write_float_directions {
         parts.header.extra.insert(
             dsistudio::WRITE_DIR_RECORDS_KEY.into(),
@@ -425,7 +430,7 @@ fn prepare_dsistudio_dataset(
 
     let amplitude = resolve_amplitude_values(odx, options.amplitude_key.as_deref())?;
     let sampled_odf = if options.dense_odf_mode == DenseOdfMode::FromSh {
-        sample_dense_odf_from_sh(odx)?
+        sample_dense_odf_from_sh(odx, hemisphere)?
     } else {
         None
     };
@@ -435,7 +440,7 @@ fn prepare_dsistudio_dataset(
             "amplitudes".into(),
             DataArray::owned_bytes(
                 vec_to_bytes(dense.clone()),
-                dsistudio_odf8::hemisphere_vertices_ras().len(),
+                hemisphere.len(),
                 DType::Float32,
             ),
         );
@@ -456,7 +461,7 @@ fn prepare_dsistudio_dataset(
                 let dense = match sampled_odf.as_ref() {
                     Some(dense) => dense,
                     None => {
-                        fallback_dense = sample_dense_odf_from_sh(odx)?;
+                        fallback_dense = sample_dense_odf_from_sh(odx, hemisphere)?;
                         fallback_dense.as_ref().ok_or_else(|| {
                             OdxError::Argument(
                                 "cannot export DSI Studio peaks: the input has no fixels and no \
@@ -466,7 +471,7 @@ fn prepare_dsistudio_dataset(
                         })?
                     }
                 };
-                peaks_from_sampled_odf(odx, dense)
+                peaks_from_sampled_odf(odx, dense, hemisphere)
             } else {
                 fixels
             }
@@ -477,7 +482,7 @@ fn prepare_dsistudio_dataset(
                     "PeakSource::SampledOdf requires SH-driven dense ODF export".into(),
                 )
             })?;
-            peaks_from_sampled_odf(odx, dense)
+            peaks_from_sampled_odf(odx, dense, hemisphere)
         }
     };
 
@@ -502,7 +507,7 @@ pub(crate) fn dsistudio_sampling_dirs(odx: &OdxDataset, ncols: usize) -> Result<
     )))
 }
 
-fn sample_dense_odf_from_sh(odx: &OdxDataset) -> Result<Option<Vec<f32>>> {
+fn sample_dense_odf_from_sh(odx: &OdxDataset, hemisphere: &[[f32; 3]]) -> Result<Option<Vec<f32>>> {
     let sh = match odx.sh::<f32>("coefficients") {
         Ok(view) => view,
         Err(_) => return Ok(None),
@@ -510,19 +515,30 @@ fn sample_dense_odf_from_sh(odx: &OdxDataset) -> Result<Option<Vec<f32>>> {
     Ok(Some(mrtrix_sh::sample_rows_nonnegative(
         sh.as_flat_slice(),
         sh.nrows(),
-        dsistudio_odf8::hemisphere_vertices_ras(),
+        hemisphere,
         sh.ncols(),
     )?))
 }
 
-fn install_builtin_dsistudio_sphere(parts: &mut OdxParts) {
-    let vertices = dsistudio_odf8::full_vertices_ras().to_vec();
+/// Install DSI Studio's built-in `odf8` sphere, rotated from `frame` to RAS,
+/// and return its RAS vertices. It is the canonical `dsistudio_odf8` sphere
+/// only on a non-oblique grid.
+fn install_builtin_dsistudio_sphere(
+    parts: &mut OdxParts,
+    frame: &dsistudio::VoxelFrame,
+) -> Vec<[f32; 3]> {
+    let vertices: Vec<[f32; 3]> = dsistudio::builtin_voxel_frame_vertices()
+        .into_iter()
+        .map(|v| frame.to_ras(v))
+        .collect();
     let faces = dsistudio_odf8::faces().to_vec();
     parts.header.nb_sphere_vertices = Some(vertices.len() as u64);
     parts.header.nb_sphere_faces = Some(faces.len() as u64);
-    parts.header.sphere_id = Some("dsistudio_odf8".into());
-    parts.sphere_vertices = Some(MmapBacking::Owned(vec_to_bytes(vertices)));
+    parts.header.sphere_id =
+        dsistudio_odf8::matches_builtin(&vertices, &faces).then(|| "dsistudio_odf8".to_string());
+    parts.sphere_vertices = Some(MmapBacking::Owned(vec_to_bytes(vertices.clone())));
     parts.sphere_faces = Some(MmapBacking::Owned(vec_to_bytes(faces)));
+    vertices
 }
 
 fn resolve_amplitude_values(odx: &OdxDataset, explicit_key: Option<&str>) -> Result<Vec<f32>> {
@@ -576,15 +592,17 @@ fn sort_fixels_by_amplitude(
 fn peaks_from_sampled_odf(
     odx: &OdxDataset,
     odf_rows: &[f32],
+    hemisphere: &[[f32; 3]],
 ) -> (Vec<u32>, Vec<[f32; 3]>, Vec<f32>) {
-    static FINDER: std::sync::OnceLock<SpherePeakFinder> = std::sync::OnceLock::new();
-    let finder = FINDER.get_or_init(|| {
-        SpherePeakFinder::for_dsistudio_odf8(PeakFinderConfig {
+    let finder = SpherePeakFinder::new(
+        hemisphere,
+        dsistudio_odf8::faces(),
+        PeakFinderConfig {
             npeaks: 5,
             relative_peak_threshold: 0.5,
             min_separation_angle_deg: 25.0,
-        })
-    });
+        },
+    );
     finder.find_peaks_rows(odf_rows, odx.nb_voxels())
 }
 
@@ -653,6 +671,67 @@ mod tests {
             mat.get("trans").unwrap().as_f32_vec(),
             vec![-1.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,]
         );
+    }
+
+    #[test]
+    fn oblique_ras_export_writes_canonical_voxel_frame_sphere() {
+        // A RAS-ordered grid rotated 20 degrees about z, as MRtrix would hand
+        // over an oblique acquisition.
+        let (c, s) = (20f64.to_radians().cos(), 20f64.to_radians().sin());
+        let affine = [
+            [2.0 * c, -2.0 * s, 0.0, 0.0],
+            [2.0 * s, 2.0 * c, 0.0, 0.0],
+            [0.0, 0.0, 2.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let peak = [0.6f32, 0.0, 0.8];
+        let mut builder = OdxBuilder::new(affine, [1, 1, 1], vec![1u8]);
+        builder.push_voxel_peaks(&[peak]);
+        builder.set_dpf_data(
+            "amplitude",
+            bytemuck::cast_slice(&[1.0f32]).to_vec(),
+            1,
+            DType::Float32,
+        );
+        let odx = builder.finalize().unwrap();
+
+        let tmp = tempdir().unwrap();
+        let out = tmp.path().join("oblique.fz");
+        save_dsistudio_from_odx(
+            &odx,
+            &out,
+            &MrtrixToDsistudioOptions {
+                output_format: DsistudioFormat::Fz,
+                dense_odf_mode: DenseOdfMode::Off,
+                peak_source: PeakSource::Fixels,
+                write_float_directions: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // DSI Studio's own sphere, in the voxel frame of the LPS-reordered grid.
+        let mat = mat4::read_mat4_gz(&out).unwrap();
+        let verts = mat.get("odf_vertices").unwrap().as_f32_vec();
+        let builtin = dsistudio::builtin_voxel_frame_vertices();
+        for (got, want) in verts.chunks_exact(3).zip(&builtin) {
+            for k in 0..3 {
+                assert!((got[k] - want[k]).abs() < 1e-6, "{got:?} != {want:?}");
+            }
+        }
+        // The peak in that frame: rotate back by -20 degrees, then flip x/y.
+        let (cf, sf) = (c as f32, s as f32);
+        let local = [cf * peak[0] + sf * peak[1], -sf * peak[0] + cf * peak[1], peak[2]];
+        let dir0 = mat.get("dir0").unwrap().as_f32_vec();
+        let want = [-local[0], -local[1], local[2]];
+        for k in 0..3 {
+            assert!((dir0[k] - want[k]).abs() < 1e-6, "{dir0:?} != {want:?}");
+        }
+
+        let back = dsistudio::load_fz(&out, None).unwrap();
+        for k in 0..3 {
+            assert!((back.directions()[0][k] - peak[k]).abs() < 1e-6);
+        }
     }
 }
 

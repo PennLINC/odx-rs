@@ -88,6 +88,7 @@ pub struct Header {
     #[serde(
         rename = "ARRAY_QUANTIZATION",
         skip_serializing_if = "HashMap::is_empty",
+        serialize_with = "serialize_sorted",
         default
     )]
     pub array_quantization: HashMap<String, QuantizationSpec>,
@@ -97,8 +98,23 @@ pub struct Header {
     #[serde(rename = "PAM_METADATA", skip_serializing_if = "Option::is_none", default)]
     pub pam_metadata: Option<PamMetadata>,
 
-    #[serde(flatten)]
+    #[serde(flatten, serialize_with = "serialize_sorted")]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Serialize a map in key order, so `header.json` (and the archives holding
+/// it) is byte-reproducible.
+fn serialize_sorted<S, V>(
+    map: &HashMap<String, V>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    V: Serialize,
+{
+    map.iter()
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .serialize(serializer)
 }
 
 impl Header {
@@ -235,5 +251,42 @@ mod tests {
             header.extra.get("CUSTOM_FIELD").unwrap(),
             &serde_json::Value::String("hello".into())
         );
+    }
+
+    #[test]
+    fn header_json_is_deterministic_with_sorted_extra_keys() {
+        let keys: Vec<String> = (0..32).map(|i| format!("_ODX_KEY_{i:02}")).collect();
+        let header_from = |order: &mut dyn Iterator<Item = &String>| {
+            let mut header: Header = serde_json::from_str(
+                r#"{"VOXEL_TO_RASMM": [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]],
+                    "DIMENSIONS": [1, 1, 1], "NB_VOXELS": 1, "NB_PEAKS": 0}"#,
+            )
+            .unwrap();
+            for key in order {
+                header.extra.insert(key.clone(), serde_json::json!(key));
+                header.array_quantization.insert(
+                    format!("dpf/{key}"),
+                    QuantizationSpec {
+                        slope: 1.0,
+                        intercept: 0.0,
+                        stored_dtype: "uint8".into(),
+                    },
+                );
+            }
+            header.to_json().unwrap()
+        };
+        // Each HashMap gets its own random hasher state, so without sorting
+        // these would (almost surely) serialize in different orders.
+        let forward = header_from(&mut keys.iter());
+        let reverse = header_from(&mut keys.iter().rev());
+        assert_eq!(forward, reverse);
+
+        let positions: Vec<usize> = keys
+            .iter()
+            .map(|key| forward.find(&format!("\"{key}\": \"{key}\"")).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{forward}");
+        // The core fields keep their declared order ahead of the extras.
+        assert!(forward.find("VOXEL_TO_RASMM").unwrap() < positions[0]);
     }
 }

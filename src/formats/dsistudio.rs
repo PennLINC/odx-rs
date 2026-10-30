@@ -14,6 +14,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use nalgebra::{Matrix3, Vector3};
+
 use crate::data_array::DataArray;
 use crate::dtype::DType;
 use crate::error::{OdxError, Result};
@@ -31,6 +33,70 @@ use crate::odx_file::{LoadOptions, OdxDataset, OdxParts};
 /// prefers `dir{p}` whenever present (`fib_data.cpp`, `get_fib`), in both
 /// `.fib.gz` and `.fz` containers.
 pub const WRITE_DIR_RECORDS_KEY: &str = "_ODX_DSISTUDIO_WRITE_DIR_RECORDS";
+
+/// DSI Studio stores `odf_vertices`, `dir{p}` (and so the directions behind
+/// `index{p}`) in its voxel frame: the axes of its LPS-reordered voxel grid,
+/// not world LPS. The column-normalized linear part of `trans` maps that
+/// frame to world RAS. For a non-oblique image this is `diag(-1, -1, 1)`; on
+/// an oblique one it also carries the acquisition rotation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VoxelFrame {
+    to_ras: Matrix3<f64>,
+    from_ras: Matrix3<f64>,
+}
+
+impl VoxelFrame {
+    pub(crate) fn from_affine(aff: &[[f64; 4]; 4]) -> Result<Self> {
+        let mut to_ras = Matrix3::zeros();
+        for col in 0..3 {
+            let norm = (0..3).map(|row| aff[row][col].powi(2)).sum::<f64>().sqrt();
+            if norm <= 0.0 {
+                return Err(OdxError::Format(format!(
+                    "DSI Studio affine has a zero-length voxel axis {col}"
+                )));
+            }
+            for row in 0..3 {
+                to_ras[(row, col)] = aff[row][col] / norm;
+            }
+        }
+        let from_ras = to_ras
+            .try_inverse()
+            .ok_or_else(|| OdxError::Format("DSI Studio affine is singular".into()))?;
+        Ok(Self { to_ras, from_ras })
+    }
+
+    /// DSI Studio voxel-frame direction → world RAS.
+    pub(crate) fn to_ras(&self, dir: [f32; 3]) -> [f32; 3] {
+        map_direction(&self.to_ras, dir)
+    }
+
+    /// World RAS direction → DSI Studio voxel frame.
+    pub(crate) fn from_ras(&self, dir: [f32; 3]) -> [f32; 3] {
+        map_direction(&self.from_ras, dir)
+    }
+}
+
+/// `mat · dir`, rescaled to `dir`'s length so that the identity and axis
+/// flips stay bit-exact and a sheared affine does not change vector lengths.
+fn map_direction(mat: &Matrix3<f64>, dir: [f32; 3]) -> [f32; 3] {
+    let v = Vector3::new(f64::from(dir[0]), f64::from(dir[1]), f64::from(dir[2]));
+    let out = mat * v;
+    let out_norm = out.norm();
+    if out_norm == 0.0 {
+        return [0.0; 3];
+    }
+    let out = out * (v.norm() / out_norm);
+    [out[0] as f32, out[1] as f32, out[2] as f32]
+}
+
+/// The built-in `odf8` sphere as DSI Studio stores it, in its voxel frame.
+pub(crate) fn builtin_voxel_frame_vertices() -> Vec<[f32; 3]> {
+    dsistudio_odf8::full_vertices_ras()
+        .iter()
+        // `full_vertices_ras` is the asset with x and y negated; undo that.
+        .map(|v| [-v[0], -v[1], v[2]])
+        .collect()
+}
 
 pub fn load_fibgz(path: &Path, affine: Option<[[f64; 4]; 4]>) -> Result<OdxDataset> {
     load_dsistudio_mat(path, affine, &LoadOptions::default())
@@ -95,14 +161,26 @@ fn load_dsistudio_mat(
     let voxel_to_rasmm = if let Some(trans) = mat.get("trans") {
         dsistudio_trans_to_nifti_affine(trans.as_f32_vec())
     } else if let Some(a) = affine {
-        a
+        // DSI Studio reorders the voxels of the DWI it reconstructs to LPS, so
+        // the DWI's own affine must be reordered the same way to match.
+        reference_affine_to_dsistudio_grid(
+            a,
+            [
+                dimensions[0] as usize,
+                dimensions[1] as usize,
+                dimensions[2] as usize,
+            ],
+        )
     } else {
         return Err(OdxError::Format(
             "DSI Studio file has no spatial affine ('trans' field). \
-             Convert it first with: odx convert --reference-affine <nifti> <file> <output.odx>"
+             Convert it first with: odx convert --reference-affine <dwi.nii.gz> <file> \
+             <output.odx>, passing the DWI NIfTI it was reconstructed from; its affine is \
+             reordered to DSI Studio's LPS voxel order automatically"
                 .into(),
         ));
     };
+    let frame = VoxelFrame::from_affine(&voxel_to_rasmm)?;
 
     let mask_source = if let Some(mask) = mat.get("mask") {
         if let Some(values) = mask.as_u8_slice() {
@@ -175,21 +253,27 @@ fn load_dsistudio_mat(
     }
     let sparse_count = row;
 
+    // DSI Studio stores sphere geometry in its voxel frame. ODX keeps
+    // directions and spheres in world RAS, so the sphere is rotated once here
+    // and `index{p}` lookups then land on RAS vertices.
     let sphere_vertices = if let Some(record) = mat.get("odf_vertices") {
         let verts_flat = record.as_f32_vec();
         let mut out = Vec::with_capacity(record.ncols());
         for i in 0..record.ncols() {
-            out.push([
-                // DSI Studio stores sphere geometry in LPS. ODX keeps directions
-                // and spheres in RAS, so imported geometry is flipped once here.
-                -verts_flat[i * record.mrows()],
-                -verts_flat[i * record.mrows() + 1],
+            out.push(frame.to_ras([
+                verts_flat[i * record.mrows()],
+                verts_flat[i * record.mrows() + 1],
                 verts_flat[i * record.mrows() + 2],
-            ]);
+            ]));
         }
         Some(out)
     } else {
-        Some(dsistudio_odf8::full_vertices_ras().to_vec())
+        Some(
+            builtin_voxel_frame_vertices()
+                .into_iter()
+                .map(|v| frame.to_ras(v))
+                .collect(),
+        )
     };
 
     let sphere_faces = if let Some(record) = mat.get("odf_faces") {
@@ -243,8 +327,8 @@ fn load_dsistudio_mat(
             let direction = if let Some(dirs) = dir_cache[p].as_ref() {
                 let d = &dirs[f_idx * 3..f_idx * 3 + 3];
                 let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                // DSI Studio stores directions in LPS; ODX keeps RAS.
-                (n > 0.0).then(|| [-d[0] / n, -d[1] / n, d[2] / n])
+                // DSI Studio stores directions in its voxel frame; ODX keeps RAS.
+                (n > 0.0).then(|| frame.to_ras([d[0] / n, d[1] / n, d[2] / n]))
             } else {
                 match (index_cache[p].as_ref(), sphere_vertices.as_ref()) {
                     (Some(indices), Some(verts)) => {
@@ -650,6 +734,63 @@ fn apply_reorientation_to_affine(
     out
 }
 
+/// The axis permutation and flips that take a grid with affine `aff` to DSI
+/// Studio's native LPS+ voxel order, as `(src_axis_for_dst, flip_dst_axis)`.
+/// This matches qsiprep's nibabel-based reorientation model
+/// (`io_orientation` + `ornt_transform`) rather than assuming an x/y mirror.
+fn lps_reorientation(aff: [[f64; 4]; 4]) -> ([usize; 3], [bool; 3]) {
+    let start = nibabel_io_orientation(aff);
+    let end = [[0, -1], [1, -1], [2, 1]];
+    let xform = nibabel_ornt_transform(start, end);
+    let mut src_axis_for_dst = [0usize, 1, 2];
+    let mut flip_dst_axis = [false, false, false];
+    for (src_axis, [dst_axis, flip]) in xform.into_iter().enumerate() {
+        let dst_axis = dst_axis as usize;
+        src_axis_for_dst[dst_axis] = src_axis;
+        flip_dst_axis[dst_axis] = flip == -1;
+    }
+    (src_axis_for_dst, flip_dst_axis)
+}
+
+/// Reorder a reference affine (typically the DWI NIfTI a `trans`-less
+/// `.fib.gz` was reconstructed from) to the LPS voxel order DSI Studio stored
+/// that DWI in, like nibabel's `io_orientation` + `ornt_transform` +
+/// `inv_ornt_aff`. `dsi_dims` is the DSI Studio grid; the reference grid's
+/// shape is recovered from it. A no-op for an affine already in LPS order.
+pub fn reference_affine_to_dsistudio_grid(
+    aff: [[f64; 4]; 4],
+    dsi_dims: [usize; 3],
+) -> [[f64; 4]; 4] {
+    let (src_axis_for_dst, flip_dst_axis) = lps_reorientation(aff);
+    let mut src_dims = [0usize; 3];
+    for dst in 0..3 {
+        src_dims[src_axis_for_dst[dst]] = dsi_dims[dst];
+    }
+    apply_reorientation_to_affine(aff, src_axis_for_dst, flip_dst_axis, src_dims)
+}
+
+fn reorients_to_lps(header: &crate::header::Header) -> bool {
+    matches!(
+        header
+            .extra
+            .get("_ODX_DSISTUDIO_VOXEL_POLICY")
+            .and_then(|v| v.as_str()),
+        Some("reorient_to_lps_fortran") | Some("flip_xy_to_lps_fortran")
+    )
+}
+
+/// The `trans` a DSI Studio export of a dataset with this header gets, and
+/// so the affine whose [`VoxelFrame`] its directions are written in.
+pub(crate) fn dsistudio_export_affine(header: &crate::header::Header) -> [[f64; 4]; 4] {
+    let aff = header.voxel_to_rasmm;
+    if !reorients_to_lps(header) {
+        return aff;
+    }
+    let src_dims = header.dimensions.map(|d| d as usize);
+    let (src_axis_for_dst, flip_dst_axis) = lps_reorientation(aff);
+    apply_reorientation_to_affine(aff, src_axis_for_dst, flip_dst_axis, src_dims)
+}
+
 fn build_dsistudio_export_geometry(
     aff: [[f64; 4]; 4],
     src_dims: [usize; 3],
@@ -665,19 +806,9 @@ fn build_dsistudio_export_geometry(
         );
     }
 
-    let start = nibabel_io_orientation(aff);
-    let end = [[0, -1], [1, -1], [2, 1]];
     // Reorient the voxel grid into DSI Studio's native LPS+ array order before
-    // the final Fortran flattening step, matching qsiprep's nibabel-based
-    // reorientation model rather than assuming a simple x/y mirror.
-    let xform = nibabel_ornt_transform(start, end);
-    let mut src_axis_for_dst = [0usize, 1, 2];
-    let mut flip_dst_axis = [false, false, false];
-    for (src_axis, [dst_axis, flip]) in xform.into_iter().enumerate() {
-        let dst_axis = dst_axis as usize;
-        src_axis_for_dst[dst_axis] = src_axis;
-        flip_dst_axis[dst_axis] = flip == -1;
-    }
+    // the final Fortran flattening step.
+    let (src_axis_for_dst, flip_dst_axis) = lps_reorientation(aff);
     let dst_dims = [
         src_dims[src_axis_for_dst[0]],
         src_dims[src_axis_for_dst[1]],
@@ -706,15 +837,10 @@ fn build_dsistudio_records(odx: &OdxDataset, masked_sloped: bool) -> Result<Vec<
     let nvoxels_total = si * sj * sk;
 
     let aff = &header.voxel_to_rasmm;
-    let reorient_to_lps = matches!(
-        header
-            .extra
-            .get("_ODX_DSISTUDIO_VOXEL_POLICY")
-            .and_then(|v| v.as_str()),
-        Some("reorient_to_lps_fortran") | Some("flip_xy_to_lps_fortran")
-    );
     let (dst_dims_usize, vox_size, c_to_f, reoriented_aff) =
-        build_dsistudio_export_geometry(*aff, [si, sj, sk], reorient_to_lps);
+        build_dsistudio_export_geometry(*aff, [si, sj, sk], reorients_to_lps(header));
+    // Sphere and peak directions go out in the voxel frame of the written grid.
+    let frame = VoxelFrame::from_affine(&reoriented_aff)?;
     let (di, dj, dk) = (dst_dims_usize[0], dst_dims_usize[1], dst_dims_usize[2]);
     // `trans` stores the voxel→RAS+ mm affine directly, even though the DSI
     // Studio voxel arrays themselves are reoriented into LPS+ index space.
@@ -738,18 +864,22 @@ fn build_dsistudio_records(odx: &OdxDataset, masked_sloped: bool) -> Result<Vec<
     }
     let sparse_indices: Vec<usize> = (0..nvoxels_total).filter(|&idx| mask_f[idx] != 0).collect();
 
-    let sphere_verts = odx
-        .sphere_vertices()
+    let voxel_frame_verts: Vec<[f32; 3]> = match odx.sphere_vertices() {
+        Some(verts) => verts.iter().map(|&v| frame.from_ras(v)).collect(),
+        // A dense ODF without a `sphere/` payload was sampled on the RAS
+        // `dsistudio_odf8` sphere that its SPHERE_ID names.
+        None if !odx.odf_arrays().is_empty() => dsistudio_odf8::full_vertices_ras()
+            .iter()
+            .map(|&v| frame.from_ras(v))
+            .collect(),
         // DSI Studio can fall back to its built-in `odf8` sphere when explicit
-        // sphere records are absent, so the writer does the same.
-        .unwrap_or(dsistudio_odf8::full_vertices_ras());
+        // sphere records are absent, so the writer does the same; that sphere
+        // is defined in the voxel frame and needs no rotation.
+        None => builtin_voxel_frame_vertices(),
+    };
     let sphere_faces = odx.sphere_faces().unwrap_or(dsistudio_odf8::faces());
 
-    let odf_verts_data: Vec<f32> = sphere_verts
-        .iter()
-        // Export back to DSI Studio's LPS sphere convention.
-        .flat_map(|v| [-v[0], -v[1], v[2]])
-        .collect();
+    let odf_verts_data: Vec<f32> = voxel_frame_verts.iter().flatten().copied().collect();
     let odf_faces_data: Vec<i16> = sphere_faces
         .iter()
         .flat_map(|f| [f[0] as i16, f[1] as i16, f[2] as i16])
@@ -760,8 +890,6 @@ fn build_dsistudio_records(odx: &OdxDataset, masked_sloped: bool) -> Result<Vec<
     let amplitudes = odx
         .scalar_dpf_f32("amplitude")
         .unwrap_or_else(|_| vec![0.0; odx.nb_peaks()]);
-
-    let lps_verts: Vec<[f32; 3]> = sphere_verts.iter().map(|v| [-v[0], -v[1], v[2]]).collect();
 
     let max_peaks = (0..odx.nb_voxels())
         .map(|i| odx.peaks_per_voxel(i))
@@ -807,13 +935,12 @@ fn build_dsistudio_records(odx: &OdxDataset, masked_sloped: bool) -> Result<Vec<
                 break;
             }
             fa_arrays[p][f_idx] = amplitudes[peak_idx];
-            let dir = directions[peak_idx];
-            // DSI Studio peak indices refer to the LPS sphere, so internal RAS
-            // directions are flipped back before nearest-vertex lookup.
-            let lps_dir = [-dir[0], -dir[1], dir[2]];
-            idx_arrays[p][f_idx] = closest_vertex(&lps_verts, &lps_dir) as i16;
+            // DSI Studio peak indices refer to the voxel-frame sphere, so
+            // internal RAS directions are mapped back before the lookup.
+            let voxel_dir = frame.from_ras(directions[peak_idx]);
+            idx_arrays[p][f_idx] = closest_vertex(&voxel_frame_verts, &voxel_dir) as i16;
             if write_dir_records {
-                dir_arrays[p][f_idx * 3..f_idx * 3 + 3].copy_from_slice(&lps_dir);
+                dir_arrays[p][f_idx * 3..f_idx * 3 + 3].copy_from_slice(&voxel_dir);
             }
             for (_, values, per_peak) in &mut extra_peak_arrays {
                 if peak_idx < values.len() {
@@ -838,7 +965,7 @@ fn build_dsistudio_records(odx: &OdxDataset, masked_sloped: bool) -> Result<Vec<
         "odf_vertices",
         odf_verts_data,
         3,
-        sphere_verts.len(),
+        voxel_frame_verts.len(),
     ));
     records.push(int16_record(
         "odf_faces",
@@ -1081,3 +1208,305 @@ trait SortedByKeyExt<T>: Iterator<Item = T> + Sized {
 }
 
 impl<I, T> SortedByKeyExt<T> for I where I: Iterator<Item = T> {}
+
+#[cfg(test)]
+mod tests {
+    use nalgebra::Rotation3;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    /// DSI Studio's LPS voxel axes rotated by (12, -7, 5) degrees about the RAS
+    /// axes, with anisotropic voxels: what DSI Studio writes for an oblique scan.
+    fn oblique_trans() -> [[f64; 4]; 4] {
+        let rot =
+            Rotation3::from_euler_angles(12f64.to_radians(), -7f64.to_radians(), 5f64.to_radians());
+        let axes = rot.matrix() * Matrix3::from_diagonal(&Vector3::new(-1.0, -1.0, 1.0));
+        let vox = [1.5, 1.5, 2.0];
+        let mut aff = [[0.0; 4]; 4];
+        for r in 0..3 {
+            for c in 0..3 {
+                aff[r][c] = axes[(r, c)] * vox[c];
+            }
+        }
+        aff[0][3] = 70.0;
+        aff[1][3] = 90.0;
+        aff[2][3] = -10.0;
+        aff[3][3] = 1.0;
+        aff
+    }
+
+    fn lps_trans() -> [[f64; 4]; 4] {
+        [
+            [-1.5, 0.0, 0.0, 70.0],
+            [0.0, -1.5, 0.0, 90.0],
+            [0.0, 0.0, 2.0, -10.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    }
+
+    fn mat_vec(aff: &[[f64; 4]; 4], v: [f32; 3]) -> [f32; 3] {
+        let col_norm = |c: usize| (0..3).map(|r| aff[r][c] * aff[r][c]).sum::<f64>().sqrt();
+        std::array::from_fn(|r| {
+            (0..3)
+                .map(|c| aff[r][c] / col_norm(c) * f64::from(v[c]))
+                .sum::<f64>() as f32
+        })
+    }
+
+    fn normalized(v: [f32; 3]) -> [f32; 3] {
+        let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / n, v[1] / n, v[2] / n]
+    }
+
+    fn assert_close(a: [f32; 3], b: [f32; 3], tol: f32) {
+        for k in 0..3 {
+            assert!((a[k] - b[k]).abs() <= tol, "{a:?} != {b:?}");
+        }
+    }
+
+    // Two voxels along j (dims 1x2x1). Voxel 0: peak 0 at sphere vertex 10,
+    // peak 1 given by an exact `dir1` record. Voxel 1: peak 0 at vertex 200.
+    const DIR1: [f32; 3] = [0.2, 0.3, 0.9];
+
+    fn write_synthetic_fib(path: &Path, trans: Option<[[f64; 4]; 4]>) {
+        let verts = builtin_voxel_frame_vertices();
+        let faces = dsistudio_odf8::faces();
+        let mut records = vec![
+            OwnedMatRecord {
+                name: "dimension".into(),
+                mrows: 1,
+                ncols: 3,
+                type_flag: 20,
+                data: vec_to_bytes(vec![1i32, 2, 1]),
+                subrecords: Vec::new(),
+            },
+            float_record("voxel_size", vec![1.5, 1.5, 2.0], 1, 3),
+        ];
+        if let Some(trans) = trans {
+            records.push(float_record(
+                "trans",
+                nifti_affine_to_dsistudio_trans(trans),
+                4,
+                4,
+            ));
+        }
+        records.extend([
+            float_record(
+                "odf_vertices",
+                verts.iter().flatten().copied().collect(),
+                3,
+                verts.len(),
+            ),
+            int16_record(
+                "odf_faces",
+                faces
+                    .iter()
+                    .flat_map(|f| f.map(|i| i as i16))
+                    .collect::<Vec<_>>(),
+                3,
+                faces.len(),
+            ),
+            uint8_record("mask", vec![1, 1], 2, 1),
+            float_record("fa0", vec![0.5, 0.4], 1, 2),
+            int16_record("index0", vec![10, 200], 1, 2),
+            float_record("fa1", vec![0.3, 0.0], 1, 2),
+            int16_record("index1", vec![0, 0], 1, 2),
+            float_record(
+                "dir1",
+                [DIR1, [0.0; 3]].into_iter().flatten().collect(),
+                3,
+                2,
+            ),
+        ]);
+        mat4::write_mat4_gz(path, &records).unwrap();
+    }
+
+    #[test]
+    fn oblique_directions_are_rotated_by_trans() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("oblique.fib.gz");
+        let trans = oblique_trans();
+        write_synthetic_fib(&path, Some(trans));
+
+        let odx = load_fibgz(&path, None).unwrap();
+        let builtin = builtin_voxel_frame_vertices();
+        let verts = odx.sphere_vertices().unwrap();
+        for (got, &v) in verts.iter().zip(&builtin) {
+            assert_close(*got, mat_vec(&trans, v), 1e-6);
+        }
+        // A rotated sphere is no longer the canonical RAS `dsistudio_odf8`.
+        assert_eq!(odx.header().sphere_id, None);
+
+        let dirs = odx.directions();
+        assert_eq!(odx.offsets(), &[0, 2, 3]);
+        // `index{p}` resolves through the rotated sphere ...
+        assert_close(dirs[0], mat_vec(&trans, builtin[10]), 1e-6);
+        assert_close(dirs[2], mat_vec(&trans, builtin[200]), 1e-6);
+        assert_close(dirs[0], verts[10], 0.0);
+        // ... and `dir{p}` gets the same rotation.
+        assert_close(dirs[1], mat_vec(&trans, normalized(DIR1)), 1e-6);
+        // The rotation is not just the non-oblique x/y flip.
+        let flipped = [-builtin[10][0], -builtin[10][1], builtin[10][2]];
+        let dot: f32 = (0..3).map(|k| dirs[0][k] * flipped[k]).sum();
+        assert!(dot < 0.99, "oblique rotation was dropped");
+    }
+
+    #[test]
+    fn non_oblique_trans_keeps_the_xy_flip_and_builtin_sphere() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("lps.fib.gz");
+        write_synthetic_fib(&path, Some(lps_trans()));
+
+        let odx = load_fibgz(&path, None).unwrap();
+        assert_eq!(
+            odx.sphere_vertices().unwrap(),
+            dsistudio_odf8::full_vertices_ras()
+        );
+        assert_eq!(odx.header().sphere_id.as_deref(), Some("dsistudio_odf8"));
+        let d = normalized(DIR1);
+        assert_eq!(odx.directions()[1], [-d[0], -d[1], d[2]]);
+    }
+
+    #[test]
+    fn oblique_export_writes_voxel_frame_sphere_and_peaks() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("oblique.fib.gz");
+        let trans = oblique_trans();
+        write_synthetic_fib(&src, Some(trans));
+        let odx = load_fibgz(&src, None).unwrap();
+        let mut parts = odx.clone_owned_parts();
+        parts
+            .header
+            .extra
+            .insert(WRITE_DIR_RECORDS_KEY.into(), serde_json::Value::Bool(true));
+        let odx = OdxDataset::from_parts(parts);
+
+        let builtin = builtin_voxel_frame_vertices();
+        let voxel_dir = |m: &MatCatalog, name: &str, voxel: usize| -> [f32; 3] {
+            let v = m.get(name).unwrap().as_f32_vec();
+            [v[voxel * 3], v[voxel * 3 + 1], v[voxel * 3 + 2]]
+        };
+        for (name, masked) in [("out.fib.gz", false), ("out.fz", true)] {
+            let out = tmp.path().join(name);
+            if masked {
+                save_fz(&odx, &out).unwrap();
+            } else {
+                save_fibgz(&odx, &out).unwrap();
+            }
+            let mat = mat4::read_mat4_gz(&out).unwrap();
+            let written: Vec<f32> = nifti_affine_to_dsistudio_trans(trans);
+            assert_eq!(mat.get("trans").unwrap().as_f32_vec(), written);
+            let verts = mat.get("odf_vertices").unwrap().as_f32_vec();
+            for (i, v) in builtin.iter().enumerate() {
+                assert_close([verts[3 * i], verts[3 * i + 1], verts[3 * i + 2]], *v, 1e-6);
+            }
+            assert_eq!(mat.get("index0").unwrap().as_i32_vec(), vec![10, 200]);
+            assert_close(voxel_dir(&mat, "dir0", 0), builtin[10], 1e-6);
+            assert_close(voxel_dir(&mat, "dir1", 0), normalized(DIR1), 1e-6);
+            assert_close(voxel_dir(&mat, "dir0", 1), builtin[200], 1e-6);
+
+            let back = load_dsistudio_mat(&out, None, &LoadOptions::default()).unwrap();
+            for (a, b) in back.directions().iter().zip(odx.directions()) {
+                assert_close(*a, *b, 1e-6);
+            }
+            for (a, b) in back
+                .sphere_vertices()
+                .unwrap()
+                .iter()
+                .zip(odx.sphere_vertices().unwrap())
+            {
+                assert_close(*a, *b, 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn reference_affine_is_reordered_to_dsistudio_lps_grid() {
+        // An oblique 'ASR' grid of shape (4, 3, 5) and the LPS-reordered affine
+        // nibabel gives for it (io_orientation + ornt_transform +
+        // inv_ornt_aff); DSI Studio stores that grid as (5, 4, 3).
+        let asr = [
+            [
+                -0.16573923439829594,
+                -0.2012637848259822,
+                1.2359615173455631,
+                10.5,
+            ],
+            [
+                1.4583256443817185,
+                -0.4350200589506861,
+                0.10813262132203647,
+                -20.25,
+            ],
+            [
+                0.30954292290361113,
+                1.941713273691062,
+                0.15233667925643435,
+                30.0,
+            ],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let lps = [
+            [
+                -1.2359615173455631,
+                0.16573923439829594,
+                -0.2012637848259822,
+                14.946628366187365,
+            ],
+            [
+                -0.10813262132203647,
+                -1.4583256443817185,
+                -0.4350200589506861,
+                -15.442492581566698,
+            ],
+            [
+                -0.15233667925643435,
+                -0.30954292290361113,
+                1.941713273691062,
+                31.53797548573657,
+            ],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let close = |a: [[f64; 4]; 4], b: [[f64; 4]; 4]| {
+            for r in 0..4 {
+                for c in 0..4 {
+                    assert!((a[r][c] - b[r][c]).abs() < 1e-9, "{a:?} != {b:?}");
+                }
+            }
+        };
+        close(reference_affine_to_dsistudio_grid(asr, [5, 4, 3]), lps);
+        // Already in DSI Studio's order: nothing to do.
+        close(reference_affine_to_dsistudio_grid(lps, [5, 4, 3]), lps);
+    }
+
+    #[test]
+    fn las_reference_affine_for_fib_without_trans_is_reordered() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("chen.fib.gz");
+        write_synthetic_fib(&path, None);
+        // The LAS DWI the file came from: DSI Studio flipped its j axis, so
+        // voxel j of the DWI is voxel (2 - 1) - j of the file.
+        let trans = oblique_trans();
+        let mut las = trans;
+        for r in 0..3 {
+            las[r][1] = -trans[r][1];
+            las[r][3] = trans[r][3] + trans[r][1];
+        }
+        let odx = load_fibgz(&path, Some(las)).unwrap();
+        let aff = odx.header().voxel_to_rasmm;
+        for r in 0..4 {
+            for c in 0..4 {
+                assert!((aff[r][c] - trans[r][c]).abs() < 1e-9, "{aff:?}");
+            }
+        }
+        let builtin = builtin_voxel_frame_vertices();
+        assert_close(odx.directions()[0], mat_vec(&trans, builtin[10]), 1e-6);
+
+        let err = load_fibgz(&path, None).unwrap_err().to_string();
+        assert!(
+            err.contains("reordered to DSI Studio's LPS voxel order"),
+            "{err}"
+        );
+    }
+}
