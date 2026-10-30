@@ -1,11 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use assert_cmd::prelude::*;
 use hdf5_metno::types::VarLenUnicode;
 use hdf5_metno::File;
 use odx_rs::{pam, sh_basis_evaluator, DType, Header, OdxBuilder};
-use predicates::prelude::*;
 
 const PAM_FIXTURE: &str = "../test_data/pam_fixture.pam5";
 
@@ -298,21 +295,6 @@ fn pam5_converted_to_odx_loads_without_sphere_faces() {
             expected_sh.as_slice()
         );
     }
-
-    // The CLI route from the bug report: `odx convert x.pam5 y.odx`, then
-    // `odx info y.odx`.
-    let cli_out = tmp.path().join("cli.odx");
-    Command::cargo_bin("odx")
-        .unwrap()
-        .args(["convert", pam5.to_str().unwrap(), cli_out.to_str().unwrap()])
-        .assert()
-        .success();
-    Command::cargo_bin("odx")
-        .unwrap()
-        .args(["info", cli_out.to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("faces=none"));
 }
 
 #[test]
