@@ -93,6 +93,30 @@ impl SpherePeakFinder {
     ///
     /// Returns peaks sorted by amplitude descending, capped at `npeaks`.
     pub fn find_peaks(&self, odf: &[f32]) -> Vec<(f32, [f32; 3])> {
+        self.find_peaks_capped(odf, self.config.npeaks)
+    }
+
+    /// Greedy separation filter over `(amplitude, direction)` candidates sorted by
+    /// amplitude, descending (antipodal symmetry: `|dot|`), keeping at most `cap`.
+    fn separate(&self, candidates: impl IntoIterator<Item = (f32, [f32; 3])>, cap: usize)
+        -> Vec<(f32, [f32; 3])> {
+        let mut accepted: Vec<(f32, [f32; 3])> = Vec::new();
+        'candidate: for (value, dir) in candidates {
+            for &(_, acc_dir) in &accepted {
+                let dot = dir[0] * acc_dir[0] + dir[1] * acc_dir[1] + dir[2] * acc_dir[2];
+                if dot.abs() > self.cos_min_sep {
+                    continue 'candidate;
+                }
+            }
+            accepted.push((value, dir));
+            if accepted.len() >= cap {
+                break;
+            }
+        }
+        accepted
+    }
+
+    fn find_peaks_capped(&self, odf: &[f32], cap: usize) -> Vec<(f32, [f32; 3])> {
         assert_eq!(
             odf.len(),
             self.vertices.len(),
@@ -126,22 +150,7 @@ impl SpherePeakFinder {
             .collect();
 
         // Step 3: greedy separation-angle filter (antipodal symmetry: use |dot|).
-        let mut accepted: Vec<(f32, [f32; 3])> = Vec::new();
-        'candidate: for (value, idx) in candidates {
-            let dir = self.vertices[idx];
-            for &(_, acc_dir) in &accepted {
-                let dot = dir[0] * acc_dir[0] + dir[1] * acc_dir[1] + dir[2] * acc_dir[2];
-                if dot.abs() > self.cos_min_sep {
-                    continue 'candidate;
-                }
-            }
-            accepted.push((value, dir));
-            if accepted.len() >= self.config.npeaks {
-                break;
-            }
-        }
-
-        accepted
+        self.separate(candidates.into_iter().map(|(v, idx)| (v, self.vertices[idx])), cap)
     }
 
     /// Refine a vertex-quantized seed direction to sub-vertex precision by
@@ -244,17 +253,20 @@ impl SpherePeakFinder {
     /// Like [`find_peaks`], but refines each accepted peak to sub-vertex
     /// precision using the original SH coefficients.
     ///
-    /// Local-maxima detection, threshold filtering, and separation-angle
-    /// pruning all run on the discrete `odf` (so the set of accepted peaks
-    /// is identical to [`find_peaks`]). Each accepted seed is then nudged
-    /// off-vertex by [`Self::refine_with_sh`].
+    /// Local maxima, the relative threshold and the separation angle are found
+    /// on the discrete `odf`, without the `npeaks` cap; each seed is then nudged
+    /// off-vertex by [`Self::refine_with_sh`], and the separation filter and the
+    /// cap run again on the refined peaks. The second pass matters: the search
+    /// sphere is a hemisphere whose mesh is not joined across its boundary, so
+    /// a lobe near the boundary can seed two maxima more than the separation
+    /// angle apart, and refinement takes both onto the same axis.
     pub fn find_peaks_with_sh(
         &self,
         odf: &[f32],
         sh: &[f32],
         basis: ShBasisKind,
     ) -> Vec<(f32, [f32; 3])> {
-        let seeds = self.find_peaks(odf);
+        let seeds = self.find_peaks_capped(odf, usize::MAX);
         let mut out = Vec::with_capacity(seeds.len());
         for (_seed_amp, seed_dir) in seeds {
             let (dir, amp) = self.refine_with_sh(seed_dir, sh, basis);
@@ -269,7 +281,8 @@ impl SpherePeakFinder {
                 out.push((amp, dir));
             }
         }
-        out
+        out.sort_by(|a, b| b.0.total_cmp(&a.0));
+        self.separate(out, self.config.npeaks)
     }
 
     /// Batch version of [`find_peaks`].
@@ -672,6 +685,93 @@ mod tests {
                 "refined direction should sit at a local max (|∇| small), got {grad_mag}"
             );
         }
+    }
+
+    #[test]
+    fn find_peaks_with_sh_keeps_one_peak_per_lobe_near_the_hemisphere_edge() {
+        // The search sphere is a hemisphere whose mesh is not joined across its
+        // boundary, so one lobe near the boundary shows up as a discrete local
+        // maximum on both sides. The two seeds can sit more than the separation
+        // angle apart, and refinement then takes both to the same axis (often
+        // with opposite signs). A single fibre must still give one peak.
+        use crate::mrtrix_sh::{sh2amp_cart, RowSamplePlan};
+        let finder = SpherePeakFinder::for_dsistudio_odf8(PeakFinderConfig {
+            npeaks: 5,
+            relative_peak_threshold: 0.5,
+            min_separation_angle_deg: 25.0,
+        });
+        let lmax = 8;
+        let basis = ShBasisKind::MrtrixTournier { lmax };
+        let mut worst = 0usize;
+        let mut n_bad = 0usize;
+        for el_deg in [-8.0_f32, -4.0, -1.0, 0.0, 1.0, 4.0, 8.0] {
+            for k in 0..36 {
+                let az = (k as f32 * 10.0 + 3.0).to_radians();
+                let el = el_deg.to_radians();
+                let dir = [el.cos() * az.cos(), el.cos() * az.sin(), el.sin()];
+                // Rotate so the fibre lies near every part of the boundary,
+                // whatever axis the hemisphere is cut along.
+                for d in [dir, [dir[2], dir[0], dir[1]], [dir[1], dir[2], dir[0]]] {
+                    let sh: Vec<f32> = sh2amp_cart(&[d], lmax).iter().copied().collect();
+                    let plan = RowSamplePlan::for_sh_rows_nonnegative(finder.vertices(), sh.len())
+                        .unwrap();
+                    let odf = plan.apply_row(&sh);
+                    let peaks = finder.find_peaks_with_sh(&odf, &sh, basis);
+                    if peaks.len() != 1 {
+                        n_bad += 1;
+                        worst = worst.max(peaks.len());
+                    }
+                    let errs: Vec<f32> = peaks.iter().map(|(_, p)| angle_between_deg(*p, d)).collect();
+                    if peaks.len() != 1 {
+                        eprintln!("d={d:?} n={} errs={errs:?} pairwise={:?}", peaks.len(),
+                            peaks.iter().skip(1).map(|(_, p)| angle_between_deg(*p, peaks[0].1)).collect::<Vec<_>>());
+                    }
+                    assert!(errs.iter().all(|e| *e < 5.0), "peak off the fibre: {errs:?}");
+                }
+            }
+        }
+        assert_eq!(n_bad, 0, "{n_bad} single fibres gave more than one peak (up to {worst})");
+    }
+
+    #[test]
+    fn find_peaks_with_sh_never_returns_two_peaks_on_one_axis() {
+        // WM fODF rows from CONSH (cs_dmri 0.3.0, lmax 8) where the exported peaks
+        // held the same axis twice: two seeds more than 25 deg apart refined onto
+        // one lobe, often with opposite signs.
+        const ROWS: &[&str] = &[
+        "0.020001 3.70544e-05 0.000196457 -0.000274297 -0.000669049 -0.000114257 0.000340161 -0.000152604 0.00012367 -1.47892e-08 -0.000129584 4.10546e-05 0.00027226 -0.000124367 5.74178e-05 3.87874e-05 9.05643e-05 -1.58243e-05 -1.25684e-05 -7.64095e-05 -5.5034e-05 6.98173e-05 4.2683e-05 -6.40127e-05 -6.85215e-05 -1.74923e-05 3.44863e-06 2.48358e-05 -1.9128e-05 -9.33313e-07 -1.09802e-05 5.76294e-06 -5.86146e-06 -1.27285e-05 -6.2177e-06 5.6455e-06 -1.8438e-05 -2.31331e-05 -1.5045e-06 -2.2925e-05 -7.64343e-06 1.73684e-05 -1.12061e-05 1.50676e-05 -1.14419e-05",
+        "0.00509206 -0.00394427 -0.0026448 -0.00204412 0.00408692 0.0036147 -0.00174032 -0.00232267 -0.000869546 0.000881936 -0.000435028 -0.00195087 -0.000935052 -4.33417e-05 0.000525665 -0.000460918 -0.00029834 4.3253e-05 0.000240121 0.000428127 0.000159857 0.000146224 0.000199289 0.000139787 -0.000484234 -0.000750837 -0.000163946 0.000216163 -0.000107683 -7.20465e-05 7.32629e-05 9.57164e-05 -8.02023e-07 1.50129e-05 4.11548e-05 -3.06238e-05 6.22351e-05 -2.61229e-05 -2.96008e-05 0.000119038 5.45087e-05 -8.04789e-05 -5.56021e-05 2.83407e-05 3.90552e-05",
+        "0.0166295 0.00653633 -0.00569082 -0.00193573 -0.00942998 0.0124597 0.00272468 -0.00243812 0.00178219 -0.000953129 -0.000677992 0.0004924 -0.00144635 3.00494e-06 0.00318468 -8.45897e-05 0.000567782 -0.000520075 0.000466809 -0.000436867 0.000103431 -0.000347938 -0.000236118 -0.000412912 0.000456039 -0.000427854 0.000722666 0.000201158 -0.000315116 0.000484258 -0.00022278 9.19441e-05 -0.000417422 0.000285048 7.92924e-06 3.89435e-06 -0.0001305 0.000129701 -1.90785e-05 -0.000125447 0.000222657 -0.000193764 5.43387e-05 8.78768e-05 -2.45091e-05",
+        "0.0204613 -0.00066584 0.00197433 0.00222784 -0.00180702 0.00102427 -0.000411757 -1.2118e-05 0.000273079 7.08231e-05 0.000471344 -0.000657725 0.000382965 -0.00020176 -0.000729273 3.91606e-05 -0.000202432 -0.000244344 0.000108551 1.98104e-05 0.000170449 -3.65766e-05 -6.70476e-05 6.62493e-05 0.000162324 9.92119e-05 -5.86277e-05 0.000157406 -3.26614e-05 -4.73648e-05 1.84313e-05 -2.99623e-06 -7.01198e-05 1.99084e-05 -7.38982e-06 2.77363e-05 2.28139e-05 -2.69119e-05 -4.31075e-05 7.03224e-06 -7.8422e-06 1.1047e-05 3.96872e-05 -8.43552e-06 -5.75591e-05",
+        "0.00713807 0.00339079 -0.00103044 -0.0061386 -0.000826552 0.0082003 0.00190633 -0.00198514 -0.00140997 0.00109988 0.00331778 0.000812522 -0.00393889 0.000462763 0.0019602 -0.000102241 -0.000762335 -0.000470507 0.00120132 0.000369221 -0.000609059 -0.00113804 -0.000404316 0.00139879 -0.000316085 -0.000765427 0.000707538 -7.7881e-05 -0.000148948 -5.6335e-05 -1.18645e-05 0.000239571 5.7593e-05 -0.000329128 -2.99322e-05 0.000165437 0.000189011 8.75542e-05 -0.000278514 0.000104215 0.000190993 -0.000222191 -6.21878e-05 0.000128678 -3.36133e-05",
+        "0.00911124 0.0042636 -0.00250162 -0.00292044 -0.00642482 0.00798826 0.00157445 -0.00195749 0.00115058 -0.000117568 2.75139e-05 0.000873749 -0.000624711 -0.00126921 0.00167151 -0.000551438 0.000200251 0.000173153 -0.00054223 0.00035316 0.000187881 -0.000489381 0.000230142 0.000361385 0.000153043 -0.000342866 -8.28056e-05 0.000193832 -0.000325103 0.000195456 -3.17966e-05 -3.89624e-05 9.31491e-05 -8.7443e-05 -5.91938e-05 6.76002e-05 5.93242e-05 1.96581e-05 -4.39012e-05 6.68431e-05 -6.04483e-05 -2.98802e-06 8.03673e-05 -0.00014283 0.000149106",
+        "0.0207078 -0.00912826 -0.000280418 -0.00345379 0.00851847 0.00280469 -0.000571926 -0.00113182 -3.22305e-05 -0.000560326 -0.000178424 -0.000903974 -0.00274634 0.000206762 0.00127298 -0.00059195 -0.000280693 0.000474782 7.13967e-05 -0.00011802 0.000244228 -5.81581e-05 6.46518e-05 0.000119734 6.28979e-06 -0.000311702 0.000148417 -0.000156499 7.89762e-05 0.000181594 -0.000104104 -0.00038818 0.000126554 1.05881e-06 -3.73684e-05 -5.1545e-05 3.69212e-05 6.98023e-05 -0.000193472 -1.69508e-05 0.000354341 7.27828e-05 -5.16985e-05 -0.000145303 7.49501e-05",
+        "0.00858252 -0.00204651 0.000317345 0.00182916 -0.00456516 0.00489997 -0.000985689 0.000126664 -0.000217271 -3.43666e-06 0.00039176 -9.36268e-05 0.000310303 -0.000137112 0.000698595 -1.80399e-05 -0.000300732 4.15087e-05 6.39551e-05 -0.000152642 0.000250385 -4.19572e-05 9.95349e-05 -8.17123e-06 9.71228e-05 -0.000101752 0.000169359 -3.17502e-05 7.00833e-05 -5.8298e-05 -4.24459e-05 5.37188e-06 1.8318e-06 2.58761e-05 1.25461e-06 0.000125873 3.5538e-05 4.7104e-05 -4.9865e-05 2.20606e-05 3.27844e-05 -5.69153e-05 9.91125e-05 -5.7064e-05 1.86506e-05",
+        "0.0271781 0.00204935 0.00128115 -0.000257789 0.000200468 -0.00067315 0.000330585 -9.49055e-05 -0.000119205 -0.000696796 -0.000278246 -0.000551226 0.000259925 -0.000254365 0.000494597 -2.04616e-05 -0.000126276 8.02324e-05 0.000104759 -9.09473e-05 6.75586e-05 0.000148725 2.83542e-05 -0.000143331 8.69828e-05 0.000104617 -0.000211406 1.36491e-05 3.60502e-05 -2.75081e-05 3.7928e-05 -9.66078e-06 -6.78423e-06 4.45139e-05 -3.0848e-05 5.87303e-05 -1.25989e-05 -2.52647e-05 -1.97211e-05 -3.77388e-05 4.78251e-06 6.28862e-05 4.76508e-05 -1.58487e-05 6.55682e-05",
+        "0.0106931 -0.00175415 0.00586164 -0.00190705 -0.00390398 -0.00210425 -0.000223556 -0.000121788 -0.00057407 -0.000161456 0.000923586 0.000336871 0.000645904 -0.000428887 -0.000440656 -1.48008e-05 -0.00021295 -0.000148304 0.000154047 0.000109541 0.000475584 -0.000665469 0.000110946 -0.000441458 -0.000318587 1.52103e-05 0.000135829 -0.000103869 2.67965e-05 5.74638e-05 -3.30177e-06 -8.46844e-05 -9.90469e-05 -0.000132889 8.73883e-05 0.000103447 0.000255929 -3.81133e-05 -1.91169e-05 -0.000209072 0.00014204 2.77721e-05 7.39294e-05 0.000119412 1.07416e-05",
+        ];
+        use crate::mrtrix_sh::RowSamplePlan;
+        let finder = SpherePeakFinder::for_dsistudio_odf8(PeakFinderConfig {
+            npeaks: 5,
+            relative_peak_threshold: 0.5,
+            min_separation_angle_deg: 25.0,
+        });
+        let basis = ShBasisKind::MrtrixTournier { lmax: 8 };
+        let plan = RowSamplePlan::for_sh_rows_nonnegative(finder.vertices(), 45).unwrap();
+        let mut n_dup = 0;
+        for row in ROWS {
+            let sh: Vec<f32> = row.split_whitespace().map(|x| x.parse().unwrap()).collect();
+            let odf = plan.apply_row(&sh);
+            let peaks = finder.find_peaks_with_sh(&odf, &sh, basis);
+            for i in 0..peaks.len() {
+                for j in i + 1..peaks.len() {
+                    if angle_between_deg(peaks[i].1, peaks[j].1) < 25.0 {
+                        n_dup += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(n_dup, 0, "{n_dup} peak pairs closer than the separation angle");
     }
 
     #[test]

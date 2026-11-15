@@ -220,7 +220,7 @@ jobs:
   # ─── macOS wheels (x86_64 + Apple Silicon) ─────────────────────────────────
   #
   # Runner mapping:
-  #   - aarch64  → macos-14         (Apple Silicon, free)
+  #   - aarch64  → macos-15         (Apple Silicon; macos-14 runners are retired)
   #   - x86_64   → macos-15-intel   (Intel x86_64 on macOS 15; GitHub's
   #                                   recommended migration path for x86_64
   #                                   builds, supported until August 2027).
@@ -231,7 +231,7 @@ jobs:
   # macos-15-intel is the long tail.
   macos:
     name: macOS ${{ matrix.target }}
-    runs-on: ${{ matrix.target == 'aarch64' && 'macos-14' || 'macos-15-intel' }}
+    runs-on: ${{ matrix.target == 'aarch64' && 'macos-15' || 'macos-15-intel' }}
     needs: [verify-version]
     strategy:
       fail-fast: false
